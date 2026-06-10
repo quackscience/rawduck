@@ -38,6 +38,8 @@ RawIngestStats RawIngestPayload(ClientContext &context, const string &target, co
 
 TableFunction GetRawServeFunction();
 TableFunction GetRawServeStopFunction();
+TableFunction GetRawServeGrpcFunction();
+TableFunction GetRawServeGrpcStopFunction();
 
 // shared SQL generation helpers
 string RawQuoteIdentifier(const string &name);

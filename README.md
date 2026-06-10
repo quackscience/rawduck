@@ -148,10 +148,26 @@ tables with the `x-rawduck-traces-table`, `x-rawduck-logs-table`, or `x-rawduck-
 headers (the generic `x-rawduck-table` also works). Responses are OTLP-conformant: an empty
 `partialSuccess` on full acceptance, with signal-specific rejected counts otherwise.
 
-OTLP/protobuf and OTLP/gRPC are not served in-process (they would require the protobuf/gRPC
-stacks inside the extension). SDKs that only speak gRPC should bridge through an OpenTelemetry
-Collector — an `otlp` gRPC receiver on `:4317` exporting `otlphttp` with `encoding: json` to
-`http://localhost:9999/otlp` is all it takes.
+### OTLP/gRPC
+
+Builds with gRPC available (vcpkg in CI, system packages locally; not wasm) also serve the
+standard OpenTelemetry collector services natively:
+
+```sql
+SELECT * FROM raw_serve_grpc(port := 4317, token := 'rt_secret');   -- TraceService/LogsService/MetricsService
+SELECT * FROM raw_serve_grpc_stop();
+```
+
+```sh
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer rt_secret"
+```
+
+Requests are converted through protobuf's canonical OTLP/JSON mapping and flow through the same
+native ingestion path as the HTTP routes, with the same `x-rawduck-*-table` routing (sent as gRPC
+metadata) and `partialSuccess` semantics. On builds without gRPC the functions explain themselves;
+OTLP/HTTP protobuf bodies still get a 415 pointing at `http/json` or the gRPC endpoint.
 
 ## ATTACH: RawMergeTree stores
 

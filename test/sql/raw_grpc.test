@@ -1,0 +1,27 @@
+# name: test/sql/raw_grpc.test
+# description: OTLP/gRPC server lifecycle (gated: requires a build with gRPC support)
+# group: [sql]
+
+require rawduck
+
+require-env RAWDUCK_GRPC_TESTS
+
+query III
+SELECT * FROM raw_serve_grpc(host := '127.0.0.1', port := 14318, token := 'rt_g');
+----
+127.0.0.1	14318	true
+
+statement error
+SELECT * FROM raw_serve_grpc(port := 14319);
+----
+<REGEX>:.*already running.*
+
+query I
+SELECT * FROM raw_serve_grpc_stop();
+----
+true
+
+query I
+SELECT * FROM raw_serve_grpc_stop();
+----
+false

@@ -407,8 +407,14 @@ private:
 	//===----------------------------------------------------------------===//
 
 	optional_ptr<TableCatalogEntry> LookupTable() {
-		return Catalog::GetEntry<TableCatalogEntry>(context, qname.catalog, qname.schema, qname.name,
-		                                            OnEntryNotFound::RETURN_NULL);
+		// non-template lookup: the template ODR-uses CatalogEntry::Name
+		// statics, which duplicate-define against core on some toolchains
+		EntryLookupInfo lookup_info(CatalogType::TABLE_ENTRY, qname.name);
+		auto entry = Catalog::GetEntry(context, qname.catalog, qname.schema, lookup_info, OnEntryNotFound::RETURN_NULL);
+		if (!entry) {
+			return nullptr;
+		}
+		return &entry->Cast<TableCatalogEntry>();
 	}
 
 	// whether evolution would need DDL for this payload

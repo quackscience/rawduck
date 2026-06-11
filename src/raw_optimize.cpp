@@ -265,11 +265,13 @@ static bool TryRewriteToProjection(ClientContext &context, LogicalOperator &pare
 		// the base table changed since materialization: never use stale data
 		return false;
 	}
-	auto projection_table = Catalog::GetEntry<TableCatalogEntry>(context, projection.catalog, projection.schema,
-	                                                             projection.name, OnEntryNotFound::RETURN_NULL);
-	if (!projection_table) {
+	EntryLookupInfo projection_lookup(CatalogType::TABLE_ENTRY, projection.name);
+	auto projection_entry = Catalog::GetEntry(context, projection.catalog, projection.schema, projection_lookup,
+	                                          OnEntryNotFound::RETURN_NULL);
+	if (!projection_entry) {
 		return false;
 	}
+	auto &projection_table = projection_entry->Cast<TableCatalogEntry>();
 	// the parent projection must reference aggregate outputs as plain columns
 	for (auto &expression : parent.expressions) {
 		if (expression->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
@@ -279,7 +281,7 @@ static bool TryRewriteToProjection(ClientContext &context, LogicalOperator &pare
 	// map group columns and the count column into the projection table
 	case_insensitive_map_t<idx_t> projection_columns;
 	idx_t physical_index = 0;
-	for (auto &column : projection_table->GetColumns().Physical()) {
+	for (auto &column : projection_table.GetColumns().Physical()) {
 		projection_columns[column.Name()] = physical_index++;
 	}
 	vector<ColumnIndex> new_column_ids;
@@ -298,10 +300,10 @@ static bool TryRewriteToProjection(ClientContext &context, LogicalOperator &pare
 
 	// build the replacement scan over the projection table
 	unique_ptr<FunctionData> bind_data;
-	auto scan_function = projection_table->GetScanFunction(context, bind_data);
+	auto scan_function = projection_table.GetScanFunction(context, bind_data);
 	vector<LogicalType> scan_types;
 	vector<string> scan_names;
-	for (auto &column : projection_table->GetColumns().Physical()) {
+	for (auto &column : projection_table.GetColumns().Physical()) {
 		scan_types.push_back(column.Type());
 		scan_names.push_back(column.Name());
 	}
@@ -313,7 +315,11 @@ static bool TryRewriteToProjection(ClientContext &context, LogicalOperator &pare
 	for (idx_t i = 0; i < aggregate.groups.size(); i++) {
 		aggregate.groups[i]->Cast<BoundColumnRefExpression>().binding = ColumnBinding(get.table_index, i);
 	}
-	auto &sum_entry = Catalog::GetEntry<AggregateFunctionCatalogEntry>(context, INVALID_CATALOG, DEFAULT_SCHEMA, "sum");
+	// EntryLookupInfo holds the name by reference: keep it alive
+	string sum_name = "sum";
+	EntryLookupInfo sum_lookup(CatalogType::AGGREGATE_FUNCTION_ENTRY, sum_name);
+	auto &sum_entry =
+	    Catalog::GetEntry(context, INVALID_CATALOG, DEFAULT_SCHEMA, sum_lookup).Cast<AggregateFunctionCatalogEntry>();
 	FunctionBinder function_binder(context);
 	vector<LogicalType> sum_arguments {LogicalType::BIGINT};
 	ErrorData bind_error;
@@ -479,7 +485,8 @@ static void RawOptimizeFunction(ClientContext &context, TableFunctionInput &data
 	auto qname = QualifiedName::Parse(bind_data.target);
 	auto catalog_name = qname.catalog.empty() ? INVALID_CATALOG : qname.catalog;
 	auto schema_name = qname.schema.empty() ? DEFAULT_SCHEMA : qname.schema;
-	auto &table = Catalog::GetEntry<TableCatalogEntry>(context, catalog_name, schema_name, qname.name);
+	EntryLookupInfo table_lookup(CatalogType::TABLE_ENTRY, qname.name);
+	auto &table = Catalog::GetEntry(context, catalog_name, schema_name, table_lookup).Cast<TableCatalogEntry>();
 
 	// rank columns by how often queries filtered on them
 	vector<pair<string, idx_t>> ranked;
@@ -681,7 +688,8 @@ static void RawProjectFunction(ClientContext &context, TableFunctionInput &data,
 	auto qname = QualifiedName::Parse(bind_data.target);
 	auto catalog_name = qname.catalog.empty() ? INVALID_CATALOG : qname.catalog;
 	auto schema_name = qname.schema.empty() ? DEFAULT_SCHEMA : qname.schema;
-	auto &table = Catalog::GetEntry<TableCatalogEntry>(context, catalog_name, schema_name, qname.name);
+	EntryLookupInfo table_lookup(CatalogType::TABLE_ENTRY, qname.name);
+	auto &table = Catalog::GetEntry(context, catalog_name, schema_name, table_lookup).Cast<TableCatalogEntry>();
 
 	// the hottest observed group set wins
 	string group_set;

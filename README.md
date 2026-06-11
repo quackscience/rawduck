@@ -285,6 +285,11 @@ git submodule update --init
 GEN=ninja make release
 ```
 
+The OTLP/gRPC server compiles in automatically when gRPC and protobuf are available (vcpkg in CI,
+system packages locally) and is always skipped for wasm. To build without it even when available
+(OTLP/HTTP keeps working): `make release RAWDUCK_DISABLE_GRPC=1` (the flag is cached per build
+directory; run `make clean` when toggling it).
+
 Artifacts:
 
 ```sh

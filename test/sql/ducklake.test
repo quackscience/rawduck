@@ -39,13 +39,18 @@ SELECT id, "user.name" FROM lake.main.events ORDER BY id;
 1	NULL
 2	alice
 
-# type widening (BIGINT -> DOUBLE) through DuckLake type evolution
-query IIIIII
-SELECT * FROM raw_ingest('lake.main.events', '[{"id":3.5,"action":"buy"}]');
-----
-lake.main.events	false	0	1	1	0
+# type widening through DuckLake's supported promotions (INTEGER -> BIGINT);
+# promotions outside DuckLake's set (e.g. BIGINT -> DOUBLE) are version-
+# dependent and surface DuckLake's own error instead
+statement ok
+CREATE TABLE lake.main.manual (id INTEGER, action VARCHAR);
 
-query I
-SELECT typeof(id) FROM lake.main.events LIMIT 1;
+query IIIIII
+SELECT * FROM raw_ingest('lake.main.manual', '[{"id":9999999999,"action":"buy"}]');
 ----
-DOUBLE
+lake.main.manual	false	0	1	1	0
+
+query II
+SELECT typeof(id), max(id) FROM lake.main.manual GROUP BY ALL;
+----
+BIGINT	9999999999

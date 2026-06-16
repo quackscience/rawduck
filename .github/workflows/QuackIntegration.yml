@@ -1,0 +1,68 @@
+#
+# RawDuck ↔ Quack integration: build with the quack extension and run raw_quack.test
+#
+name: Quack Integration
+
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'test/sql/raw_quack.test'
+      - 'CMakeLists.txt'
+      - 'extension_config.cmake'
+      - '.github/workflows/QuackIntegration.yml'
+      - 'duckdb/**'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'test/sql/raw_quack.test'
+      - 'CMakeLists.txt'
+      - 'extension_config.cmake'
+      - '.github/workflows/QuackIntegration.yml'
+      - 'duckdb/**'
+  workflow_dispatch:
+
+concurrency:
+  group: quack-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quack-integration:
+    name: rawduck:quack tests
+    runs-on: ubuntu-latest
+    env:
+      GEN: ninja
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      VCPKG_TARGET_TRIPLET: x64-linux
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake ninja-build ccache
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: a42af01b72c28a8e1d7b48107b33e4f286a55ef6
+
+      - name: Add quack to extension build
+        run: |
+          cat >> extension_config.cmake <<'EOF'
+
+          # Quack transport for rawduck:quack integration tests
+          duckdb_extension_load(quack
+              GIT_URL https://github.com/duckdb/duckdb-quack
+              GIT_TAG 1693647c152b438aa2a6a9ad71764f99c5a561e0
+          )
+          EOF
+
+      - name: Build
+        run: make release
+
+      - name: Run Quack integration tests
+        run: ./build/release/test/unittest --test-dir . "test/sql/raw_quack.test"

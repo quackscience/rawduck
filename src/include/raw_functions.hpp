@@ -7,6 +7,8 @@ namespace duckdb {
 
 class OptimizerExtension;
 class StorageExtension;
+struct StorageExtensionInfo;
+class TransactionManager;
 struct RawParseOptions;
 struct RawParsedPayload;
 
@@ -66,6 +68,19 @@ unique_ptr<SchemaCatalogEntry> RawCreateIngestSchema(Catalog &catalog);
 bool RawIsIngestTable(const TableCatalogEntry &table);
 PhysicalOperator &RawPlanIngestInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
                                       optional_ptr<PhysicalOperator> plan);
+PhysicalOperator &RawPlanQuackIngestInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+                                           optional_ptr<PhysicalOperator> plan);
+
+// rawduck:quack:host:port remote attach (requires quack extension at runtime)
+bool RawDuckIsQuackAttach(const string &path);
+unique_ptr<Catalog> RawDuckAttachQuack(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
+                                       AttachedDatabase &db, const string &name, AttachInfo &info,
+                                       AttachOptions &options);
+unique_ptr<TransactionManager> RawDuckQuackCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
+                                                                    AttachedDatabase &db, Catalog &catalog);
+bool RawDuckIsQuackCatalog(Catalog &catalog);
+string RawDuckQuackUri(Catalog &catalog);
+string RawDuckQuackToken(Catalog &catalog);
 
 // constant-time token comparison (HTTP and gRPC auth)
 bool RawTokenEquals(const string &provided, const string &expected);

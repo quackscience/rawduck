@@ -1,0 +1,92 @@
+# name: test/sql/raw_quack.test
+# description: RawDuck over Quack protocol (client queries remote server)
+# group: [sql]
+
+require rawduck
+
+# --- server: start Quack listener and ingest ---
+
+statement ok
+INSTALL quack;
+
+statement ok
+LOAD quack;
+
+query III
+SELECT * FROM quack_serve('quack:127.0.0.1:19920', token := 'rt_secret');
+----
+quack:127.0.0.1:19920	http://127.0.0.1:19920	rt_secret
+
+statement ok
+CALL raw_ingest('events', '[{"action":"click","user":"alice","value":42}]');
+
+# --- client: stateless queries via quack_query ---
+
+query II client
+FROM quack_query('quack:127.0.0.1:19920', 'SELECT action, user FROM events', token := 'rt_secret');
+----
+click	alice
+
+query I client
+FROM quack_query('quack:127.0.0.1:19920', 'SELECT count(*) FROM events', token := 'rt_secret');
+----
+1
+
+# remote ingest from client
+statement ok client
+FROM quack_query('quack:127.0.0.1:19920', $$CALL raw_ingest('events', '[{"action":"view","user":"bob"}]')$$, token := 'rt_secret');
+
+query II client
+FROM quack_query('quack:127.0.0.1:19920', 'SELECT action, user FROM events ORDER BY action', token := 'rt_secret');
+----
+click	alice
+view	bob
+
+# --- client: plain quack attach ---
+
+statement ok client
+ATTACH 'quack:127.0.0.1:19920' AS remote (TOKEN 'rt_secret');
+
+query II client
+SELECT action, user FROM remote.events ORDER BY action;
+----
+click	alice
+view	bob
+
+statement ok client
+DETACH remote;
+
+# --- client: rawduck:quack attach (RawDuck catalog over Quack transport) ---
+
+statement ok client
+ATTACH 'rawduck:quack:127.0.0.1:19920' AS raw (TOKEN 'rt_secret');
+
+query I client
+SELECT type FROM duckdb_databases() WHERE database_name = 'raw';
+----
+rawduck
+
+query II client
+SELECT action, user FROM raw.events ORDER BY action;
+----
+click	alice
+view	bob
+
+# ingest lane via virtual ingest schema
+statement ok client
+INSERT INTO raw.ingest.events VALUES ('{"action":"purchase","user":"carol","value":99}');
+
+query III client
+SELECT action, user, value FROM raw.events ORDER BY action;
+----
+click	alice	42
+purchase	carol	99
+view	bob	NULL
+
+statement ok client
+DETACH raw;
+
+# --- cleanup ---
+
+statement ok
+CALL quack_stop('quack:127.0.0.1:19920');

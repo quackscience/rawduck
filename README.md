@@ -248,6 +248,30 @@ Two kinds of `INSERT` coexist: typed inserts into the real tables behave exactly
 (fixed columns, binder-validated), while inserts into the virtual `ingest` schema take raw JSON
 payloads and handle creation and evolution. Both run in your transaction.
 
+## Remote access via Quack
+
+Query or ingest into a RawDuck server over the [Quack](https://github.com/duckdb/duckdb-quack)
+protocol. The server must run DuckDB with RawDuck loaded (`raw_ingest`, schema evolution, ingest
+lane); the client needs both RawDuck and Quack.
+
+```sql
+-- server
+LOAD rawduck; LOAD quack;
+SELECT * FROM quack_serve('quack:127.0.0.1:19920', token := 'secret');
+CALL raw_ingest('events', '[{"action":"click"}]');
+
+-- client
+LOAD rawduck; LOAD quack;
+ATTACH 'rawduck:quack:127.0.0.1:19920' AS raw (TOKEN 'secret');
+
+SELECT * FROM raw.events;
+INSERT INTO raw.ingest.events VALUES ('{"action":"view","user":"bob"}');
+```
+
+`ATTACH 'rawduck:quack:…'` keeps a **rawduck** catalog identity (including the virtual `ingest`
+schema) while delegating table scans and DML to the remote Quack connection. Plain
+`ATTACH 'quack:…'` works for reads and regular inserts but does not expose `raw.ingest.*`.
+
 ## Transforms
 
 RawDuck reshapes envelope-style telemetry at ingest time: one row per nested event,

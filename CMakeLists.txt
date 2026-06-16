@@ -105,6 +105,7 @@ set(EXTENSION_SOURCES
     src/raw_records.cpp
     src/raw_ingest.cpp
     src/raw_attach.cpp
+    src/raw_quack_attach.cpp
     src/raw_async.cpp
     src/raw_insert.cpp
     src/raw_api.cpp

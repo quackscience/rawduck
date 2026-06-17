@@ -4,13 +4,11 @@
 
 require rawduck
 
+require quack
+
+require httpfs
+
 # --- server: start Quack listener and ingest ---
-
-statement ok
-INSTALL quack;
-
-statement ok
-LOAD quack;
 
 query III
 SELECT * FROM quack_serve('quack:127.0.0.1:19920', token := 'rt_secret');

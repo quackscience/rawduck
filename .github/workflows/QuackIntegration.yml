@@ -55,6 +55,10 @@ jobs:
           cat >> extension_config.cmake <<'EOF'
 
           # Quack transport for rawduck:quack integration tests
+          duckdb_extension_load(httpfs
+              GIT_URL https://github.com/duckdb/duckdb-httpfs
+              GIT_TAG 13e18b3c9f3810334f5972b76a3acc247b28e537
+          )
           duckdb_extension_load(quack
               GIT_URL https://github.com/duckdb/duckdb-quack
               GIT_TAG 1693647c152b438aa2a6a9ad71764f99c5a561e0

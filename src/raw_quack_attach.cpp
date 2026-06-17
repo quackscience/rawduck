@@ -206,7 +206,7 @@ public:
 	static constexpr idx_t BATCH_ROWS = 30000;
 
 	PhysicalRawQuackIngest(PhysicalPlan &plan, string quack_uri_p, string token_p, string table_name_p,
-	                         idx_t estimated_cardinality)
+	                       idx_t estimated_cardinality)
 	    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, estimated_cardinality),
 	      quack_uri(std::move(quack_uri_p)), token(std::move(token_p)), table_name(std::move(table_name_p)) {
 	}
@@ -350,7 +350,7 @@ unique_ptr<Catalog> RawDuckAttachQuack(optional_ptr<StorageExtensionInfo> storag
 }
 
 unique_ptr<TransactionManager> RawDuckQuackCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
-                                                                      AttachedDatabase &db, Catalog &catalog) {
+                                                                    AttachedDatabase &db, Catalog &catalog) {
 	auto &rawduck_quack = catalog.Cast<RawDuckQuackCatalog>();
 	auto quack_ext = StorageExtension::Find(db.GetDatabase().config, "quack");
 	if (!quack_ext || !quack_ext->create_transaction_manager) {

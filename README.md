@@ -11,7 +11,7 @@ flattens nested objects into real columns, transforms and evolves the schema as 
 ### ⚡ Benefits
 No `CREATE TABLE`, no schema declarations, no `json_extract` at query time. Because data lands
 shredded into native typed columns instead of opaque JSON strings, analytical queries run
-**45–265× faster** on **40% smaller** than the JSON-column approach (see benchmark).
+**15–38× faster** on telemetry queries, **3.5× smaller** on disk — see benchmark.
 
 ### ⚙️ Under the hood
 RawDuck delivers a complete engine rather than a parser: ingestion is transactional, pipelined, and
@@ -61,61 +61,31 @@ For ingestion outside a RawDuck store (the default in-memory catalog, DuckLake, 
 commands are table functions: invoke them with `CALL`, or use `SELECT ... FROM fn(...)` when you
 want to project or filter their result columns.
 
-## Benchmark: one hour of GitHub, three ways
+## Benchmark: OTEL at line speed
 
-Real [GH Archive](https://www.gharchive.org/) data — **247,199 GitHub events, 956 MB of NDJSON,
-wildly heterogeneous payloads** (the dataset RawBench uses). One `INSERT` shredded it into
-**914 typed columns**, schema evolution included. The baseline is the standard DuckDB JSON
-extension pattern: a single `JSON` column queried with `->>` paths.
+Real OTLP/JSON export envelopes — logs, metrics, traces — shredded into typed columns on
+ingest. Apple Silicon, DuckDB v1.5.3, 1M records per signal:
 
-Same machine (Apple Silicon, DuckDB v1.5.3), best of 3:
-
-| RawBench-style query | JSON column (`->>`) | RawDuck typed columns | speedup |
+| signal | ingest | records/s | on disk |
 |---|---:|---:|---:|
-| count by event type | 231 ms | 1 ms | **231×** |
-| top repos by pushes | 268 ms | 3 ms | **89×** |
-| distinct repos per actor | 457 ms | 10 ms | **46×** |
-| sum of push payload sizes | 265 ms | 1 ms | **265×** |
-| events per minute | 236 ms | 3 ms | **79×** |
-| *all five combined* | *1.46 s* | *18 ms* | **~80×** |
+| traces | 1.65 s | **604k** | 72 MB |
+| logs | 1.71 s | **586k** | 61 MB |
+| metrics | 1.30 s | **771k** | 56 MB |
 
-| | JSON column | RawDuck |
-|---|---:|---:|
-| ingest (full hour, 956 MB) | 1.4 s | **~6 s** |
-| storage on disk | 1.05 GB | **627 MB** |
-
-Ingestion is fully parallel (zero-copy parse from source vectors, multi-threaded appends,
-drain-free schema evolution): the pipeline sustains **~6.1M rows/s** on narrow JSON and lands the
-heterogeneous 956 MB hour in ~6 s — a one-time cost a few times that of loading opaque JSON
-strings, in exchange for every later query being 45–265× faster and the data 40% smaller on disk.
-
-On the realistic telemetry workload — OTLP/JSON logs, metrics, and traces — `raw_ingest_file(...,
-transform := 'otlp-traces')` shreds the nested export envelopes (KeyValue attributes flattened to
-typed columns, byte ids normalized to hex) at **~600k–770k records/s per signal** (3M records in
-4.66 s, ~10× smaller on disk), with the same 15–38× query speedup over a JSON column. Fat export
-envelopes that explode into many records are parallelized automatically via byte-aware batching — no
-`batch_size` tuning needed. See [BENCHMARK.md](BENCHMARK.md).
-
-The append pool is **drain-free by default**: worker collections stay in memory during a load and
-flush in one parallel burst at the end, which keeps peak memory low and is optimal for evolving
-(schema-churning) payloads. For large *stable-schema* bulk imports you can opt into overlapping
-parse with compression/IO by flushing completed row groups mid-append:
+**3M telemetry records in 4.7 s.** Queries on shredded spans run **15–38× faster** than a JSON
+column with identical results; storage is **3.5× smaller**. One call handles envelope explode,
+KeyValue attribute flattening, and byte-id normalization — no schema upfront:
 
 ```sql
-SET rawduck_overlap_flush = true;   -- ~10-15% faster on large stable imports, higher peak memory
+CALL raw_ingest_file('traces', 'export.ndjson', transform := 'otlp-traces');
+
+SELECT "resource.service.name", count(*) FROM traces
+WHERE "http.status_code" >= 500 GROUP BY 1;   -- 3 ms
 ```
 
-It is off by default and a no-op while a load is still adding columns (the pool falls back to
-drain-free during churn), so it never slows down or destabilizes the evolving case. The trade is
-purely peak memory vs throughput on stable large imports; small/streaming inserts are unaffected.
-
-```sql
-INSERT INTO raw.ingest.gh_events SELECT json::VARCHAR FROM read_json(...);  -- ~6s, 914 columns
-
-SELECT type, count(*) FROM raw.gh_events GROUP BY type ORDER BY 2 DESC;      -- 1 ms
-SELECT "repo.name", count(*) AS pushes FROM raw.gh_events
-WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 3 ms
-```
+As a wide-schema stress test, one hour of [GH Archive](https://www.gharchive.org/) data (914
+columns, 247k events) still lands in ~13 s with **45–265×** query speedup over JSON columns.
+Full methodology, query suites, and reproduction steps: [BENCHMARK.md](BENCHMARK.md).
 
 ## Functions
 

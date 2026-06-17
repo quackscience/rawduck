@@ -27,6 +27,7 @@ jobs:
       ci_tools_version: v1.5-variegata
       extension_name: rawduck
       opt_in_archs: 'linux_amd64'
+      use_merged_vcpkg_manifest: '1'
       extra_extension_config: |
         duckdb_extension_load(httpfs
             GIT_URL https://github.com/duckdb/duckdb-httpfs

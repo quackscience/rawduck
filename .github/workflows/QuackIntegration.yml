@@ -4,14 +4,6 @@
 name: Quack Integration
 
 on:
-  push:
-    paths:
-      - 'src/**'
-      - 'test/sql/raw_quack.test'
-      - 'CMakeLists.txt'
-      - 'extension_config.cmake'
-      - '.github/workflows/QuackIntegration.yml'
-      - 'duckdb/**'
   pull_request:
     paths:
       - 'src/**'
@@ -23,7 +15,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: quack-${{ github.workflow }}-${{ github.ref }}
+  group: quack-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:

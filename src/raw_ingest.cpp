@@ -193,17 +193,20 @@ static unique_ptr<MaterializedQueryResult> RunQuery(Connection &conn, const stri
 // RawAppendPool: multi-threaded appends
 //
 // Worker threads extract payload batches into private optimistic row-group
-// collections (the same mechanism as DuckDB's parallel INSERT sink); the
-// collections merge into transaction-local storage on the main thread when
-// the pool drains. The pool must drain before any DDL, so the table schema
-// is frozen for its lifetime.
+// collections (the same mechanism as DuckDB's parallel INSERT sink), flushing
+// completed row groups to disk as they go so parse/compression/I/O overlap;
+// the collections merge into transaction-local storage on the main thread when
+// the pool drains. Schema evolution is barrier-free: new columns are published
+// to an append-only list and each worker pads its own collection (and rebuilds
+// its flush writer against the evolved storage) when it next picks up a batch.
+// Only type widening drains the pool.
 //===--------------------------------------------------------------------===//
 
 class RawAppendPool {
 public:
-	RawAppendPool(ClientContext &context, TableCatalogEntry &table, idx_t worker_count)
+	RawAppendPool(ClientContext &context, TableCatalogEntry &table, idx_t worker_count, bool overlap_flush)
 	    : context(context), block_manager_ref(table.GetStorage().GetTableIOManager().GetBlockManagerForRowData()),
-	      types(table.GetTypes()) {
+	      flush_storage(&table.GetStorage()), overlap_flush(overlap_flush), types(table.GetTypes()) {
 		auto &storage = table.GetStorage();
 		idx_t physical_index = 0;
 		for (auto &column : table.GetColumns().Physical()) {
@@ -244,8 +247,13 @@ public:
 	// columns to an append-only list; each worker pads its own collection to
 	// the published prefix when it next picks up a batch. Worker layouts are
 	// always a prefix of the table layout, so merges stay positional.
-	void PublishColumns(const vector<pair<string, LogicalType>> &new_columns) {
+	void PublishColumns(const vector<pair<string, LogicalType>> &new_columns, DataTable &current_storage) {
 		std::unique_lock<mutex> guard(lock);
+		// the ALTER swapped the table's storage object; flush writers rebuilt
+		// after this point must target it (its column count covers every
+		// published column, so it is always a valid superset of any worker's
+		// prefix layout)
+		flush_storage = &current_storage;
 		for (auto &new_column : new_columns) {
 			slots[new_column.first] = types.size();
 			types.push_back(new_column.second);
@@ -277,9 +285,12 @@ public:
 				}
 			}
 			if (!missing.empty()) {
-				ExtendWorker(worker, missing);
+				ExtendWorker(worker, missing, storage);
 			}
-			worker.writer = make_uniq<OptimisticDataWriter>(context, storage);
+			// the worker's writer already targets the current storage: it was
+			// created against it (no evolution) or rebuilt by ExtendWorker, and
+			// it holds the partial blocks from incremental flushes, so reuse it
+			// rather than dropping that state on the floor.
 			flushers.emplace_back([&worker, merge_threshold] {
 				auto &collection = *worker.collection->collection;
 				collection.FinalizeAppend(TransactionData(0, 0), *worker.append_state);
@@ -349,6 +360,7 @@ private:
 			while (true) {
 				shared_ptr<RawParsedPayload> parsed;
 				vector<pair<string, LogicalType>> pending_columns;
+				DataTable *pending_storage = nullptr;
 				{
 					std::unique_lock<mutex> guard(lock);
 					worker_cv.wait(guard, [&] { return !queue.empty() || stopped; });
@@ -361,21 +373,28 @@ private:
 					for (idx_t i = worker.local_types.size(); i < types.size(); i++) {
 						pending_columns.emplace_back(string(), types[i]);
 					}
-					idx_t pending_index = 0;
 					for (auto &slot : slots) {
 						if (slot.second >= worker.local_types.size()) {
 							pending_columns[slot.second - worker.local_types.size()].first = slot.first;
 						}
-						(void)pending_index;
 					}
+					pending_storage = flush_storage;
 					producer_cv.notify_one();
 				}
+				// flush completed row groups during append only when overlap is
+				// enabled AND the schema is stable for this worker. A batch that
+				// still carries new columns means the stream is churning:
+				// deferring the flush keeps the drain-free behaviour (one flush
+				// at the final width) and avoids re-extending freshly
+				// checkpointed row groups, the expensive interaction on wide
+				// evolving payloads.
+				bool schema_stable = overlap_flush && pending_columns.empty();
 				if (!pending_columns.empty()) {
-					ExtendWorker(worker, pending_columns);
+					ExtendWorker(worker, pending_columns, *pending_storage);
 					chunk.Destroy();
 					chunk.Initialize(Allocator::Get(context), worker.local_types);
 				}
-				AppendBatch(worker, *parsed, chunk);
+				AppendBatch(worker, *parsed, chunk, schema_stable);
 			}
 		} catch (...) {
 			std::unique_lock<mutex> guard(lock);
@@ -389,8 +408,14 @@ private:
 	}
 
 	// pads this worker's collection with NULL-filled columns: metadata-only
-	// work through RowGroupCollection::AddColumn
-	void ExtendWorker(Worker &worker, const vector<pair<string, LogicalType>> &new_columns) {
+	// work through RowGroupCollection::AddColumn. The worker may have already
+	// flushed complete row groups to disk (incremental WriteNewRowGroup);
+	// AddColumn extends those checkpointed row groups too (existing columns
+	// stay on disk, the new column is materialized NULL in memory). The flush
+	// writer is then rebuilt against the post-ALTER storage so subsequent
+	// WriteNewRowGroup calls see the evolved column/compression layout, while
+	// the partial blocks written so far are carried forward via Merge.
+	void ExtendWorker(Worker &worker, const vector<pair<string, LogicalType>> &new_columns, DataTable &flush_storage) {
 		worker.collection->collection->FinalizeAppend(TransactionData(0, 0), *worker.append_state);
 		for (auto &new_column : new_columns) {
 			ColumnDefinition definition(new_column.first, new_column.second);
@@ -406,11 +431,14 @@ private:
 			worker.local_slots[new_column.first] = worker.local_types.size();
 			worker.local_types.push_back(new_column.second);
 		}
+		auto rebuilt = make_uniq<OptimisticDataWriter>(context, flush_storage);
+		rebuilt->Merge(*worker.writer);
+		worker.writer = std::move(rebuilt);
 		worker.append_state = make_uniq<TableAppendState>();
 		worker.collection->collection->InitializeAppend(*worker.append_state);
 	}
 
-	void AppendBatch(Worker &worker, RawParsedPayload &parsed, DataChunk &chunk) {
+	void AppendBatch(Worker &worker, RawParsedPayload &parsed, DataChunk &chunk, bool allow_flush) {
 		auto &types = worker.local_types;
 		auto &slots = worker.local_slots;
 		RawExtractor extractor(*parsed.root, parsed.columns);
@@ -449,10 +477,14 @@ private:
 				}
 			}
 			chunk.SetCardinality(count);
-			// collections stay purely in-memory: schema evolution can then
-			// extend them safely, and flushing happens in parallel at drain
-			// with the final layout
-			collection_of(worker).Append(chunk, *worker.append_state);
+			// flush completed row groups to disk as we go, overlapping parse +
+			// compression + I/O instead of deferring every byte to drain. The
+			// writer targets the current storage layout; schema evolution
+			// rebuilds it (ExtendWorker) so AddColumn stays safe across flushes.
+			bool row_group_complete = collection_of(worker).Append(chunk, *worker.append_state);
+			if (row_group_complete && allow_flush) {
+				worker.writer->WriteNewRowGroup(*worker.collection);
+			}
 		}
 	}
 
@@ -462,6 +494,15 @@ private:
 
 	ClientContext &context;
 	BlockManager &block_manager_ref;
+	// the DataTable that flush writers must target: ALTERs swap the storage
+	// object, so this is republished (with the new columns) on every evolution
+	// and read by workers when they rebuild their writer. Guarded by `lock`.
+	DataTable *flush_storage;
+	// opt-in (rawduck_overlap_flush): overlap parse with compression/IO by
+	// flushing completed row groups mid-append. Off by default: the pool stays
+	// drain-free (one flush burst at the final width), which is lower peak
+	// memory and optimal for schema-churn payloads.
+	bool overlap_flush;
 	vector<LogicalType> types;
 	case_insensitive_map_t<idx_t> slots;
 	vector<Worker> workers;
@@ -615,12 +656,14 @@ private:
 				pool.reset();
 			}
 			EvolveNative(catalog, *table, parsed);
-			if (pool && !adds.empty()) {
-				pool->PublishColumns(adds);
-			}
 			table = LookupTable();
 			if (!table) {
 				throw InternalException("RawDuck: table %s disappeared during ingestion", target);
+			}
+			if (pool && !adds.empty()) {
+				// publish against the post-ALTER storage so workers rebuild
+				// their flush writers to the evolved layout
+				pool->PublishColumns(adds, table->GetStorage());
 			}
 			lock_guard<mutex> guard(cache.lock);
 			auto &entry = cache.tables[cache_key];
@@ -637,13 +680,20 @@ private:
 		                                             DatabaseModificationType::INSERT_DATA);
 		if (!pool && PoolEligible(*table, parsed)) {
 			auto worker_count = MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() / 2, 4));
-			pool = make_uniq<RawAppendPool>(context, *table, worker_count);
+			pool = make_uniq<RawAppendPool>(context, *table, worker_count, OverlapFlushEnabled());
 		}
 		if (pool) {
 			pool->Submit(std::move(parsed_ptr));
 			return;
 		}
 		AppendNative(*table, parsed);
+	}
+
+	// rawduck_overlap_flush: opt-in parse/flush overlap for the append pool
+	bool OverlapFlushEnabled() {
+		Value enabled;
+		return context.TryGetCurrentSetting("rawduck_overlap_flush", enabled) && !enabled.IsNull() &&
+		       enabled.GetValue<bool>();
 	}
 
 	void LegacyIngestNative(shared_ptr<RawParsedPayload> parsed_ptr, optional_ptr<TableCatalogEntry> table) {
@@ -677,7 +727,12 @@ private:
 			EvolveNative(catalog, *table, parsed);
 			if (pool && !adds.empty()) {
 				// drain-free, barrier-free: workers pad their own collections
-				pool->PublishColumns(adds);
+				// and rebuild their flush writers against the post-ALTER storage
+				auto evolved = LookupTable();
+				if (!evolved) {
+					throw InternalException("RawDuck: table %s disappeared during ingestion", target);
+				}
+				pool->PublishColumns(adds, evolved->GetStorage());
 			}
 		}
 		if (parsed.payload.rows.empty()) {
@@ -690,7 +745,7 @@ private:
 		}
 		if (!pool && PoolEligible(*table, parsed)) {
 			auto worker_count = MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() / 2, 4));
-			pool = make_uniq<RawAppendPool>(context, *table, worker_count);
+			pool = make_uniq<RawAppendPool>(context, *table, worker_count, OverlapFlushEnabled());
 		}
 		if (pool) {
 			pool->Submit(std::move(parsed_ptr));
@@ -1103,6 +1158,14 @@ TableFunction GetRawIngestFunction() {
 
 static constexpr idx_t RAW_DEFAULT_BATCH_SIZE = 30000;
 static constexpr idx_t RAW_READ_BUFFER_SIZE = 16ULL * 1024ULL * 1024ULL;
+// A batch is closed at whichever comes first: batch_size *lines* or this many
+// *bytes*. The byte cap is what keeps the parse threads fed when each NDJSON
+// line is a fat container that explodes into many records (OTLP export
+// envelopes, CloudWatch log groups, ...): without it the whole file can land in
+// a single line-count batch and parsing serializes onto one thread. Sized well
+// above a flat-record batch (30k records of typical JSON) so plain NDJSON still
+// batches by line count and schema-evolution rounds are unaffected.
+static constexpr idx_t RAW_BATCH_BYTE_TARGET = 8ULL * 1024ULL * 1024ULL;
 
 static unique_ptr<FunctionData> RawIngestFileBind(ClientContext &context, TableFunctionBindInput &input,
                                                   vector<LogicalType> &return_types, vector<string> &names) {
@@ -1261,15 +1324,17 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 					}
 				}
 				pending.append(buffer.get(), NumericCast<idx_t>(read));
-				while (pending_lines >= batch_size) {
-					// split off the first batch_size lines
+				// close a batch on the line cap, or earlier on the byte cap when
+				// lines are fat (so OTLP/container payloads still parallelize)
+				while (pending_lines >= batch_size || (pending.size() >= RAW_BATCH_BYTE_TARGET && pending_lines > 0)) {
+					idx_t take = MinValue<idx_t>(pending_lines, batch_size);
 					idx_t split = 0;
-					for (idx_t line = 0; line < batch_size; line++) {
+					for (idx_t line = 0; line < take; line++) {
 						split = pending.find('\n', split) + 1;
 					}
 					emit(pending.substr(0, split));
 					pending.erase(0, split);
-					pending_lines -= batch_size;
+					pending_lines -= take;
 				}
 			}
 			emit(std::move(pending));
@@ -1281,7 +1346,7 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 
 	// parse workers: parsing and inference are pure and scale with cores;
 	// batch order is irrelevant to ingestion
-	auto parser_count = MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() / 4, 3));
+	auto parser_count = MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() / 3, 4));
 	pipeline.active_parsers = parser_count;
 	vector<std::thread> parsers;
 	for (idx_t i = 0; i < parser_count; i++) {

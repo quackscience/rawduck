@@ -22,7 +22,7 @@ release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; f
 |---|---|
 | `raw_json.cpp/.hpp` | **Pure, context-free core**: payload parsing (JSON/NDJSON), schema inference tree (`RawNode`), type lattice, flattening, multi-level explode transform, vectorized extraction (`RawExtractor` + `FillVector`). Never touches `ClientContext` — this is what makes parse threads safe. |
 | `raw_records.cpp` | `raw_records()` table function; shared named-parameter handling (`RawBindParseOptions`). |
-| `raw_ingest.cpp` | `RawIngestor` (native catalog/storage ingestion + DuckLake SQL fallback), `RawAppendPool` (multi-threaded appends), `RawIngestPipeline` (background parse thread), `raw_ingest()` / `raw_ingest_file()`. |
+| `raw_ingest.cpp` | `RawIngestor` (native catalog/storage ingestion + DuckLake SQL fallback), `RawAppendPool` (multi-threaded appends), `RawIngestPipeline` (reader → parse threads → consumer), `raw_ingest()` / `raw_ingest_file()`. The reader closes a batch at whichever comes first: `batch_size` *lines* or `RAW_BATCH_BYTE_TARGET` *bytes* — the byte cap is essential for *container* payloads (OTLP export envelopes, CloudWatch log groups) where one NDJSON line explodes into many records: without it the whole file lands in a single line-count batch and parsing serializes onto one thread. |
 | `raw_optimize.cpp` | Optimizer hooks (predicate/group observation, projection rewrite), `raw_stats()`, `raw_optimize()`, `raw_projections()`, `raw_project()`, `raw_stats_save/load()`. |
 | `raw_transforms.cpp` | User-defined transform registry, `raw_transform_define()` scalar, `raw_transforms()`. |
 | `raw_attach.cpp` | `ATTACH 'rawduck:...'` storage extension (`RawDuckCatalog : DuckCatalog`). |
@@ -61,6 +61,15 @@ release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; f
    CURRENT storage at drain (compression metadata and per-column partial block managers must match
    the evolved layout); the merge target must be the current catalog entry (ALTER swaps the
    storage object). Only type widening drains the pool.
+   By default collections stay in memory and flush in one parallel burst at drain (lowest peak
+   memory, optimal for churn). `rawduck_overlap_flush` (off by default) opts into flushing
+   completed row groups mid-append to overlap parse with compression/IO — but **only while the
+   worker's schema is stable** (`pending_columns.empty()`): churning batches keep deferring, so a
+   freshly checkpointed row group is never re-extended. With it on, a worker that evolves must
+   rebuild its flush writer against the post-ALTER storage (published via `PublishColumns`) and
+   carry forward already-flushed partial blocks (`OptimisticDataWriter::Merge`); the worker's
+   writer must always target a storage whose column count ≥ the worker's local prefix. Trade-off:
+   ~10–15% faster on large stable imports, higher peak memory.
 
 5. **Extraction is row-major.** Each row's JSON tree is traversed once and values are routed to
    column slots via schema-tree node identity (`RawExtractor`). Do not reintroduce per-column path

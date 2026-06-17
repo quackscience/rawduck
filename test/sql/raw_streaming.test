@@ -1,0 +1,223 @@
+# name: test/sql/raw_streaming.test
+# description: Realistic streaming ingestion - small evolving batches, mid-stream
+# group: [sql]
+
+#              schema conflicts, immediate visibility, and large single imports
+
+require rawduck
+
+require json
+
+#===----------------------------------------------------------------------===#
+# Streaming small batches (the OTEL exporter shape): each insert is its own
+# synchronous transaction, so rows are visible the moment the call returns.
+#===----------------------------------------------------------------------===#
+
+statement ok
+SELECT * FROM raw_ingest('spans', '[{"trace_id":"a1","service":"cart","duration_ms":12.5},{"trace_id":"a2","service":"cart","duration_ms":3.0}]');
+
+# immediately visible after the call returns
+query I
+SELECT count(*) FROM spans;
+----
+2
+
+statement ok
+SELECT * FROM raw_ingest('spans', '[{"trace_id":"a3","service":"checkout","duration_ms":40.0}]');
+
+query I
+SELECT count(*) FROM spans;
+----
+3
+
+# a stable repeated shape is absorbed by the schema cache: no new columns
+query I
+SELECT columns_added FROM raw_ingest('spans', '[{"trace_id":"a4","service":"auth","duration_ms":1.0}]');
+----
+0
+
+#===----------------------------------------------------------------------===#
+# Mid-stream schema evolution: a new attribute appears, old rows read back NULL
+#===----------------------------------------------------------------------===#
+
+query I
+SELECT columns_added FROM raw_ingest('spans', '[{"trace_id":"a5","service":"search","duration_ms":7.0,"feature_flag":"b"}]');
+----
+1
+
+query I
+SELECT count(*) FROM spans WHERE feature_flag IS NULL;
+----
+4
+
+query I
+SELECT feature_flag FROM spans WHERE trace_id = 'a5';
+----
+b
+
+#===----------------------------------------------------------------------===#
+# Mid-stream type conflict: duration_ms arrives as text, service_code as int
+# then text. Widening must preserve every row and value (lattice never drops).
+#===----------------------------------------------------------------------===#
+
+query I
+SELECT columns_widened FROM raw_ingest('spans', '[{"trace_id":"a6","service":"cart","duration_ms":"unknown"}]');
+----
+1
+
+# all six rows survive the widening
+query I
+SELECT count(*) FROM spans;
+----
+6
+
+# the earlier numeric values are preserved as text after widening to VARCHAR
+query I
+SELECT duration_ms FROM spans WHERE trace_id = 'a1';
+----
+12.5
+
+query I
+SELECT duration_ms FROM spans WHERE trace_id = 'a6';
+----
+unknown
+
+#===----------------------------------------------------------------------===#
+# Large single import through the multi-threaded append pool (>= pool threshold)
+#===----------------------------------------------------------------------===#
+
+statement ok
+COPY (SELECT range AS id, 'svc_' || (range % 8) AS service, (range * 1.5) AS latency FROM range(50000))
+TO '__TEST_DIR__/bulk.ndjson' (FORMAT json);
+
+query II
+SELECT rows, errors FROM raw_ingest_file('bulk', '__TEST_DIR__/bulk.ndjson');
+----
+50000	0
+
+query I
+SELECT count(*) FROM bulk;
+----
+50000
+
+# values are intact after the parallel append + drain merge
+query II
+SELECT sum(id), count(DISTINCT service) FROM bulk;
+----
+1249975000	8
+
+#===----------------------------------------------------------------------===#
+# Opt-in parse/flush overlap (rawduck_overlap_flush): the append pool flushes
+# completed row groups mid-append while the schema is stable. Must produce
+# byte-identical results to the default drain-free path.
+#===----------------------------------------------------------------------===#
+
+statement ok
+SET rawduck_overlap_flush = true;
+
+query II
+SELECT rows, errors FROM raw_ingest_file('bulk_overlap', '__TEST_DIR__/bulk.ndjson');
+----
+50000	0
+
+query III
+SELECT count(*), sum(id), count(DISTINCT service) FROM bulk_overlap;
+----
+50000	1249975000	8
+
+statement ok
+SET rawduck_overlap_flush = false;
+
+#===----------------------------------------------------------------------===#
+# Sparse-wide correctness: disjoint keys per row produce many columns with
+# mostly-NULL cells; populated values must land in the right column.
+#===----------------------------------------------------------------------===#
+
+statement ok
+SELECT * FROM raw_ingest('wide', '[{"k0":0,"k1":1},{"k2":2,"k3":3},{"k4":4,"k5":5}]');
+
+query I
+SELECT count(*) FROM pragma_table_info('wide');
+----
+6
+
+query I
+SELECT count(*) FROM wide;
+----
+3
+
+# each populated cell is in its own column; everything else is NULL
+query I
+SELECT k0 FROM wide WHERE k0 IS NOT NULL;
+----
+0
+
+query I
+SELECT k5 FROM wide WHERE k5 IS NOT NULL;
+----
+5
+
+query I
+SELECT count(*) FROM wide WHERE k0 IS NULL;
+----
+2
+
+#===----------------------------------------------------------------------===#
+# Streaming across batch boundaries: schema discovered incrementally must still
+# yield the full row count and correct values (no rows stranded mid-stream).
+#===----------------------------------------------------------------------===#
+
+statement ok
+COPY (SELECT range AS n, 'tag' || (range % 3) AS tag FROM range(25000))
+TO '__TEST_DIR__/stream.ndjson' (FORMAT json);
+
+query II
+SELECT rows, batches FROM raw_ingest_file('streamed', '__TEST_DIR__/stream.ndjson', batch_size := 2500);
+----
+25000	10
+
+query II
+SELECT count(*), count(DISTINCT tag) FROM streamed;
+----
+25000	3
+
+#===----------------------------------------------------------------------===#
+# OTLP through the file pipeline: every NDJSON line is a fat export envelope
+# that explodes into many spans. The transform must shred KeyValue attributes
+# into typed columns and every span must survive the multi-batch parse.
+#===----------------------------------------------------------------------===#
+
+statement ok
+COPY (
+  SELECT [{
+    'resource': {'attributes': [{'key': 'service.name', 'value': {'stringValue': 'svc_' || (env % 4)}}]},
+    'scopeSpans': [{'spans': spans}]
+  }] AS "resourceSpans"
+  FROM (
+    SELECT env, list({
+      'name': 'op',
+      'kind': (sp % 5) + 1,
+      'attributes': [{'key': 'http.method', 'value': {'stringValue': CASE WHEN sp % 2 = 0 THEN 'GET' ELSE 'POST' END}}]
+    }) AS spans
+    FROM (SELECT range // 10 AS env, range % 10 AS sp FROM range(20000))
+    GROUP BY env
+  )
+) TO '__TEST_DIR__/otlp_traces.ndjson' (FORMAT json);
+
+# 2000 envelopes on disk, 10 spans each
+query II
+SELECT rows, errors FROM raw_ingest_file('otlp', '__TEST_DIR__/otlp_traces.ndjson', transform := 'otlp-traces');
+----
+20000	0
+
+# KeyValue attributes shredded to typed columns; resource attrs prefixed
+query III
+SELECT count(*), count(DISTINCT "resource.service.name"), max(kind) FROM otlp;
+----
+20000	4	5
+
+query TI
+SELECT "http.method", count(*) FROM otlp GROUP BY 1 ORDER BY 1;
+----
+GET	10000
+POST	10000

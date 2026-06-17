@@ -89,6 +89,26 @@ drain-free schema evolution): the pipeline sustains **~6.1M rows/s** on narrow J
 heterogeneous 956 MB hour in ~6 s — a one-time cost a few times that of loading opaque JSON
 strings, in exchange for every later query being 45–265× faster and the data 40% smaller on disk.
 
+On the realistic telemetry workload — OTLP/JSON logs, metrics, and traces — `raw_ingest_file(...,
+transform := 'otlp-traces')` shreds the nested export envelopes (KeyValue attributes flattened to
+typed columns, byte ids normalized to hex) at **~600k–770k records/s per signal** (3M records in
+4.66 s, ~10× smaller on disk), with the same 15–38× query speedup over a JSON column. Fat export
+envelopes that explode into many records are parallelized automatically via byte-aware batching — no
+`batch_size` tuning needed. See [BENCHMARK.md](BENCHMARK.md).
+
+The append pool is **drain-free by default**: worker collections stay in memory during a load and
+flush in one parallel burst at the end, which keeps peak memory low and is optimal for evolving
+(schema-churning) payloads. For large *stable-schema* bulk imports you can opt into overlapping
+parse with compression/IO by flushing completed row groups mid-append:
+
+```sql
+SET rawduck_overlap_flush = true;   -- ~10-15% faster on large stable imports, higher peak memory
+```
+
+It is off by default and a no-op while a load is still adding columns (the pool falls back to
+drain-free during churn), so it never slows down or destabilizes the evolving case. The trade is
+purely peak memory vs throughput on stable large imports; small/streaming inserts are unaffected.
+
 ```sql
 INSERT INTO raw.ingest.gh_events SELECT json::VARCHAR FROM read_json(...);  -- ~6s, 914 columns
 
@@ -158,10 +178,11 @@ Semantics to know before enabling it:
   session does not un-enqueue them, and a failed background flush drops that batch.
 - Data buffered for less than the age threshold is lost if the database closes first; call
   `raw_flush()` before shutdown.
-- The HTTP and gRPC servers ingest asynchronously by default (their clients are exactly the
-  many-small-writers case, and a single flusher also serializes schema evolution instead of
-  letting per-request transactions race on it). Start them with `async := false` to make every
-  request its own synchronous transaction.
+- The HTTP and gRPC servers ingest **synchronously by default**: a row is queryable the moment
+  the insert call returns, which is what insert-then-query clients expect. Pass `async := true`
+  to opt into buffered ingestion when the workload is many concurrent fire-and-forget producers
+  (a single flusher then also serializes schema evolution instead of letting per-request
+  transactions race on it); call `raw_flush()` to drain before reading.
 
 ## HTTP API
 
@@ -175,11 +196,11 @@ CALL raw_serve_stop();
 ```sh
 curl -X POST localhost:9999/v1/tables/events -H "Authorization: Bearer rt_secret" \
      -d '[{"action":"click","user":"alice","value":42}]'
-# {"table":"events","inserted":1,"created":true,"columns_added":3,"errors":0}
+# {"inserted":1}
 
 curl -X POST localhost:9999/v1/query -H "Authorization: Bearer rt_secret" \
      -d '{"sql":"SELECT action, count(*) FROM events GROUP BY action"}'
-# {"meta":[...],"data":[["click",1]],"rows":1,"statistics":{"elapsed":0.0016}}
+# {"meta":[...],"data":[{"action":"click","count_star":1}],"rows":1,"statistics":{"elapsed":0.0016,"rows_read":1,"bytes_read":16},"hints":[]}
 ```
 
 | Endpoint | Behavior |

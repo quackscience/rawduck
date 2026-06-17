@@ -46,6 +46,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Rewrite eligible count(*) aggregations onto fresh materialized projections "
 	                          "(append-only workloads)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("rawduck_overlap_flush",
+	                          "Flush completed row groups during a large multi-threaded ingest while the schema is "
+	                          "stable, overlapping parse with compression/IO. Faster on large stable-schema imports "
+	                          "at the cost of higher peak memory; off by default (drain-free)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	// ATTACH 'rawduck:store.db' AS raw
 	StorageExtension::Register(config, "rawduck", GetRawDuckStorageExtension());
 }

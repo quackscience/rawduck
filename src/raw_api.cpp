@@ -8,6 +8,7 @@
 #include "httplib.hpp"
 
 #include <thread>
+#include <unordered_map>
 
 namespace duckdb {
 
@@ -37,7 +38,7 @@ struct RawApiServer {
 	string host;
 	int port = 0;
 	string token;
-	bool async = true;
+	bool async = false;
 	bool running = false;
 
 	// stop the listener and join the thread; safe to call repeatedly
@@ -86,11 +87,67 @@ void Respond(duckdb_httplib::Response &res, int status, JsonDoc &json, duckdb_yy
 	res.set_content(json.Write(root), "application/json");
 }
 
-void RespondError(duckdb_httplib::Response &res, int status, const string &message) {
+void RespondError(duckdb_httplib::Response &res, int status, const string &message, const string &hint = "") {
 	JsonDoc json;
 	auto root = duckdb_yyjson::yyjson_mut_obj(json.doc);
 	duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, root, "error", message.c_str(), message.size());
+	duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, root, "message", message.c_str(), message.size());
+	duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, root, "hint", hint.c_str(), hint.size());
 	Respond(res, status, json, root);
+}
+
+static string ApiTypeName(const string &duckdb_type) {
+	static const unordered_map<string, string> mapping = {
+	    {"VARCHAR", "String"}, {"BIGINT", "Int64"}, {"INTEGER", "Int32"},      {"INT32", "Int32"},
+	    {"DOUBLE", "Float64"}, {"BOOLEAN", "Bool"}, {"TIMESTAMP", "DateTime"}, {"TIMESTAMP WITH TIME ZONE", "DateTime"},
+	    {"DATE", "Date"},      {"JSON", "Json"},    {"UBIGINT", "UInt64"},     {"UINTEGER", "UInt32"},
+	    {"FLOAT", "Float32"},  {"BLOB", "Bytes"},
+	};
+	auto it = mapping.find(duckdb_type);
+	return it != mapping.end() ? it->second : duckdb_type;
+}
+
+static constexpr const char *API_CREATED_AT_PLACEHOLDER = "1970-01-01T00:00:00Z";
+
+static pair<idx_t, idx_t> ApiTableStats(Connection &conn, const string &table) {
+	idx_t total_rows = 0;
+	auto count = conn.Query("SELECT COUNT(*)::UBIGINT FROM " + RawQualifiedTarget(table));
+	if (count && !count->HasError() && count->RowCount() > 0) {
+		total_rows = count->GetValue(0, 0).GetValue<idx_t>();
+	}
+	// hosted APIs expose byte counts; we approximate from row count.
+	return {total_rows, total_rows * 64};
+}
+
+static void AddProjectOrganization(JsonDoc &json, duckdb_yyjson::yyjson_mut_val *root) {
+	auto project = duckdb_yyjson::yyjson_mut_obj(json.doc);
+	duckdb_yyjson::yyjson_mut_obj_add_str(json.doc, project, "name", "default");
+	duckdb_yyjson::yyjson_mut_obj_add_val(json.doc, root, "project", project);
+	auto organization = duckdb_yyjson::yyjson_mut_obj(json.doc);
+	duckdb_yyjson::yyjson_mut_obj_add_str(json.doc, organization, "name", "default");
+	duckdb_yyjson::yyjson_mut_obj_add_val(json.doc, root, "organization", organization);
+}
+
+static string InferOtlpTransform(const string &body) {
+	if (body.find("\"resourceSpans\"") != string::npos) {
+		return "otlp-traces";
+	}
+	if (body.find("\"resourceLogs\"") != string::npos) {
+		return "otlp-logs";
+	}
+	if (body.find("\"resourceMetrics\"") != string::npos) {
+		return "otlp-metrics";
+	}
+	return "";
+}
+
+static string RequestHeader(const duckdb_httplib::Request &req, std::initializer_list<const char *> names) {
+	for (auto name : names) {
+		if (req.has_header(name)) {
+			return req.get_header_value(name);
+		}
+	}
+	return "";
 }
 
 duckdb_yyjson::yyjson_mut_val *ValueToJson(JsonDoc &json, const Value &value) {
@@ -142,8 +199,13 @@ bool Authorized(const duckdb_httplib::Request &req, duckdb_httplib::Response &re
 	return false;
 }
 
-RawParseOptions RequestParseOptions(ClientContext &context, const duckdb_httplib::Request &req) {
-	auto options = ResolveTransform(context, req.get_param_value("transform"), req.get_param_value("explode"));
+RawParseOptions RequestParseOptions(ClientContext &context, const duckdb_httplib::Request &req,
+                                    const string &body = "") {
+	auto transform = req.get_param_value("transform");
+	if (transform.empty() && !body.empty()) {
+		transform = InferOtlpTransform(body);
+	}
+	auto options = ResolveTransform(context, transform, req.get_param_value("explode"));
 	options.ignore_errors = req.get_param_value("ignore_errors") == "true";
 	return options;
 }
@@ -172,7 +234,7 @@ void HandleIngest(const duckdb_httplib::Request &req, duckdb_httplib::Response &
 		// async mode (rawduck_async_insert): enqueue and acknowledge, exactly
 		// like SQL-level ingestion - the scaling answer for many concurrent
 		// small-insert clients (batched commits, single-threaded evolution)
-		auto options = otlp_signal.empty() ? RequestParseOptions(*conn.context, req)
+		auto options = otlp_signal.empty() ? RequestParseOptions(*conn.context, req, body)
 		                                   : ResolveTransform(*conn.context, "otlp-" + otlp_signal, "");
 		if (GetApiServer().async || RawAsyncEnabled(*conn.context)) {
 			RawAsyncEnqueue(*conn.context, table, body, options);
@@ -192,7 +254,7 @@ void HandleIngest(const duckdb_httplib::Request &req, duckdb_httplib::Response &
 	}
 	conn.BeginTransaction();
 	try {
-		auto options = otlp_signal.empty() ? RequestParseOptions(*conn.context, req)
+		auto options = otlp_signal.empty() ? RequestParseOptions(*conn.context, req, body)
 		                                   : ResolveTransform(*conn.context, "otlp-" + otlp_signal, "");
 		auto stats = RawIngestPayload(*conn.context, table, body, options);
 		conn.Commit();
@@ -211,11 +273,7 @@ void HandleIngest(const duckdb_httplib::Request &req, duckdb_httplib::Response &
 			Respond(res, 200, json, root);
 			return;
 		}
-		duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, root, "table", table.c_str(), table.size());
 		duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, root, "inserted", stats.rows);
-		duckdb_yyjson::yyjson_mut_obj_add_bool(json.doc, root, "created", stats.created);
-		duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, root, "columns_added", stats.columns_added);
-		duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, root, "errors", stats.errors);
 		Respond(res, 200, json, root);
 	} catch (std::exception &ex) {
 		conn.Rollback();
@@ -308,7 +366,7 @@ void HandleQuery(const duckdb_httplib::Request &req, duckdb_httplib::Response &r
 		auto column = duckdb_yyjson::yyjson_mut_obj(json.doc);
 		duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, column, "name", result->names[col].c_str(),
 		                                          result->names[col].size());
-		auto type = result->types[col].ToString();
+		auto type = ApiTypeName(result->types[col].ToString());
 		duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, column, "type", type.c_str(), type.size());
 		duckdb_yyjson::yyjson_mut_arr_append(meta, column);
 	}
@@ -316,18 +374,23 @@ void HandleQuery(const duckdb_httplib::Request &req, duckdb_httplib::Response &r
 	auto data = duckdb_yyjson::yyjson_mut_arr(json.doc);
 	idx_t row_count = 0;
 	for (auto &row : *result) {
-		auto row_array = duckdb_yyjson::yyjson_mut_arr(json.doc);
+		auto row_obj = duckdb_yyjson::yyjson_mut_obj(json.doc);
 		for (idx_t col = 0; col < result->ColumnCount(); col++) {
-			duckdb_yyjson::yyjson_mut_arr_append(row_array, ValueToJson(json, row.GetValue<Value>(col)));
+			auto &name = result->names[col];
+			duckdb_yyjson::yyjson_mut_obj_add_val(json.doc, row_obj, name.c_str(),
+			                                      ValueToJson(json, row.GetValue<Value>(col)));
 		}
-		duckdb_yyjson::yyjson_mut_arr_append(data, row_array);
+		duckdb_yyjson::yyjson_mut_arr_append(data, row_obj);
 		row_count++;
 	}
 	duckdb_yyjson::yyjson_mut_obj_add_val(json.doc, root, "data", data);
 	duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, root, "rows", row_count);
 	auto statistics = duckdb_yyjson::yyjson_mut_obj(json.doc);
 	duckdb_yyjson::yyjson_mut_obj_add_real(json.doc, statistics, "elapsed", elapsed);
+	duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, statistics, "rows_read", row_count);
+	duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, statistics, "bytes_read", row_count * result->ColumnCount() * 8);
 	duckdb_yyjson::yyjson_mut_obj_add_val(json.doc, root, "statistics", statistics);
+	duckdb_yyjson::yyjson_mut_obj_add_val(json.doc, root, "hints", duckdb_yyjson::yyjson_mut_arr(json.doc));
 	Respond(res, 200, json, root);
 }
 
@@ -337,8 +400,7 @@ void HandleListTables(duckdb_httplib::Response &res) {
 		return;
 	}
 	Connection conn(*db);
-	auto result = conn.Query("SELECT table_name, column_count, estimated_size FROM duckdb_tables() "
-	                         "WHERE NOT internal ORDER BY table_name");
+	auto result = conn.Query("SELECT table_name FROM duckdb_tables() WHERE NOT internal ORDER BY table_name");
 	if (result->HasError()) {
 		RespondError(res, 500, result->GetError());
 		return;
@@ -347,15 +409,17 @@ void HandleListTables(duckdb_httplib::Response &res) {
 	auto root = duckdb_yyjson::yyjson_mut_obj(json.doc);
 	auto tables = duckdb_yyjson::yyjson_mut_arr(json.doc);
 	for (auto &row : *result) {
-		auto table = duckdb_yyjson::yyjson_mut_obj(json.doc);
 		auto name = row.GetValue<Value>(0).ToString();
+		auto stats = ApiTableStats(conn, name);
+		auto table = duckdb_yyjson::yyjson_mut_obj(json.doc);
 		duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, table, "name", name.c_str(), name.size());
-		duckdb_yyjson::yyjson_mut_obj_add_sint(json.doc, table, "columns", row.GetValue<Value>(1).GetValue<int64_t>());
-		auto size = row.GetValue<Value>(2);
-		duckdb_yyjson::yyjson_mut_obj_add_sint(json.doc, table, "rows", size.IsNull() ? 0 : size.GetValue<int64_t>());
+		duckdb_yyjson::yyjson_mut_obj_add_str(json.doc, table, "created_at", API_CREATED_AT_PLACEHOLDER);
+		duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, table, "total_rows", stats.first);
+		duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, table, "total_bytes", stats.second);
 		duckdb_yyjson::yyjson_mut_arr_append(tables, table);
 	}
 	duckdb_yyjson::yyjson_mut_obj_add_val(json.doc, root, "tables", tables);
+	AddProjectOrganization(json, root);
 	Respond(res, 200, json, root);
 }
 
@@ -370,19 +434,26 @@ void HandleDescribe(duckdb_httplib::Response &res, const string &table) {
 		RespondError(res, 404, result->GetError());
 		return;
 	}
+	auto stats = ApiTableStats(conn, table);
 	JsonDoc json;
 	auto root = duckdb_yyjson::yyjson_mut_obj(json.doc);
-	duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, root, "table", table.c_str(), table.size());
+	auto table_obj = duckdb_yyjson::yyjson_mut_obj(json.doc);
+	duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, table_obj, "name", table.c_str(), table.size());
+	duckdb_yyjson::yyjson_mut_obj_add_str(json.doc, table_obj, "created_at", API_CREATED_AT_PLACEHOLDER);
+	duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, table_obj, "total_rows", stats.first);
+	duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, table_obj, "total_bytes", stats.second);
 	auto columns = duckdb_yyjson::yyjson_mut_arr(json.doc);
 	for (auto &row : *result) {
 		auto column = duckdb_yyjson::yyjson_mut_obj(json.doc);
 		auto name = row.GetValue<Value>(0).ToString();
-		auto type = row.GetValue<Value>(1).ToString();
+		auto type = ApiTypeName(row.GetValue<Value>(1).ToString());
 		duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, column, "name", name.c_str(), name.size());
 		duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, column, "type", type.c_str(), type.size());
 		duckdb_yyjson::yyjson_mut_arr_append(columns, column);
 	}
-	duckdb_yyjson::yyjson_mut_obj_add_val(json.doc, root, "columns", columns);
+	duckdb_yyjson::yyjson_mut_obj_add_val(json.doc, table_obj, "columns", columns);
+	duckdb_yyjson::yyjson_mut_obj_add_val(json.doc, root, "table", table_obj);
+	AddProjectOrganization(json, root);
 	Respond(res, 200, json, root);
 }
 
@@ -423,8 +494,10 @@ void RegisterRoutes(duckdb_httplib::Server &server) {
 	// browser clients: permissive CORS, preflight handled globally
 	server.set_default_headers(
 	    {{"Access-Control-Allow-Origin", "*"},
-	     {"Access-Control-Allow-Headers", "Authorization, Content-Type, x-rawduck-table, x-rawduck-traces-table, "
-	                                      "x-rawduck-logs-table, x-rawduck-metrics-table"},
+	     {"Access-Control-Allow-Headers",
+	      "Authorization, Content-Type, x-rawduck-table, x-rawduck-traces-table, x-rawduck-logs-table, "
+	      "x-rawduck-metrics-table, x-rawtree-table, x-rawtree-traces-table, x-rawtree-logs-table, "
+	      "x-rawtree-metrics-table"},
 	     {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
 	// cap request bodies: ingest payloads should be batched, not unbounded
 	server.set_payload_max_length(256ULL * 1024ULL * 1024ULL);
@@ -464,10 +537,10 @@ void RegisterRoutes(duckdb_httplib::Server &server) {
 		            }
 		            string signal = req.matches.groups[1].text;
 		            // signal-specific table header, generic header, then default
-		            auto table = req.get_header_value("x-rawduck-" + signal + "-table");
-		            if (table.empty()) {
-			            table = req.get_header_value("x-rawduck-table");
-		            }
+		            auto duck_signal_header = "x-rawduck-" + signal + "-table";
+		            auto tree_signal_header = "x-rawtree-" + signal + "-table";
+		            auto table = RequestHeader(req, {duck_signal_header.c_str(), tree_signal_header.c_str(),
+		                                             "x-rawduck-table", "x-rawtree-table"});
 		            if (table.empty()) {
 			            table = "otel_" + signal;
 		            }
@@ -489,9 +562,11 @@ struct RawServeBindData : public TableFunctionData {
 	string host = "127.0.0.1";
 	int32_t port = 9999;
 	string token;
-	// the service defaults to asynchronous ingestion: concurrent clients get
-	// batched commits and serialized schema evolution (no conflicts)
-	bool async = true;
+	// Synchronous ingestion by default: insert-then-query clients (MCP, the
+	// TypeScript SDK, curl scripts) expect a row to be visible the moment the
+	// insert call returns. Opt into async batching with async := true when the
+	// workload is many concurrent fire-and-forget producers.
+	bool async = false;
 };
 
 struct RawServeState : public GlobalTableFunctionState {

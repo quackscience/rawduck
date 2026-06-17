@@ -40,7 +40,7 @@ struct RawGrpcState {
 	string host;
 	int port = 0;
 	string token;
-	bool async = true;
+	bool async = false;
 	bool running = false;
 
 	void Shutdown() {
@@ -183,7 +183,9 @@ struct RawServeGrpcBindData : public TableFunctionData {
 	string host = "127.0.0.1";
 	int32_t port = 4317;
 	string token;
-	bool async = true;
+	// Synchronous by default for parity with raw_serve(); opt into async
+	// batching with async := true for high-rate fire-and-forget producers.
+	bool async = false;
 };
 
 struct RawServeGrpcState : public GlobalTableFunctionState {

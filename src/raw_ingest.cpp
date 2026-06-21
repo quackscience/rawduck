@@ -1,5 +1,8 @@
 #include "raw_functions.hpp"
 #include "raw_json.hpp"
+#include "raw_write_settings.hpp"
+
+#include <atomic>
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -74,6 +77,16 @@ static uint64_t HashPayloadShape(const vector<RawColumn> &columns) {
 		shape = (shape ^ static_cast<uint64_t>(column.type.id())) * 0x100000001b3ULL;
 	}
 	return shape;
+}
+
+static void MergeParsedPayloads(RawParsedPayload &into, RawParsedPayload &&from) {
+	into.payload.rows.insert(into.payload.rows.end(), from.payload.rows.begin(), from.payload.rows.end());
+	for (auto *doc : from.payload.docs) {
+		into.payload.docs.push_back(doc);
+	}
+	from.payload.docs.clear();
+	from.payload.rows.clear();
+	from.payload.parse_errors = 0;
 }
 
 //===--------------------------------------------------------------------===//
@@ -204,9 +217,11 @@ static unique_ptr<MaterializedQueryResult> RunQuery(Connection &conn, const stri
 
 class RawAppendPool {
 public:
-	RawAppendPool(ClientContext &context, TableCatalogEntry &table, idx_t worker_count, bool overlap_flush)
+	RawAppendPool(ClientContext &context, TableCatalogEntry &table, idx_t worker_count, bool overlap_flush,
+	              idx_t max_queue_depth)
 	    : context(context), block_manager_ref(table.GetStorage().GetTableIOManager().GetBlockManagerForRowData()),
-	      flush_storage(&table.GetStorage()), overlap_flush(overlap_flush), types(table.GetTypes()) {
+	      flush_storage(&table.GetStorage()), overlap_flush(overlap_flush), max_queue_depth(max_queue_depth),
+	      types(table.GetTypes()) {
 		auto &storage = table.GetStorage();
 		idx_t physical_index = 0;
 		for (auto &column : table.GetColumns().Physical()) {
@@ -235,7 +250,7 @@ public:
 
 	void Submit(shared_ptr<RawParsedPayload> parsed) {
 		std::unique_lock<mutex> guard(lock);
-		producer_cv.wait(guard, [&] { return queue.size() < 4 || stopped; });
+		producer_cv.wait(guard, [&] { return queue.size() < max_queue_depth || stopped; });
 		if (stopped) {
 			return;
 		}
@@ -257,6 +272,9 @@ public:
 		for (auto &new_column : new_columns) {
 			slots[new_column.first] = types.size();
 			types.push_back(new_column.second);
+		}
+		for (auto &worker : workers) {
+			worker.layout_cache.shape = 0;
 		}
 	}
 
@@ -331,6 +349,12 @@ public:
 	}
 
 private:
+	struct BatchLayout {
+		uint64_t shape = 0;
+		vector<idx_t> slot_of;
+		vector<bool> covered;
+	};
+
 	struct Worker {
 		unique_ptr<OptimisticDataWriter> writer;
 		optional_ptr<OptimisticWriteCollection> collection;
@@ -338,6 +362,7 @@ private:
 		// this worker's collection layout: a prefix of the published schema
 		vector<LogicalType> local_types;
 		case_insensitive_map_t<idx_t> local_slots;
+		BatchLayout layout_cache;
 	};
 
 	void Stop() {
@@ -431,6 +456,7 @@ private:
 			worker.local_slots[new_column.first] = worker.local_types.size();
 			worker.local_types.push_back(new_column.second);
 		}
+		worker.layout_cache.shape = 0;
 		auto rebuilt = make_uniq<OptimisticDataWriter>(context, flush_storage);
 		rebuilt->Merge(*worker.writer);
 		worker.writer = std::move(rebuilt);
@@ -442,15 +468,27 @@ private:
 		auto &types = worker.local_types;
 		auto &slots = worker.local_slots;
 		RawExtractor extractor(*parsed.root, parsed.columns);
-		vector<idx_t> slot_of(parsed.columns.size());
-		vector<bool> covered(types.size(), false);
-		for (idx_t col = 0; col < parsed.columns.size(); col++) {
-			auto entry = slots.find(parsed.columns[col].name);
-			if (entry == slots.end()) {
-				throw InternalException("RawDuck: column %s missing from append pool schema", parsed.columns[col].name);
+		auto shape = HashPayloadShape(parsed.columns);
+		vector<idx_t> slot_of;
+		vector<bool> covered;
+		if (worker.layout_cache.shape == shape && worker.layout_cache.slot_of.size() == parsed.columns.size()) {
+			slot_of = worker.layout_cache.slot_of;
+			covered = worker.layout_cache.covered;
+		} else {
+			slot_of.resize(parsed.columns.size());
+			covered.assign(types.size(), false);
+			for (idx_t col = 0; col < parsed.columns.size(); col++) {
+				auto entry = slots.find(parsed.columns[col].name);
+				if (entry == slots.end()) {
+					throw InternalException("RawDuck: column %s missing from append pool schema",
+					                        parsed.columns[col].name);
+				}
+				slot_of[col] = entry->second;
+				covered[entry->second] = true;
 			}
-			slot_of[col] = entry->second;
-			covered[entry->second] = true;
+			worker.layout_cache.shape = shape;
+			worker.layout_cache.slot_of = slot_of;
+			worker.layout_cache.covered = covered;
 		}
 		auto &payload_rows = parsed.payload.rows;
 		for (idx_t start = 0; start < payload_rows.size(); start += STANDARD_VECTOR_SIZE) {
@@ -503,6 +541,7 @@ private:
 	// drain-free (one flush burst at the final width), which is lower peak
 	// memory and optimal for schema-churn payloads.
 	bool overlap_flush;
+	idx_t max_queue_depth;
 	vector<LogicalType> types;
 	case_insensitive_map_t<idx_t> slots;
 	vector<Worker> workers;
@@ -544,6 +583,7 @@ public:
 		}
 		auto &catalog = Catalog::GetCatalog(context, qname.catalog);
 		native = catalog.IsDuckCatalog();
+		write_settings = RawWriteSettings::Get(context);
 	}
 
 	void Ingest(const string &payload_str) {
@@ -573,6 +613,82 @@ public:
 		}
 	}
 
+	// Schema evolution (serial). Returns true when the append pool owns the batch.
+	bool PrepareForAppend(RawParsedPayload &parsed) {
+		write_settings = RawWriteSettings::Get(context);
+		auto table = LookupTableCached();
+		if (!table || parsed.columns.empty()) {
+			return false;
+		}
+		auto cache_key = qname.catalog + "." + qname.schema + "." + qname.name;
+		auto shape = HashPayloadShape(parsed.columns);
+		auto &cache = *ObjectCache::GetObjectCache(context).GetOrCreate<RawSchemaCache>(RawSchemaCache::ObjectType());
+		bool absorbed = false;
+		{
+			lock_guard<mutex> guard(cache.lock);
+			auto entry = cache.tables.find(cache_key);
+			absorbed = entry != cache.tables.end() && entry->second.storage_token == &table->GetStorage() &&
+			           entry->second.absorbed_shapes.count(shape) > 0;
+		}
+		last_batch_shape_absorbed = absorbed;
+		if (!absorbed) {
+			auto &catalog = Catalog::GetCatalog(context, qname.catalog);
+			MetaTransaction::Get(context).ModifyDatabase(
+			    catalog.GetAttached(), DatabaseModificationType::ALTER_TABLE | DatabaseModificationType::INSERT_DATA);
+			vector<pair<string, LogicalType>> adds;
+			bool widens = false;
+			ComputeDelta(*table, parsed, adds, widens);
+			if (pool && widens) {
+				rows += pool->Drain(*table);
+				pool.reset();
+			}
+			EvolveNative(catalog, *table, parsed);
+			InvalidateTableCache();
+			table = LookupTableCached();
+			if (!table) {
+				throw InternalException("RawDuck: table %s disappeared during ingestion", target);
+			}
+			if (pool && !adds.empty()) {
+				pool->PublishColumns(adds, table->GetStorage());
+			}
+			lock_guard<mutex> guard(cache.lock);
+			auto &entry = cache.tables[cache_key];
+			if (entry.storage_token != &table->GetStorage()) {
+				entry.storage_token = &table->GetStorage();
+				entry.absorbed_shapes.clear();
+			}
+			entry.absorbed_shapes.insert(shape);
+			last_batch_shape_absorbed = true;
+		}
+		if (parsed.payload.rows.empty()) {
+			return false;
+		}
+		MetaTransaction::Get(context).ModifyDatabase(Catalog::GetCatalog(context, qname.catalog).GetAttached(),
+		                                             DatabaseModificationType::INSERT_DATA);
+		EnsurePool(*table, parsed, last_batch_shape_absorbed);
+		return pool != nullptr;
+	}
+
+	void SubmitPreparedBatch(shared_ptr<RawParsedPayload> parsed_ptr, bool use_pool) {
+		auto &parsed = *parsed_ptr;
+		if (parsed.payload.rows.empty()) {
+			return;
+		}
+		if (use_pool && pool) {
+			pool->Submit(std::move(parsed_ptr));
+			return;
+		}
+		auto table = LookupTableCached();
+		if (!table) {
+			throw InternalException("RawDuck: table %s disappeared during ingestion", target);
+		}
+		AppendNative(*table, parsed);
+	}
+
+	optional_ptr<TableCatalogEntry> LookupTableForAppend() {
+		return LookupTable();
+	}
+
 	bool created = false;
 	idx_t columns_added = 0;
 	idx_t columns_widened = 0;
@@ -595,6 +711,67 @@ private:
 		return &entry->Cast<TableCatalogEntry>();
 	}
 
+	void InvalidateTableCache() {
+		cached_table = nullptr;
+		cached_storage = nullptr;
+		append_layout.shape = 0;
+	}
+
+	optional_ptr<TableCatalogEntry> LookupTableCached() {
+		auto table = LookupTable();
+		if (!table) {
+			InvalidateTableCache();
+			return nullptr;
+		}
+		auto *storage = &table->GetStorage();
+		if (cached_table && cached_storage == storage) {
+			return cached_table;
+		}
+		cached_table = table;
+		cached_storage = storage;
+		append_layout.shape = 0;
+		return table;
+	}
+
+	struct AppendLayoutCache {
+		void *storage_token = nullptr;
+		uint64_t shape = 0;
+		vector<LogicalType> types;
+		vector<idx_t> slot_of;
+		vector<bool> covered;
+		vector<unique_ptr<BoundConstraint>> bound_constraints;
+	};
+
+	bool ResolveAppendLayout(TableCatalogEntry &table, RawParsedPayload &parsed, AppendLayoutCache &layout) {
+		auto shape = HashPayloadShape(parsed.columns);
+		auto *storage = &table.GetStorage();
+		if (layout.storage_token == storage && layout.shape == shape && !layout.slot_of.empty()) {
+			return true;
+		}
+		auto &columns_list = table.GetColumns();
+		case_insensitive_map_t<idx_t> table_index;
+		idx_t physical_index = 0;
+		for (auto &column : columns_list.Physical()) {
+			table_index[column.Name()] = physical_index++;
+		}
+		layout.types = table.GetTypes();
+		layout.slot_of.resize(parsed.columns.size());
+		layout.covered.assign(layout.types.size(), false);
+		for (idx_t col = 0; col < parsed.columns.size(); col++) {
+			auto entry = table_index.find(parsed.columns[col].name);
+			if (entry == table_index.end()) {
+				throw InternalException("RawDuck: column %s missing after evolution", parsed.columns[col].name);
+			}
+			layout.slot_of[col] = entry->second;
+			layout.covered[entry->second] = true;
+		}
+		auto binder = Binder::CreateBinder(context);
+		layout.bound_constraints = binder->BindConstraints(table);
+		layout.storage_token = storage;
+		layout.shape = shape;
+		return true;
+	}
+
 	// classifies the DDL this payload would require
 	void ComputeDelta(TableCatalogEntry &table, RawParsedPayload &parsed, vector<pair<string, LogicalType>> &adds,
 	                  bool &widens) {
@@ -612,7 +789,7 @@ private:
 	}
 
 	bool PoolEligible(TableCatalogEntry &table, RawParsedPayload &parsed) {
-		if (parsed.payload.rows.size() < 4096) {
+		if (parsed.payload.rows.size() < write_settings.pool_min_rows) {
 			return false;
 		}
 		auto &columns_list = table.GetColumns();
@@ -626,9 +803,19 @@ private:
 		return binder->BindConstraints(table).empty();
 	}
 
+	void EnsurePool(TableCatalogEntry &table, RawParsedPayload &parsed, bool shape_absorbed) {
+		if (pool || parsed.payload.rows.empty() || !PoolEligible(table, parsed)) {
+			return;
+		}
+		write_settings = RawWriteSettings::Get(context);
+		auto worker_count = write_settings.PoolThreadCount(parsed.payload.rows.size());
+		auto overlap = write_settings.OverlapFlushForBatch(context, shape_absorbed, parsed.payload.rows.size());
+		pool = make_uniq<RawAppendPool>(context, table, worker_count, overlap, write_settings.pipeline_depth);
+	}
+
 	void IngestNative(shared_ptr<RawParsedPayload> parsed_ptr) {
 		auto &parsed = *parsed_ptr;
-		auto table = LookupTable();
+		auto table = LookupTableCached();
 		if (!table || parsed.columns.empty()) {
 			LegacyIngestNative(std::move(parsed_ptr), table);
 			return;
@@ -643,6 +830,7 @@ private:
 			absorbed = entry != cache.tables.end() && entry->second.storage_token == &table->GetStorage() &&
 			           entry->second.absorbed_shapes.count(shape) > 0;
 		}
+		bool shape_absorbed = absorbed;
 		if (!absorbed) {
 			// schema-delta slow path, then absorb the shape
 			auto &catalog = Catalog::GetCatalog(context, qname.catalog);
@@ -656,13 +844,12 @@ private:
 				pool.reset();
 			}
 			EvolveNative(catalog, *table, parsed);
-			table = LookupTable();
+			InvalidateTableCache();
+			table = LookupTableCached();
 			if (!table) {
 				throw InternalException("RawDuck: table %s disappeared during ingestion", target);
 			}
 			if (pool && !adds.empty()) {
-				// publish against the post-ALTER storage so workers rebuild
-				// their flush writers to the evolved layout
 				pool->PublishColumns(adds, table->GetStorage());
 			}
 			lock_guard<mutex> guard(cache.lock);
@@ -672,28 +859,19 @@ private:
 				entry.absorbed_shapes.clear();
 			}
 			entry.absorbed_shapes.insert(shape);
+			shape_absorbed = true;
 		}
 		if (parsed.payload.rows.empty()) {
 			return;
 		}
 		MetaTransaction::Get(context).ModifyDatabase(Catalog::GetCatalog(context, qname.catalog).GetAttached(),
 		                                             DatabaseModificationType::INSERT_DATA);
-		if (!pool && PoolEligible(*table, parsed)) {
-			auto worker_count = MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() / 2, 4));
-			pool = make_uniq<RawAppendPool>(context, *table, worker_count, OverlapFlushEnabled());
-		}
+		EnsurePool(*table, parsed, shape_absorbed);
 		if (pool) {
 			pool->Submit(std::move(parsed_ptr));
 			return;
 		}
 		AppendNative(*table, parsed);
-	}
-
-	// rawduck_overlap_flush: opt-in parse/flush overlap for the append pool
-	bool OverlapFlushEnabled() {
-		Value enabled;
-		return context.TryGetCurrentSetting("rawduck_overlap_flush", enabled) && !enabled.IsNull() &&
-		       enabled.GetValue<bool>();
 	}
 
 	void LegacyIngestNative(shared_ptr<RawParsedPayload> parsed_ptr, optional_ptr<TableCatalogEntry> table) {
@@ -714,6 +892,7 @@ private:
 			CreateNative(catalog, parsed);
 			created = true;
 			columns_added += parsed.columns.size();
+			InvalidateTableCache();
 		} else {
 			vector<pair<string, LogicalType>> adds;
 			bool widens = false;
@@ -725,6 +904,7 @@ private:
 				pool.reset();
 			}
 			EvolveNative(catalog, *table, parsed);
+			InvalidateTableCache();
 			if (pool && !adds.empty()) {
 				// drain-free, barrier-free: workers pad their own collections
 				// and rebuild their flush writers against the post-ALTER storage
@@ -739,14 +919,11 @@ private:
 			return;
 		}
 		// re-resolve: DDL replaces the catalog entry
-		table = LookupTable();
+		table = LookupTableCached();
 		if (!table) {
 			throw InternalException("RawDuck: table %s disappeared during ingestion", target);
 		}
-		if (!pool && PoolEligible(*table, parsed)) {
-			auto worker_count = MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() / 2, 4));
-			pool = make_uniq<RawAppendPool>(context, *table, worker_count, OverlapFlushEnabled());
-		}
+		EnsurePool(*table, parsed, true);
 		if (pool) {
 			pool->Submit(std::move(parsed_ptr));
 			return;
@@ -797,39 +974,21 @@ private:
 	}
 
 	void AppendNative(TableCatalogEntry &table, RawParsedPayload &parsed) {
-		auto &columns_list = table.GetColumns();
-		if (columns_list.PhysicalColumnCount() != columns_list.LogicalColumnCount()) {
+		if (table.GetColumns().PhysicalColumnCount() != table.GetColumns().LogicalColumnCount()) {
 			throw NotImplementedException("RawDuck: cannot ingest into tables with generated columns");
 		}
-		case_insensitive_map_t<idx_t> table_index;
-		idx_t physical_index = 0;
-		for (auto &column : columns_list.Physical()) {
-			table_index[column.Name()] = physical_index++;
-		}
-		auto types = table.GetTypes();
+		ResolveAppendLayout(table, parsed, append_layout);
+		auto &types = append_layout.types;
+		auto &slot_of = append_layout.slot_of;
+		auto &covered = append_layout.covered;
+		auto &bound_constraints = append_layout.bound_constraints;
 
 		DataChunk chunk;
 		chunk.Initialize(Allocator::Get(context), types);
 		RawExtractor extractor(*parsed.root, parsed.columns);
-		// payload column -> table column slot
-		vector<idx_t> slot_of(parsed.columns.size());
-		vector<bool> covered(types.size(), false);
-		for (idx_t col = 0; col < parsed.columns.size(); col++) {
-			auto entry = table_index.find(parsed.columns[col].name);
-			if (entry == table_index.end()) {
-				throw InternalException("RawDuck: column %s missing after evolution", parsed.columns[col].name);
-			}
-			slot_of[col] = entry->second;
-			covered[entry->second] = true;
-		}
-
-		auto binder = Binder::CreateBinder(context);
-		auto bound_constraints = binder->BindConstraints(table);
 		auto &storage = table.GetStorage();
 		auto &payload_rows = parsed.payload.rows;
 
-		// types FillVector writes directly; others go through a cast
-		Vector intermediate(LogicalType::VARCHAR);
 		for (idx_t start = 0; start < payload_rows.size(); start += STANDARD_VECTOR_SIZE) {
 			auto count = MinValue<idx_t>(payload_rows.size() - start, STANDARD_VECTOR_SIZE);
 			chunk.Reset();
@@ -1009,6 +1168,11 @@ private:
 	RawParseOptions options;
 	QualifiedName qname;
 	bool native = false;
+	RawWriteSettings write_settings;
+	bool last_batch_shape_absorbed = false;
+	optional_ptr<TableCatalogEntry> cached_table;
+	void *cached_storage = nullptr;
+	AppendLayoutCache append_layout;
 	unique_ptr<RawAppendPool> pool;
 	// fallback state
 	unique_ptr<Connection> fallback_conn;
@@ -1043,22 +1207,45 @@ public:
 		ingestor.Ingest(payload);
 	}
 	void IngestParsedConcurrent(shared_ptr<RawParsedPayload> parsed) override {
-		// parsing already happened on the calling thread; the schema/append
-		// handoff serializes and appends fan out through the pool
-		lock_guard<mutex> guard(lock);
-		ingestor.IngestParsed(std::move(parsed), empty_payload);
+		ingestor.errors += parsed->payload.parse_errors;
+		bool use_pool = false;
+		{
+			lock_guard<mutex> guard(schema_lock);
+			auto table = ingestor.LookupTableForAppend();
+			if (!table || parsed->columns.empty()) {
+				ingestor.IngestParsed(std::move(parsed), empty_payload);
+				return;
+			}
+			use_pool = ingestor.PrepareForAppend(*parsed);
+		}
+		if (use_pool) {
+			ingestor.SubmitPreparedBatch(std::move(parsed), true);
+			return;
+		}
+		lock_guard<mutex> guard(schema_lock);
+		ingestor.SubmitPreparedBatch(std::move(parsed), false);
 	}
 	void Finish() override {
+		lock_guard<mutex> guard(schema_lock);
 		ingestor.Finish();
 	}
 	idx_t Rows() const override {
 		return ingestor.rows;
 	}
+	RawIngestStats GetStats() const override {
+		RawIngestStats stats;
+		stats.created = ingestor.created;
+		stats.columns_added = ingestor.columns_added;
+		stats.columns_widened = ingestor.columns_widened;
+		stats.rows = ingestor.rows;
+		stats.errors = ingestor.errors;
+		return stats;
+	}
 
 private:
 	RawParseOptions parse_options;
 	string empty_payload;
-	mutex lock;
+	mutex schema_lock;
 	RawIngestor ingestor;
 };
 } // namespace
@@ -1115,6 +1302,16 @@ static void EmitIngestRow(DataChunk &output, const string &target, const RawInge
 	output.SetValue(3, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.columns_widened)));
 	output.SetValue(4, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.rows)));
 	output.SetValue(5, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.errors)));
+	output.SetCardinality(1);
+}
+
+static void EmitIngestRow(DataChunk &output, const string &target, const RawIngestStats &stats) {
+	output.SetValue(0, 0, Value(target));
+	output.SetValue(1, 0, Value::BOOLEAN(stats.created));
+	output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(stats.columns_added)));
+	output.SetValue(3, 0, Value::BIGINT(NumericCast<int64_t>(stats.columns_widened)));
+	output.SetValue(4, 0, Value::BIGINT(NumericCast<int64_t>(stats.rows)));
+	output.SetValue(5, 0, Value::BIGINT(NumericCast<int64_t>(stats.errors)));
 	output.SetCardinality(1);
 }
 
@@ -1194,11 +1391,15 @@ static unique_ptr<FunctionData> RawIngestFileBind(ClientContext &context, TableF
 // Bounded handoff between the parse thread and the appending thread: parsing
 // and inference are pure and overlap with catalog/storage work.
 struct RawIngestPipeline {
+	explicit RawIngestPipeline(idx_t capacity_p) : capacity(capacity_p) {
+	}
+
 	struct Item {
 		shared_ptr<RawParsedPayload> parsed;
 		string payload;
 	};
-	static constexpr idx_t CAPACITY = 4;
+
+	idx_t capacity;
 
 	mutex lock;
 	std::condition_variable producer_cv;
@@ -1215,7 +1416,7 @@ struct RawIngestPipeline {
 
 	void PushRaw(string batch) {
 		std::unique_lock<mutex> guard(lock);
-		producer_cv.wait(guard, [&] { return raw_queue.size() < CAPACITY || aborted; });
+		producer_cv.wait(guard, [&] { return raw_queue.size() < capacity || aborted; });
 		if (aborted) {
 			return;
 		}
@@ -1235,7 +1436,7 @@ struct RawIngestPipeline {
 	}
 	void Push(Item item) {
 		std::unique_lock<mutex> guard(lock);
-		producer_cv.wait(guard, [&] { return queue.size() < CAPACITY || aborted; });
+		producer_cv.wait(guard, [&] { return queue.size() < capacity || aborted; });
 		if (aborted) {
 			return;
 		}
@@ -1244,8 +1445,8 @@ struct RawIngestPipeline {
 	}
 	bool Pop(Item &item) {
 		std::unique_lock<mutex> guard(lock);
-		consumer_cv.wait(guard, [&] { return !queue.empty() || (reader_done && active_parsers == 0); });
-		if (queue.empty()) {
+		consumer_cv.wait(guard, [&] { return !queue.empty() || aborted || (reader_done && active_parsers == 0); });
+		if (aborted || queue.empty()) {
 			return false;
 		}
 		item = std::move(queue.front());
@@ -1295,10 +1496,10 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 	auto handle = fs.OpenFile(bind_data.path, FileOpenFlags(FileFlags::FILE_FLAGS_READ) |
 	                                              FileOpenFlags(FileCompressionType::AUTO_DETECT));
 
-	RawIngestor ingestor(context, bind_data.target, bind_data.options);
-	RawIngestPipeline pipeline;
-	auto options = bind_data.options;
+	auto write_settings = RawWriteSettings::Get(context);
 	auto batch_size = bind_data.batch_size;
+	RawIngestPipeline pipeline(write_settings.pipeline_depth);
+	auto options = bind_data.options;
 
 	// reader thread: owns the file handle, splits NDJSON into raw batches
 	std::thread reader([&pipeline, &handle, batch_size] {
@@ -1346,7 +1547,7 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 
 	// parse workers: parsing and inference are pure and scale with cores;
 	// batch order is irrelevant to ingestion
-	auto parser_count = MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() / 3, 4));
+	auto parser_count = write_settings.PipelineThreadCount();
 	pipeline.active_parsers = parser_count;
 	vector<std::thread> parsers;
 	for (idx_t i = 0; i < parser_count; i++) {
@@ -1371,12 +1572,92 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 		}
 	};
 
-	idx_t batches = 0;
+	auto consumer_count = write_settings.PipelineConsumerCount();
+	std::atomic<idx_t> batches {0};
+	mutex consumer_error_lock;
+	std::exception_ptr consumer_error;
+
+	auto coalesce_and_ingest = [&](auto ingest_fn, RawIngestPipeline::Item &pending_storage, bool &has_pending,
+	                               RawIngestPipeline::Item item) {
+		if (!has_pending) {
+			pending_storage = std::move(item);
+			has_pending = true;
+			return;
+		}
+		auto pending_shape = HashPayloadShape(pending_storage.parsed->columns);
+		auto item_shape = HashPayloadShape(item.parsed->columns);
+		if (pending_shape == item_shape &&
+		    pending_storage.parsed->payload.rows.size() + item.parsed->payload.rows.size() <
+		        write_settings.pool_min_rows) {
+			MergeParsedPayloads(*pending_storage.parsed, std::move(*item.parsed));
+			return;
+		}
+		ingest_fn(std::move(pending_storage));
+		pending_storage = std::move(item);
+		has_pending = true;
+	};
+
+	idx_t batches_result = 0;
 	try {
-		RawIngestPipeline::Item item;
-		while (pipeline.Pop(item)) {
-			ingestor.IngestParsed(std::move(item.parsed), item.payload);
-			batches++;
+		if (consumer_count > 1) {
+			auto stream = RawCreateStreamIngestor(context, bind_data.target, bind_data.options);
+			auto consumer_loop = [&] {
+				try {
+					RawIngestPipeline::Item pending_storage;
+					bool has_pending = false;
+					RawIngestPipeline::Item item;
+					while (pipeline.Pop(item)) {
+						batches.fetch_add(1);
+						coalesce_and_ingest(
+						    [&](RawIngestPipeline::Item pending) {
+							    stream->IngestParsedConcurrent(std::move(pending.parsed));
+						    },
+						    pending_storage, has_pending, std::move(item));
+					}
+					if (has_pending) {
+						stream->IngestParsedConcurrent(std::move(pending_storage.parsed));
+					}
+				} catch (...) {
+					lock_guard<mutex> guard(consumer_error_lock);
+					if (!consumer_error) {
+						consumer_error = std::current_exception();
+					}
+					pipeline.Abort();
+				}
+			};
+			vector<std::thread> consumers;
+			consumers.reserve(consumer_count);
+			for (idx_t i = 0; i < consumer_count; i++) {
+				consumers.emplace_back(consumer_loop);
+			}
+			for (auto &consumer : consumers) {
+				consumer.join();
+			}
+			if (consumer_error) {
+				std::rethrow_exception(consumer_error);
+			}
+			stream->Finish();
+			batches_result = batches.load();
+			EmitIngestRow(output, bind_data.target, stream->GetStats());
+		} else {
+			RawIngestor ingestor(context, bind_data.target, bind_data.options);
+			RawIngestPipeline::Item pending_storage;
+			bool has_pending = false;
+			RawIngestPipeline::Item item;
+			while (pipeline.Pop(item)) {
+				batches_result++;
+				coalesce_and_ingest(
+				    [&](RawIngestPipeline::Item pending) {
+					    ingestor.IngestParsed(std::move(pending.parsed), pending.payload);
+				    },
+				    pending_storage, has_pending, std::move(item));
+			}
+			if (has_pending) {
+				ingestor.IngestParsed(std::move(pending_storage.parsed), pending_storage.payload);
+			}
+			ingestor.Finish();
+			EmitIngestRow(output, bind_data.target, ingestor);
+			output.SetValue(6, 0, Value::BIGINT(NumericCast<int64_t>(batches_result)));
 		}
 	} catch (...) {
 		pipeline.Abort();
@@ -1387,10 +1668,10 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 	if (pipeline.error) {
 		std::rethrow_exception(pipeline.error);
 	}
-	ingestor.Finish();
-
-	EmitIngestRow(output, bind_data.target, ingestor);
-	output.SetValue(6, 0, Value::BIGINT(NumericCast<int64_t>(batches)));
+	if (consumer_count > 1) {
+		output.SetValue(6, 0, Value::BIGINT(NumericCast<int64_t>(batches_result)));
+	}
+	return;
 }
 
 TableFunction GetRawIngestFileFunction() {

@@ -104,6 +104,7 @@ set(EXTENSION_SOURCES
     src/raw_json.cpp
     src/raw_records.cpp
     src/raw_ingest.cpp
+    src/raw_write_settings.cpp
     src/raw_attach.cpp
     src/raw_quack_attach.cpp
     src/raw_async.cpp

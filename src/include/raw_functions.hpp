@@ -56,6 +56,7 @@ public:
 	virtual void IngestParsedConcurrent(shared_ptr<RawParsedPayload> parsed) = 0;
 	virtual void Finish() = 0;
 	virtual idx_t Rows() const = 0;
+	virtual RawIngestStats GetStats() const = 0;
 };
 unique_ptr<RawStreamIngestor> RawCreateStreamIngestor(ClientContext &context, const string &target,
                                                       RawParseOptions options);

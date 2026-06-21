@@ -1,0 +1,53 @@
+# name: test/sql/raw_write.test
+# description: Write-path settings, layout cache, and tunable pipeline defaults
+# group: [sql]
+
+require rawduck
+
+require json
+
+# tunable pool threshold (default 4096; lower for small test files)
+statement ok
+COPY (SELECT range AS n, 'v' || (range % 7) AS v FROM range(1000)) TO '__TEST_DIR__/fast_pool.ndjson' (FORMAT json);
+
+query II
+SELECT rows, errors FROM raw_ingest_file('t_fast', '__TEST_DIR__/fast_pool.ndjson', batch_size := 600);
+----
+1000	0
+
+query III
+SELECT count(*), count(DISTINCT n), sum(n) FROM t_fast;
+----
+1000	1000	499500
+
+statement ok
+SET rawduck_pool_min_rows = 200;
+
+query I
+SELECT rows FROM raw_ingest_file('t_thresh', '__TEST_DIR__/fast_pool.ndjson');
+----
+1000
+
+# overlap_flush_auto on stable re-ingest (schema already known)
+statement ok
+SET rawduck_overlap_flush_auto = true;
+
+query I
+SELECT rows FROM raw_ingest_file('t_fast', '__TEST_DIR__/fast_pool.ndjson', batch_size := 600);
+----
+1000
+
+# parallel ingest consumers are opt-in (default serial schema evolution)
+statement ok
+SET rawduck_overlap_flush_auto = false;
+SET rawduck_pipeline_consumers = 2;
+
+query II
+SELECT rows, batches FROM raw_ingest_file('t_consumers', '__TEST_DIR__/fast_pool.ndjson', batch_size := 600);
+----
+1000	2
+
+query III
+SELECT count(*), count(DISTINCT n), sum(n) FROM t_consumers;
+----
+1000	1000	499500

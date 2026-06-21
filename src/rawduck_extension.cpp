@@ -2,6 +2,7 @@
 
 #include "rawduck_extension.hpp"
 #include "raw_functions.hpp"
+#include "raw_write_settings.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/main/config.hpp"
@@ -50,6 +51,26 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Flush completed row groups during a large multi-threaded ingest while the schema is "
 	                          "stable, overlapping parse with compression/IO. Faster on large stable-schema imports "
 	                          "at the cost of higher peak memory; off by default (drain-free)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("rawduck_pool_min_rows",
+	                          "Minimum rows in a batch before the multi-threaded append pool activates",
+	                          LogicalType::BIGINT, Value::BIGINT(RawWriteSettings::DEFAULT_POOL_MIN_ROWS));
+	config.AddExtensionOption("rawduck_pool_threads",
+	                          "Append-pool worker count (0 = auto from batch size and hardware concurrency)",
+	                          LogicalType::BIGINT, Value::BIGINT(0));
+	config.AddExtensionOption("rawduck_pipeline_threads",
+	                          "NDJSON file parse thread count (0 = auto, up to 8 on large imports)",
+	                          LogicalType::BIGINT, Value::BIGINT(0));
+	config.AddExtensionOption("rawduck_pipeline_consumers",
+	                          "Parallel ingest consumers for raw_ingest_file (default 1; >1 overlaps parse with "
+	                          "append on stable schemas only — wide schema churn should stay at 1)",
+	                          LogicalType::BIGINT, Value::BIGINT(0));
+	config.AddExtensionOption("rawduck_pipeline_depth",
+	                          "Bounded queue depth between reader, parse workers, and ingest consumer(s)",
+	                          LogicalType::BIGINT, Value::BIGINT(RawWriteSettings::DEFAULT_PIPELINE_DEPTH));
+	config.AddExtensionOption("rawduck_overlap_flush_auto",
+	                          "When true, overlap parse/flush on stable re-ingest batches that meet pool_min_rows "
+	                          "(without setting rawduck_overlap_flush globally)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	// ATTACH 'rawduck:store.db' AS raw
 	StorageExtension::Register(config, "rawduck", GetRawDuckStorageExtension());

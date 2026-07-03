@@ -1,0 +1,89 @@
+# name: test/sql/raw_distribution_quack.test
+# description: Multi-client Quack reads while server ingests (distribution scaffold)
+# group: [sql]
+#
+# Exercises two client connections against one Quack server — a single-process
+# proxy for multi-host readers. Full multi-process fan-out lives in
+# scripts/distribution/ and test/http/.
+
+require rawduck
+
+require quack
+
+require httpfs
+
+# --- server: Quack listener + seed data ---
+
+query III
+SELECT * FROM quack_serve('quack:127.0.0.1:19921', token := 'rt_dist');
+----
+quack:127.0.0.1:19921	http://127.0.0.1:19921	rt_dist
+
+statement ok
+CALL raw_ingest('events', '[{"action":"seed","user":"init","seq":0}]');
+
+# --- two clients attach rawduck:quack ---
+
+statement ok client
+ATTACH 'rawduck:quack:127.0.0.1:19921' AS raw_a (TOKEN 'rt_dist');
+
+statement ok client2
+ATTACH 'rawduck:quack:127.0.0.1:19921' AS raw_b (TOKEN 'rt_dist');
+
+# both clients see seed row
+query III client
+SELECT action, user, seq FROM raw_a.events;
+----
+seed	init	0
+
+query III client2
+SELECT action, user, seq FROM raw_b.events;
+----
+seed	init	0
+
+# client A ingests via ingest lane while client B counts
+statement ok client
+INSERT INTO raw_a.ingest.events VALUES ('{"action":"click","user":"alice","seq":1}');
+
+query I client2
+SELECT count(*) FROM raw_b.events;
+----
+2
+
+statement ok client
+INSERT INTO raw_a.ingest.events VALUES ('{"action":"view","user":"bob","seq":2}');
+
+# interleaved reads on both clients
+query III client
+SELECT action, user, seq FROM raw_a.events ORDER BY seq;
+----
+seed	init	0
+click	alice	1
+view	bob	2
+
+query III client2
+SELECT action, user, seq FROM raw_b.events ORDER BY seq;
+----
+seed	init	0
+click	alice	1
+view	bob	2
+
+# schema evolution visible to both clients
+statement ok client
+INSERT INTO raw_a.ingest.events VALUES ('{"action":"purchase","user":"carol","seq":3,"meta":{"sku":"x1"}}');
+
+query I client2
+SELECT "meta.sku" FROM raw_b.events WHERE action = 'purchase';
+----
+x1
+
+statement ok client
+DETACH raw_a;
+
+statement ok client2
+DETACH raw_b;
+
+# --- cleanup ---
+
+statement ok
+CALL quack_stop('quack:127.0.0.1:19921');

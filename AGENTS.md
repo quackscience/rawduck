@@ -14,7 +14,8 @@ see BENCHMARK.md).
 Pinned to DuckDB **v1.5.3**: the `duckdb/` submodule commit and the versions in
 `.github/workflows/MainDistributionPipeline.yml` must stay in sync. Build with `GEN=ninja make
 release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; format with
-`make format-fix` (CI enforces it).
+`make format-fix` (CI enforces it). Multi-host distribution plan and test scaffold:
+[docs/DISTRIBUTION.md](docs/DISTRIBUTION.md).
 
 ## Source map (src/)
 

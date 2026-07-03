@@ -1,0 +1,55 @@
+# name: test/sql/raw_distribution_ducklake.test
+# description: Multi-connection DuckLake ingest (distribution scaffold)
+# group: [sql]
+#
+# Two connections ingesting into the same DuckLake-backed table — validates
+# the SQL fallback path under interleaved writes. Multi-process writers are
+# covered by scripts/distribution/run_ducklake_writers.sh.
+
+require rawduck
+
+require json
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/dist.ducklake' AS lake (DATA_PATH '__TEST_DIR__/dist_data');
+
+# connection 1 (default): create table via first ingest
+query IIIIII
+SELECT * FROM raw_ingest('lake.main.events', '[{"id":1,"action":"click","writer":"conn1"}]');
+----
+lake.main.events	true	3	0	1	0
+
+# connection 2: second writer interleaved
+statement ok client
+CALL raw_ingest('lake.main.events', '[{"id":2,"action":"view","writer":"conn2"}]');
+
+# both writers visible from either connection
+query III
+SELECT id, action, writer FROM lake.main.events ORDER BY id;
+----
+1	click	conn1
+2	view	conn2
+
+statement ok client
+CALL raw_ingest('lake.main.events', '[{"id":3,"action":"purchase","writer":"conn2","user":{"name":"alice"}}]');
+
+query IIIIII
+SELECT * FROM raw_ingest('lake.main.events', '[{"id":4,"action":"refund","writer":"conn1"}]');
+----
+lake.main.events	false	0	0	1	0
+
+query IIII
+SELECT id, action, writer, "user.name" FROM lake.main.events ORDER BY id;
+----
+1	click	conn1	NULL
+2	view	conn2	NULL
+3	purchase	conn2	alice
+4	refund	conn1	NULL

@@ -56,6 +56,9 @@ struct RawParseOptions {
 	// apply OTLP semantics after exploding: spread KeyValue attribute lists
 	// into their parent, unwrap AnyValue, numeric *UnixNano fields
 	bool otlp = false;
+	// original bind parameters for replay through raw_records in SQL fallback paths
+	string source_transform;
+	string source_explode;
 };
 
 // A parsed payload: one or more JSON documents and the row roots within them.

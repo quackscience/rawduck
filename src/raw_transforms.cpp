@@ -59,6 +59,8 @@ RawParseOptions ResolveTransform(ClientContext &context, const string &transform
 	}
 	auto options = RawExplodeOptions(path);
 	options.otlp = otlp;
+	options.source_transform = transform;
+	options.source_explode = explode;
 	return options;
 }
 

@@ -34,6 +34,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	// observe pushed-down predicates to drive raw_optimize()
 	OptimizerExtension::Register(config, GetRawDuckOptimizerExtension());
+	config.AddExtensionOption("rawduck_ingest_prefix",
+	                          "Prefix for bare ingest targets (e.g. lake.main routes otel_traces to lake.main.otel_traces)",
+	                          LogicalType::VARCHAR, Value(""));
 	config.AddExtensionOption("rawduck_insert_transform",
 	                          "Transform name or explode path applied by INSERTs into ingest tables",
 	                          LogicalType::VARCHAR, Value(""));

@@ -1,8 +1,52 @@
 # RawDuck distribution — plan
 
 Multi-host setups: **many OTEL (or HTTP/gRPC) writers** and **many DuckDB query clients** sharing one
-logical dataset. This document is the working plan for the `distribution` branch — validate what we
-have, scaffold tests, then evolve the design where gaps appear.
+logical dataset.
+
+## Primary architecture (DuckLake-first)
+
+**Writers:** N independent RawDuck instances (`raw_serve` / gRPC / batch `raw_ingest`), each shredding
+OTLP into typed columns and evolving schema on ingest.
+
+**Storage:** shared [DuckLake](https://ducklake.select) catalog (sqlite metadata + local `DATA_PATH`
+for now; S3/postgres metadata later).
+
+**Readers:** M DuckDB clients attach DuckLake **directly** (typically `READ_ONLY`) — no Quack hop
+required for analytics.
+
+```sql
+-- each writer hub (process 1..N)
+INSTALL ducklake; LOAD ducklake;
+ATTACH 'ducklake:/data/shared.ducklake' AS lake (DATA_PATH '/data/parquet');
+SELECT * FROM raw_serve(
+    host := '0.0.0.0', port := 9999, token := 'secret',
+    ingest_prefix := 'lake.main'   -- routes otel_traces → lake.main.otel_traces
+);
+
+-- OTEL collectors → http://writer-host:9999/otlp/v1/traces
+
+-- reader (separate host/process)
+ATTACH 'ducklake:/data/shared.ducklake' AS lake (DATA_PATH '/data/parquet', READ_ONLY);
+SELECT "resource.service.name", count(*) FROM lake.main.otel_traces GROUP BY 1;
+```
+
+| Setting / param | Purpose |
+|---|---|
+| `rawduck_ingest_prefix` | Prefix bare targets (`otel_traces` → `lake.main.otel_traces`) |
+| `raw_serve(..., ingest_prefix := 'lake.main')` | Sets prefix at database level for all HTTP/gRPC requests |
+| Cross-process schema lock | `*.rawduck_schema.lock` beside DuckLake metadata during DDL |
+
+**Sqlite DuckLake constraint:** only one process may hold a persistent `ATTACH` on the metadata
+file at a time. Patterns that work today:
+
+| Pattern | Writers | Notes |
+|---|---|---|
+| **Sequential writer processes** | N processes, each attach → ingest → exit | Validated (`run_ducklake_otel_cluster.sh`) |
+| **Single long-lived hub** | N OTEL collectors → one `raw_serve` | Parallel HTTP OK; one metadata lock holder |
+| **Concurrent long-lived hubs** | N `raw_serve` on same sqlite lake | **Blocked** by metadata file lock |
+| **Postgres DuckLake metadata** | N always-on hubs | Future — removes sqlite exclusivity |
+
+Quack remains optional for remote SQL / ingest lane when readers cannot mount the lake path.
 
 ## Target topologies
 
@@ -47,7 +91,7 @@ flowchart TB
 | **A. Single ingest hub** | N → one `raw_serve` / gRPC | M via Quack or HTTP query | One DuckDB process + file | Partially tested |
 | **B. Quack fan-out** | N → hub (HTTP/gRPC/SQL) | M `ATTACH rawduck:quack:…` | Server-side store | `raw_quack.test` (happy path) |
 | **C. DuckLake lakehouse** | N processes → `raw_ingest('lake.…')` | M read-only DuckLake attach | Metadata + parquet on S3/disk | `ducklake.test` (single process) |
-| **D. Hybrid hub → lake** | N → hub writing DuckLake backend | M DuckLake or Quack | DuckLake snapshots | **Not validated** |
+| **D. Hybrid hub → lake** | N → hub writing DuckLake backend | M DuckLake read-only attach | DuckLake snapshots | **Validated** (sequential multi-process) |
 
 **Design bet for scale-out:** topology **D** — one or few RawDuck ingest hubs (schema evolution,
 OTLP transforms, adaptive layout) backed by **DuckLake** for durable shared storage; readers attach

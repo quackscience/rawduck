@@ -1,0 +1,60 @@
+# name: test/sql/raw_distribution_ducklake_otel.test
+# description: Multi-writer OTEL ingest into shared DuckLake with schema evolution
+# group: [sql]
+
+require rawduck
+
+require json
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/otel_lake.ducklake' AS lake (DATA_PATH '__TEST_DIR__/otel_lake_data');
+
+statement ok
+SET rawduck_ingest_prefix = 'lake.main';
+
+# writer 1: first OTLP envelope creates otel_traces
+query IIIIII
+SELECT * FROM raw_ingest('otel_traces', '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"writer-a"}}]},"scopeSpans":[{"spans":[{"traceId":"00000000000000000000000000000001","spanId":"0000000000000001","name":"a-1","kind":1}]}]}]}', transform := 'otlp-traces');
+----
+otel_traces	true	5	0	1	0
+
+# writer 2 (client): same table, different service
+statement ok client
+SET rawduck_ingest_prefix = 'lake.main';
+
+statement ok client
+CALL raw_ingest('otel_traces', '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"writer-b"}}]},"scopeSpans":[{"spans":[{"traceId":"00000000000000000000000000000002","spanId":"0000000000000002","name":"b-1","kind":1}]}]}]}', transform := 'otlp-traces');
+
+# schema evolution: writer 1 adds a new attribute column
+statement ok
+CALL raw_ingest('otel_traces', '{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"writer-a"}}]},"scopeSpans":[{"spans":[{"traceId":"00000000000000000000000000000003","spanId":"0000000000000003","name":"a-2","kind":1,"attributes":[{"key":"region","value":{"stringValue":"eu-west"}}]}]}]}]}', transform := 'otlp-traces');
+
+query I
+SELECT count(*) FROM lake.main.otel_traces;
+----
+3
+
+query I
+SELECT DISTINCT "resource.service.name" FROM lake.main.otel_traces ORDER BY 1;
+----
+writer-a
+writer-b
+
+query I
+SELECT count(*) FROM lake.main.otel_traces WHERE region = 'eu-west';
+----
+1
+
+# bare table name resolves via prefix
+query IIIIII
+SELECT * FROM raw_ingest('otel_traces', '{"resourceSpans":[{"resource":{},"scopeSpans":[{"spans":[{"traceId":"00000000000000000000000000000004","spanId":"0000000000000004","name":"c-1","kind":1}]}]}]}', transform := 'otlp-traces');
+----
+otel_traces	false	1	0	1	0

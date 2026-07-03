@@ -562,6 +562,7 @@ struct RawServeBindData : public TableFunctionData {
 	string host = "127.0.0.1";
 	int32_t port = 9999;
 	string token;
+	string ingest_prefix;
 	// Synchronous ingestion by default: insert-then-query clients (MCP, the
 	// TypeScript SDK, curl scripts) expect a row to be visible the moment the
 	// insert call returns. Opt into async batching with async := true when the
@@ -592,6 +593,10 @@ static unique_ptr<FunctionData> RawServeBind(ClientContext &context, TableFuncti
 	if (async != input.named_parameters.end() && !async->second.IsNull()) {
 		result->async = async->second.GetValue<bool>();
 	}
+	auto ingest_prefix = input.named_parameters.find("ingest_prefix");
+	if (ingest_prefix != input.named_parameters.end() && !ingest_prefix->second.IsNull()) {
+		result->ingest_prefix = ingest_prefix->second.GetValue<string>();
+	}
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN};
 	names = {"host", "port", "auth"};
 	return std::move(result);
@@ -621,6 +626,9 @@ static void RawServeFunction(ClientContext &context, TableFunctionInput &data, D
 	api.port = bind_data.port;
 	api.token = bind_data.token;
 	api.async = bind_data.async;
+	if (!bind_data.ingest_prefix.empty()) {
+		RawSetIngestPrefix(*context.db, bind_data.ingest_prefix);
+	}
 	api.server = make_uniq<duckdb_httplib::Server>();
 	RegisterRoutes(*api.server);
 	if (!api.server->bind_to_port(bind_data.host.c_str(), bind_data.port)) {
@@ -666,6 +674,7 @@ TableFunction GetRawServeFunction() {
 	function.named_parameters["port"] = LogicalType::INTEGER;
 	function.named_parameters["token"] = LogicalType::VARCHAR;
 	function.named_parameters["async"] = LogicalType::BOOLEAN;
+	function.named_parameters["ingest_prefix"] = LogicalType::VARCHAR;
 	return function;
 }
 

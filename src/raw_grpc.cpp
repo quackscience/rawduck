@@ -105,15 +105,16 @@ grpc::Status ExportSignal(const grpc::ServerContext &context, const google::prot
 	}
 
 	Connection conn(*db);
+	auto resolved = RawResolveIngestTarget(*conn.context, table);
 	if (GetGrpcState().async || RawAsyncEnabled(*conn.context)) {
 		auto parse_options = ResolveTransform(*conn.context, "otlp-" + signal, "");
-		RawAsyncEnqueue(*conn.context, table, payload, parse_options);
+		RawAsyncEnqueue(*conn.context, resolved, payload, parse_options);
 		return grpc::Status::OK;
 	}
 	conn.BeginTransaction();
 	try {
 		auto parse_options = ResolveTransform(*conn.context, "otlp-" + signal, "");
-		auto stats = RawIngestPayload(*conn.context, table, payload, parse_options);
+		auto stats = RawIngestPayload(*conn.context, resolved, payload, parse_options);
 		conn.Commit();
 		rejected = stats.errors;
 		if (rejected > 0) {

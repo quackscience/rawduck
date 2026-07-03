@@ -181,6 +181,20 @@ static string QuoteLiteral(const string &value) {
 	return KeywordHelper::WriteQuoted(value, '\'');
 }
 
+static string RawRecordsCall(const string &payload_str, const RawParseOptions &options) {
+	string call = "raw_records(" + QuoteLiteral(payload_str);
+	if (!options.source_transform.empty()) {
+		call += ", transform := " + QuoteLiteral(options.source_transform);
+	} else if (!options.source_explode.empty()) {
+		call += ", explode := " + QuoteLiteral(options.source_explode);
+	}
+	if (options.ignore_errors) {
+		call += ", ignore_errors := true";
+	}
+	call += ")";
+	return call;
+}
+
 string RawQualifiedTarget(const string &target) {
 	auto qualified = QualifiedName::Parse(target);
 	string result;
@@ -566,7 +580,7 @@ private:
 class RawIngestor {
 public:
 	RawIngestor(ClientContext &context, string target_p, RawParseOptions options_p)
-	    : context(context), target(std::move(target_p)), options(std::move(options_p)) {
+	    : context(context), target(RawResolveIngestTarget(context, target_p)), options(std::move(options_p)) {
 		qname = QualifiedName::Parse(target);
 		if (qname.catalog.empty() && !qname.schema.empty()) {
 			// two-part names: the first part may be a catalog (raw.events)
@@ -1043,6 +1057,23 @@ private:
 		}
 	}
 
+	void ReprobeFallbackSchema() {
+		if (!fallback_conn) {
+			EnsureFallbackConnection();
+			return;
+		}
+		auto qualified = RawQualifiedTarget(target);
+		auto probe = fallback_conn->Query("SELECT * FROM " + qualified + " LIMIT 0");
+		fallback_exists = !probe->HasError();
+		fallback_types.clear();
+		if (!fallback_exists) {
+			return;
+		}
+		for (idx_t col = 0; col < probe->ColumnCount(); col++) {
+			fallback_types[probe->names[col]] = probe->types[col];
+		}
+	}
+
 	void IngestFallback(RawParsedPayload &parsed, const string &payload_str) {
 		EnsureFallbackConnection();
 		if (!fallback_exists && parsed.columns.empty()) {
@@ -1068,6 +1099,8 @@ private:
 	}
 
 	void FallbackBatch(RawParsedPayload &parsed, const string &payload_str, bool allow_json_widening) {
+		RawFallbackSchemaLock schema_lock(context, qname);
+		ReprobeFallbackSchema();
 		auto &conn = *fallback_conn;
 		auto qualified = RawQualifiedTarget(target);
 		auto &columns = parsed.columns;
@@ -1143,7 +1176,7 @@ private:
 					}
 					select_list += (i ? ", " : "") + expr;
 				}
-				insert += ") SELECT " + select_list + " FROM raw_records(" + QuoteLiteral(payload_str) + ")";
+				insert += ") SELECT " + select_list + " FROM " + RawRecordsCall(payload_str, options);
 				auto result = RunQuery(conn, insert);
 				batch_rows = NumericCast<idx_t>(result->GetValue(0, 0).GetValue<int64_t>());
 			}
@@ -1184,7 +1217,8 @@ private:
 // the caller's active transaction.
 RawIngestStats RawIngestPayload(ClientContext &context, const string &target, const string &payload,
                                 const RawParseOptions &options) {
-	RawIngestor ingestor(context, target, options);
+	auto resolved = RawResolveIngestTarget(context, target);
+	RawIngestor ingestor(context, resolved, options);
 	ingestor.Ingest(payload);
 	ingestor.Finish();
 	RawIngestStats stats;

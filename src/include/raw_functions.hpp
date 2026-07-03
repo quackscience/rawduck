@@ -39,6 +39,25 @@ struct RawIngestStats {
 RawIngestStats RawIngestPayload(ClientContext &context, const string &target, const string &payload,
                                 const RawParseOptions &options);
 
+// resolve bare table names against rawduck_ingest_prefix (e.g. lake.main)
+string RawResolveIngestTarget(ClientContext &context, const string &table);
+void RawSetIngestPrefix(DatabaseInstance &db, const string &prefix);
+
+// cross-process DDL serialization for non-native catalogs (DuckLake)
+class RawFallbackSchemaLock {
+public:
+	RawFallbackSchemaLock(ClientContext &context, const QualifiedName &qname);
+	~RawFallbackSchemaLock();
+
+	RawFallbackSchemaLock(const RawFallbackSchemaLock &) = delete;
+	RawFallbackSchemaLock &operator=(const RawFallbackSchemaLock &) = delete;
+
+private:
+#ifndef _WIN32
+	int fd = -1;
+#endif
+};
+
 TableFunction GetRawServeFunction();
 TableFunction GetRawServeStopFunction();
 TableFunction GetRawServeGrpcFunction();

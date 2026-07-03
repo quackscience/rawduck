@@ -1,58 +1,48 @@
 # Distribution test scripts
 
-Multi-process simulations for RawDuck distributed setups. See [docs/DISTRIBUTION.md](../../docs/DISTRIBUTION.md).
+Primary path: **multi-process OTEL writers → shared DuckLake → read-only reader**.
 
-## Prerequisites
+See [docs/DISTRIBUTION.md](../../docs/DISTRIBUTION.md).
+
+## Quick start
 
 ```sh
 GEN=ninja make release
-export DUCKDB=./build/release/duckdb
-export EXT=./build/release/extension/rawduck/rawduck.duckdb_extension
-```
-
-## Local Quack cluster (hub + readers)
-
-Terminal 1 — ingest hub:
-
-```sh
-$DUCKDB -unsigned -c "
-  LOAD '$EXT'; LOAD quack;
-  SELECT * FROM quack_serve('quack:127.0.0.1:19920', token := 'rt_secret');
-  CALL raw_serve('127.0.0.1:9999', token := 'rt_secret');
-"
-```
-
-Terminal 2 — parallel HTTP writers:
-
-```sh
-./test/http/distribution_concurrent_writes.sh
-./test/http/distribution_otlp_fanin.sh
-```
-
-Terminal 3 — Quack reader loop:
-
-```sh
-while true; do
-  $DUCKDB -unsigned -c "
-    LOAD '$EXT'; LOAD quack;
-    ATTACH 'rawduck:quack:127.0.0.1:19920' AS raw (TOKEN 'rt_secret');
-    SELECT count(*) FROM raw.dist_events;
-    DETACH raw;
-  "
-  sleep 0.5
-done
-```
-
-## DuckLake multi-process writers
-
-```sh
+./scripts/distribution/run_ducklake_otel_cluster.sh
 ./scripts/distribution/run_ducklake_writers.sh
 ```
 
-Two DuckDB processes ingest into the same on-disk DuckLake attach. Inspect exit codes and final
-row counts printed by the script.
+## Writer hub recipe (one instance)
 
-## CI note
+```sql
+LOAD rawduck;
+INSTALL ducklake; LOAD ducklake;
+ATTACH 'ducklake:/path/shared.ducklake' AS lake (DATA_PATH '/path/parquet');
+SELECT * FROM raw_serve(
+    host := '0.0.0.0', port := 9999, token := 'secret',
+    ingest_prefix := 'lake.main'
+);
+-- OTEL → POST /otlp/v1/traces  (table defaults to otel_traces → lake.main.otel_traces)
+```
 
-Layer 1 sqllogictests (`raw_distribution_*.test`) run in the normal unittest suite. HTTP and
-multi-process scripts are manual or future `DistributionIntegration` workflow targets.
+## Reader recipe
+
+```sql
+LOAD ducklake;
+ATTACH 'ducklake:/path/shared.ducklake' AS lake (DATA_PATH '/path/parquet', READ_ONLY);
+SELECT * FROM lake.main.otel_traces;
+```
+
+## Sqlite metadata note
+
+Only one process can hold `ATTACH` on a sqlite-backed DuckLake file at a time. For N always-on
+writer **processes**, either fan collectors into one hub or move metadata to postgres DuckLake.
+The cluster script models N **sequential** writer processes (attach → serve → exit).
+
+## Tests
+
+| Layer | File |
+|---|---|
+| sqllogictest | `test/sql/raw_distribution_ducklake_otel.test` |
+| multi-process | `scripts/distribution/run_ducklake_otel_cluster.sh` |
+| HTTP fan-in (single hub) | `test/http/distribution_otlp_fanin.sh` |

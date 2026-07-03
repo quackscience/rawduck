@@ -1,0 +1,74 @@
+# name: test/sql/raw_distribution_ducklake_inprocess.test
+# description: In-process DuckLake read/write matrix (single attach, multi-connection)
+# group: [sql]
+
+require rawduck
+
+require json
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/inproc.ducklake' AS lake (DATA_PATH '__TEST_DIR__/inproc_data');
+
+# writer creates table
+query IIIIII
+SELECT * FROM raw_ingest('lake.main.metrics', '[{"host":"a","cpu":42}]');
+----
+lake.main.metrics	true	2	0	1	0
+
+# reader connection queries while writer ingests more rows
+query I client
+SELECT count(*) FROM lake.main.metrics;
+----
+1
+
+statement ok
+CALL raw_ingest('lake.main.metrics', '[{"host":"b","cpu":99,"mem":1024}]');
+
+query I client
+SELECT count(*) FROM lake.main.metrics;
+----
+2
+
+query II client
+SELECT host, max(cpu) FROM lake.main.metrics GROUP BY host ORDER BY host;
+----
+a	42
+b	99
+
+# schema evolution: new nested column from writer, reader sees it
+query I client
+SELECT count(*) FROM lake.main.metrics WHERE mem IS NOT NULL;
+----
+1
+
+# type widening: BIGINT value from second connection
+statement ok client
+CALL raw_ingest('lake.main.metrics', '[{"host":"c","cpu":9999999999}]');
+
+query II
+SELECT typeof(cpu), cpu FROM lake.main.metrics WHERE host = 'c';
+----
+BIGINT	9999999999
+
+# concurrent-ish evolution: both connections add columns
+statement ok client
+CALL raw_ingest('lake.main.metrics', '[{"host":"d","region":"us"}]');
+
+query IIIIII
+SELECT * FROM raw_ingest('lake.main.metrics', '[{"host":"e","zone":"east"}]');
+----
+lake.main.metrics	false	1	0	1	0
+
+query III
+SELECT host, region, zone FROM lake.main.metrics WHERE host IN ('d', 'e') ORDER BY host;
+----
+d	us	NULL
+e	NULL	east

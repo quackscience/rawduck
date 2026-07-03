@@ -134,6 +134,37 @@ Quack remains the convenient **query/control plane** when clients need `raw.inge
 - `ObjectCache` stats and async buffers — **per DatabaseInstance**, not shared across hosts.
 - No `rawduck:ducklake:` attach alias or first-class distributed config.
 
+## Probe matrix (rules of the game)
+
+Run `./scripts/distribution/probe_matrix.sh` against **one DuckLake** (sqlite metadata + local
+`DATA_PATH`) with multiple writers and readers. Output: `benchmark/work/distribution_probe/probe_report.md`.
+
+| Scenario ID | Category | Question |
+|---|---|---|
+| `sql_raw_distribution_*` | in_process | Multi-connection ingest/read on one attach |
+| `mp_sequential_writers` | multi_process | N processes, attach → write → exit |
+| `mp_overlapping_writers` | multi_process | Concurrent short-lived writers |
+| `mp_concurrent_persistent_attach` | multi_process | Two long-lived ATTACH (expect fail on sqlite) |
+| `mp_schema_evolution` | multi_process | ADD COLUMN from process B visible everywhere |
+| `mp_reader_readonly_after_writers` | multi_process | READ_ONLY reader after writers finish |
+| `mp_sequential_otel_hubs` | multi_process | OTLP `raw_serve` per process, shared lake |
+| `hub_ducklake_parallel_http` | single_hub | Parallel HTTP → one hub → DuckLake |
+| `hub_ducklake_schema_churn_http` | single_hub | Parallel wide-schema HTTP posts |
+| `hub_ducklake_parallel_otlp` | single_hub | Parallel OTLP → one hub → DuckLake |
+
+**Preliminary rules (sqlite DuckLake):**
+
+| Works | Does not work (today) |
+|---|---|
+| Single hub, parallel HTTP/OTLP → DuckLake | Two long-lived processes holding ATTACH |
+| Sequential writer processes (attach → exit) | Always-on N writer daemons without postgres metadata |
+| READ_ONLY reader after writers complete | In-process second READ_ONLY attach while first ATTACH open |
+| Cross-process schema evolution (with lock) | Native append pool (DuckLake uses SQL fallback) |
+| Multi-connection read-while-write (one process) | Projection rewrite across writers |
+
+Use probe results to decide: hub fan-in vs sequential workers vs postgres metadata — without
+guessing at production.
+
 ## Validation matrix
 
 Use this checklist as tests land. Mark in PRs / issues.

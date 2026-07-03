@@ -1,48 +1,44 @@
-# Distribution test scripts
+# Distribution probes — one DuckLake, multiple writers/readers
 
-Primary path: **multi-process OTEL writers → shared DuckLake → read-only reader**.
-
-See [docs/DISTRIBUTION.md](../../docs/DISTRIBUTION.md).
-
-## Quick start
+Run the **probe matrix** to learn what works on your platform before scaling DuckLake metadata.
 
 ```sh
 GEN=ninja make release
-./scripts/distribution/run_ducklake_otel_cluster.sh
-./scripts/distribution/run_ducklake_writers.sh
+./scripts/distribution/probe_matrix.sh          # full matrix (~1 min)
+./scripts/distribution/probe_matrix.sh --quick  # skip expected-fail dual-attach probe
 ```
 
-## Writer hub recipe (one instance)
+Reports land in `benchmark/work/distribution_probe/`:
 
-```sql
-LOAD rawduck;
-INSTALL ducklake; LOAD ducklake;
-ATTACH 'ducklake:/path/shared.ducklake' AS lake (DATA_PATH '/path/parquet');
-SELECT * FROM raw_serve(
-    host := '0.0.0.0', port := 9999, token := 'secret',
-    ingest_prefix := 'lake.main'
-);
--- OTEL → POST /otlp/v1/traces  (table defaults to otel_traces → lake.main.otel_traces)
-```
+- `probe_report.md` — human table
+- `probe_report.json` — machine-readable for CI baselines
 
-## Reader recipe
+## Scenario categories
 
-```sql
-LOAD ducklake;
-ATTACH 'ducklake:/path/shared.ducklake' AS lake (DATA_PATH '/path/parquet', READ_ONLY);
-SELECT * FROM lake.main.otel_traces;
-```
+| Category | What it models | Key question |
+|---|---|---|
+| **in_process** | sqllogictest, one ATTACH, multi-connection | Do interleaved writes/reads and schema evolution work? |
+| **multi_process** | Separate DuckDB PIDs, short- or long-lived attach | Can N writer processes share sqlite DuckLake metadata? |
+| **single_hub** | One `raw_serve` + DuckLake backend, parallel HTTP | Is fan-in to one hub the high-throughput path? |
 
-## Sqlite metadata note
+## Individual scripts
 
-Only one process can hold `ATTACH` on a sqlite-backed DuckLake file at a time. For N always-on
-writer **processes**, either fan collectors into one hub or move metadata to postgres DuckLake.
-The cluster script models N **sequential** writer processes (attach → serve → exit).
-
-## Tests
-
-| Layer | File |
+| Script | Scenario |
 |---|---|
-| sqllogictest | `test/sql/raw_distribution_ducklake_otel.test` |
-| multi-process | `scripts/distribution/run_ducklake_otel_cluster.sh` |
-| HTTP fan-in (single hub) | `test/http/distribution_otlp_fanin.sh` |
+| `probe_matrix.sh` | Runs all probes, writes report |
+| `run_ducklake_otel_cluster.sh` | Sequential OTEL writer processes → READ_ONLY reader |
+| `run_ducklake_writers.sh` | Overlapping raw_ingest processes |
+
+## SQL tests (CI / unittest)
+
+```sh
+./build/release/test/unittest --test-dir . "test/sql/raw_distribution*"
+```
+
+| File | Covers |
+|---|---|
+| `raw_distribution_ducklake.test` | Two connections, interleaved ingest |
+| `raw_distribution_ducklake_otel.test` | OTLP transform + prefix + schema evolution |
+| `raw_distribution_ducklake_inprocess.test` | Read-while-write, type widening, column churn |
+
+Design notes and evolution roadmap: [docs/DISTRIBUTION.md](../../docs/DISTRIBUTION.md).

@@ -11,7 +11,7 @@
 # One-time setup: repo Settings -> Pages -> Build and deployment -> Source: GitHub Actions.
 #
 # Layout after deploy:
-#   https://quackscience.github.io/rawduck/v1.5.3/linux_amd64/rawduck.duckdb_extension.gz
+#   https://quackscience.github.io/rawduck/v1.5.4/linux_amd64/rawduck.duckdb_extension.gz
 #
 # Users:
 #   SET allow_unsigned_extensions = true;
@@ -47,7 +47,7 @@ concurrency:
 
 env:
   EXT_NAME: rawduck
-  DUCKDB_VERSION: v1.5.3
+  DUCKDB_VERSION: v1.5.4
   PAGES_BASE_URL: https://quackscience.github.io/rawduck
 
 jobs:
@@ -55,7 +55,7 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
     with:
-      duckdb_version: v1.5.3
+      duckdb_version: v1.5.4
       ci_tools_version: v1.5-variegata
       extension_name: rawduck
       # build exactly the four published platforms: linux/osx x amd64/arm64.

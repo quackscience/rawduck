@@ -26,11 +26,11 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
     with:
-      duckdb_version: v1.5.3
+      duckdb_version: v1.5.4
       ci_tools_version: v1.5-variegata
       extension_name: rawduck
       # Windows is excluded until the VS2026 runner image is compatible with
-      # duckdb v1.5.3's vendored fmt (stdext::checked_array_iterator was
+      # duckdb v1.5.4's vendored fmt (stdext::checked_array_iterator was
       # removed from the MSVC STL).
       exclude_archs: 'windows_amd64;windows_arm64;windows_amd64_mingw;windows_amd64_rtools'
 
@@ -38,7 +38,7 @@ jobs:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
     with:
-      duckdb_version: v1.5.3
+      duckdb_version: v1.5.4
       ci_tools_version: v1.5-variegata
       extension_name: rawduck
       format_checks: 'format;tidy'

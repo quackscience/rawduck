@@ -973,6 +973,17 @@ bool RawFillSupported(const LogicalType &type) {
 	}
 }
 
+// Match a JSON object key against schema children without allocating a std::string.
+static idx_t LookupChildIndex(const RawNode &node, const char *key, size_t key_len) {
+	for (idx_t i = 0; i < node.children.size(); i++) {
+		auto &stored = node.children[i].first;
+		if (stored.size() == key_len && memcmp(stored.data(), key, key_len) == 0) {
+			return i;
+		}
+	}
+	return DConstants::INVALID_INDEX;
+}
+
 RawExtractor::RawExtractor(const RawNode &root_p, const vector<RawColumn> &columns, bool mut_rows_p)
     : root(root_p), mut_rows(mut_rows_p) {
 	values.resize(columns.size());
@@ -1013,12 +1024,11 @@ void RawExtractor::Traverse(yyjson_val *val, const RawNode &node, idx_t row_idx)
 	yyjson_obj_iter iter;
 	duckdb_yyjson::yyjson_obj_iter_init(val, &iter);
 	while (auto key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
-		auto entry =
-		    node.child_lookup.find(string(duckdb_yyjson::yyjson_get_str(key), duckdb_yyjson::yyjson_get_len(key)));
-		if (entry == node.child_lookup.end()) {
+		auto child_idx = LookupChildIndex(node, duckdb_yyjson::yyjson_get_str(key), duckdb_yyjson::yyjson_get_len(key));
+		if (child_idx == DConstants::INVALID_INDEX) {
 			continue;
 		}
-		Traverse(duckdb_yyjson::yyjson_obj_iter_get_val(key), *node.children[entry->second].second, row_idx);
+		Traverse(duckdb_yyjson::yyjson_obj_iter_get_val(key), *node.children[child_idx].second, row_idx);
 	}
 }
 
@@ -1042,12 +1052,12 @@ void RawExtractor::TraverseMut(yyjson_mut_val *val, const RawNode &node, idx_t r
 	yyjson_mut_obj_iter iter;
 	duckdb_yyjson::yyjson_mut_obj_iter_init(val, &iter);
 	while (auto key = duckdb_yyjson::yyjson_mut_obj_iter_next(&iter)) {
-		auto entry =
-		    node.child_lookup.find(string(duckdb_yyjson::yyjson_mut_get_str(key), duckdb_yyjson::yyjson_mut_get_len(key)));
-		if (entry == node.child_lookup.end()) {
+		auto child_idx =
+		    LookupChildIndex(node, duckdb_yyjson::yyjson_mut_get_str(key), duckdb_yyjson::yyjson_mut_get_len(key));
+		if (child_idx == DConstants::INVALID_INDEX) {
 			continue;
 		}
-		TraverseMut(duckdb_yyjson::yyjson_mut_obj_iter_get_val(key), *node.children[entry->second].second, row_idx);
+		TraverseMut(duckdb_yyjson::yyjson_mut_obj_iter_get_val(key), *node.children[child_idx].second, row_idx);
 	}
 }
 
@@ -1059,14 +1069,59 @@ void RawExtractor::AssignMutRow(yyjson_mut_val *row, idx_t row_idx) {
 	TraverseMut(row, root, row_idx);
 }
 
-static string_t WriteJSONString(yyjson_val *val, Vector &result) {
+// Per-thread bump allocator for JSON column serialization; reset at the start of each FillVector pass.
+struct RawJSONWritePool {
+	static constexpr size_t CAPACITY = 262144;
+	alignas(8) char buffer[CAPACITY];
+	duckdb_yyjson::yyjson_alc alc {};
+
+	RawJSONWritePool() {
+		duckdb_yyjson::yyjson_alc_pool_init(&alc, buffer, CAPACITY);
+	}
+
+	void Reset() {
+		duckdb_yyjson::yyjson_alc_pool_init(&alc, buffer, CAPACITY);
+	}
+};
+
+static RawJSONWritePool &GetJSONWritePool() {
+	static thread_local RawJSONWritePool pool;
+	return pool;
+}
+
+static string_t WriteJSONString(yyjson_val *val, Vector &result, duckdb_yyjson::yyjson_alc *alc) {
 	size_t len = 0;
-	auto data = duckdb_yyjson::yyjson_val_write(val, 0, &len);
+	duckdb_yyjson::yyjson_write_err err {};
+	auto data = duckdb_yyjson::yyjson_val_write_opts(val, 0, alc, &len, &err);
+	bool pooled = data != nullptr;
+	if (!data) {
+		data = duckdb_yyjson::yyjson_val_write(val, 0, &len);
+	}
 	if (!data) {
 		throw InternalException("RawDuck: failed to serialize JSON value");
 	}
 	auto str = StringVector::AddString(result, data, len);
-	free(data);
+	if (!pooled) {
+		free(data);
+	}
+	return str;
+}
+
+static string_t WriteJSONStringMut(yyjson_mut_val *val, Vector &result, duckdb_yyjson::yyjson_alc *alc) {
+	size_t len = 0;
+	duckdb_yyjson::yyjson_write_err err {};
+	auto data = duckdb_yyjson::yyjson_mut_val_write_opts(val, 0, alc, &len, &err);
+	bool pooled = data != nullptr;
+	if (!data) {
+		data = duckdb_yyjson::yyjson_mut_val_write(val, 0, &len);
+	}
+	if (!data) {
+		throw InternalException("RawDuck: failed to serialize JSON value");
+	}
+	auto str = StringVector::AddString(result, data, len);
+	if (!pooled) {
+		free(data);
+	}
 	return str;
 }
 
@@ -1079,6 +1134,8 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 		validity.SetInvalid(offset + i);
 	};
 	if (IsRawJSONType(type)) {
+		auto &pool = GetJSONWritePool();
+		pool.Reset();
 		auto data = FlatVector::GetData<string_t>(result);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
@@ -1086,7 +1143,7 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 				set_null(i);
 				continue;
 			}
-			data[offset + i] = WriteJSONString(val, result);
+			data[offset + i] = WriteJSONString(val, result, &pool.alc);
 		}
 		return;
 	}
@@ -1157,6 +1214,8 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 	}
 	case LogicalTypeId::VARCHAR: {
 		auto data = FlatVector::GetData<string_t>(result);
+		auto &pool = GetJSONWritePool();
+		bool pool_ready = false;
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (!val || duckdb_yyjson::yyjson_is_null(val)) {
@@ -1165,8 +1224,12 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 				data[offset + i] = StringVector::AddString(result, duckdb_yyjson::yyjson_get_str(val),
 				                                           duckdb_yyjson::yyjson_get_len(val));
 			} else {
+				if (!pool_ready) {
+					pool.Reset();
+					pool_ready = true;
+				}
 				// mixed-type column: render non-strings as their JSON literal
-				data[offset + i] = WriteJSONString(val, result);
+				data[offset + i] = WriteJSONString(val, result, &pool.alc);
 			}
 		}
 		break;
@@ -1203,23 +1266,14 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 	}
 }
 
-static string_t WriteJSONStringMut(yyjson_mut_val *val, Vector &result) {
-	size_t len = 0;
-	auto data = duckdb_yyjson::yyjson_mut_val_write(val, 0, &len);
-	if (!data) {
-		throw InternalException("RawDuck: failed to serialize JSON value");
-	}
-	auto str = StringVector::AddString(result, data, len);
-	free(data);
-	return str;
-}
-
 void FillVectorMut(const vector<yyjson_mut_val *> &vals, const LogicalType &type, Vector &result, idx_t offset) {
 	auto &validity = FlatVector::Validity(result);
 	auto set_null = [&](idx_t i) {
 		validity.SetInvalid(offset + i);
 	};
 	if (IsRawJSONType(type)) {
+		auto &pool = GetJSONWritePool();
+		pool.Reset();
 		auto data = FlatVector::GetData<string_t>(result);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
@@ -1227,7 +1281,7 @@ void FillVectorMut(const vector<yyjson_mut_val *> &vals, const LogicalType &type
 				set_null(i);
 				continue;
 			}
-			data[offset + i] = WriteJSONStringMut(val, result);
+			data[offset + i] = WriteJSONStringMut(val, result, &pool.alc);
 		}
 		return;
 	}
@@ -1299,6 +1353,8 @@ void FillVectorMut(const vector<yyjson_mut_val *> &vals, const LogicalType &type
 	}
 	case LogicalTypeId::VARCHAR: {
 		auto data = FlatVector::GetData<string_t>(result);
+		auto &pool = GetJSONWritePool();
+		bool pool_ready = false;
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (!val || duckdb_yyjson::yyjson_mut_is_null(val)) {
@@ -1307,7 +1363,11 @@ void FillVectorMut(const vector<yyjson_mut_val *> &vals, const LogicalType &type
 				data[offset + i] = StringVector::AddString(result, duckdb_yyjson::yyjson_mut_get_str(val),
 				                                           duckdb_yyjson::yyjson_mut_get_len(val));
 			} else {
-				data[offset + i] = WriteJSONStringMut(val, result);
+				if (!pool_ready) {
+					pool.Reset();
+					pool_ready = true;
+				}
+				data[offset + i] = WriteJSONStringMut(val, result, &pool.alc);
 			}
 		}
 		break;

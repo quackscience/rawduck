@@ -1036,13 +1036,18 @@ private:
 	}
 
 	void EvolveNative(Catalog &catalog, TableCatalogEntry &table, RawParsedPayload &parsed) {
-		auto &existing_columns = table.GetColumns();
+		AlterEntryData data(qname.catalog, qname.schema, qname.name, OnEntryNotFound::THROW_EXCEPTION);
+		vector<ColumnDefinition> to_add;
+		struct WidenColumn {
+			string name;
+			LogicalType target_type;
+			unique_ptr<ParsedExpression> expression;
+		};
+		vector<WidenColumn> to_widen;
 		for (auto &column : parsed.columns) {
-			AlterEntryData data(qname.catalog, qname.schema, qname.name, OnEntryNotFound::THROW_EXCEPTION);
+			auto &existing_columns = table.GetColumns();
 			if (!existing_columns.ColumnExists(column.name)) {
-				AddColumnInfo add_column(std::move(data), ColumnDefinition(column.name, column.type), false);
-				catalog.Alter(context, add_column);
-				columns_added++;
+				to_add.emplace_back(column.name, column.type);
 				continue;
 			}
 			auto &existing = existing_columns.GetColumn(column.name);
@@ -1053,14 +1058,21 @@ private:
 			auto column_ref = make_uniq<ColumnRefExpression>(column.name);
 			unique_ptr<ParsedExpression> expression;
 			if (IsRawJSONType(target_type) && !IsRawJSONType(existing.Type())) {
-				// a plain cast to JSON would reject bare strings
 				vector<unique_ptr<ParsedExpression>> children;
 				children.push_back(std::move(column_ref));
 				expression = make_uniq<FunctionExpression>("to_json", std::move(children));
 			} else {
 				expression = make_uniq<CastExpression>(target_type, std::move(column_ref));
 			}
-			ChangeColumnTypeInfo change_type(std::move(data), column.name, target_type, std::move(expression));
+			to_widen.push_back(WidenColumn {column.name, target_type, std::move(expression)});
+		}
+		for (auto &col : to_add) {
+			AddColumnInfo add_column(data, col.Copy(), false);
+			catalog.Alter(context, add_column);
+			columns_added++;
+		}
+		for (auto &widen : to_widen) {
+			ChangeColumnTypeInfo change_type(data, widen.name, widen.target_type, widen.expression->Copy());
 			catalog.Alter(context, change_type);
 			columns_widened++;
 		}

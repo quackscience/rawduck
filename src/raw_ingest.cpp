@@ -59,10 +59,16 @@ public:
 		return optional_idx();
 	}
 
+	struct CachedShapePlan {
+		uint64_t shape = 0;
+		unique_ptr<RawNode> root;
+	};
+
 	struct Entry {
 		// validity token: the table's DataTable address at absorption time
 		void *storage_token = nullptr;
 		unordered_set<uint64_t> absorbed_shapes;
+		unordered_map<uint64_t, CachedShapePlan> plans;
 	};
 	mutex lock;
 	unordered_map<string, Entry> tables;
@@ -79,13 +85,53 @@ static uint64_t HashPayloadShape(const vector<RawColumn> &columns) {
 	return shape;
 }
 
-static void MergeParsedPayloads(RawParsedPayload &into, RawParsedPayload &&from) {
-	into.payload.rows.insert(into.payload.rows.end(), from.payload.rows.begin(), from.payload.rows.end());
-	for (auto *doc : from.payload.docs) {
-		into.payload.docs.push_back(doc);
+static void SaveCachedShapePlan(RawSchemaCache::Entry &entry, uint64_t shape, const RawParsedPayload &parsed) {
+	if (!parsed.root) {
+		return;
 	}
-	from.payload.docs.clear();
-	from.payload.rows.clear();
+	auto &plan = entry.plans[shape];
+	if (plan.root) {
+		return;
+	}
+	plan.shape = shape;
+	plan.root = CloneRawNode(*parsed.root);
+}
+
+static bool TryApplyCachedShapePlan(RawParsedPayload &parsed, RawSchemaCache::Entry &entry, void *storage_token) {
+	if (entry.storage_token != storage_token || entry.plans.empty()) {
+		return false;
+	}
+	// Stable OTEL workloads replay one shape; GH Archive may hold many.
+	if (entry.plans.size() == 1) {
+		parsed.AttachCachedRoot(*entry.plans.begin()->second.root);
+		return true;
+	}
+	return false;
+}
+
+static void MergeParsedPayloads(RawParsedPayload &into, RawParsedPayload &&from) {
+	if (into.payload.UsesMutRows() || from.payload.UsesMutRows()) {
+		if (!into.payload.UsesMutRows()) {
+			throw InternalException("RawDuck: cannot merge mut and imut parsed payloads");
+		}
+		if (!from.payload.UsesMutRows()) {
+			throw InternalException("RawDuck: cannot merge mut and imut parsed payloads");
+		}
+		into.payload.mut_rows.insert(into.payload.mut_rows.end(), from.payload.mut_rows.begin(),
+		                             from.payload.mut_rows.end());
+		for (auto *doc : from.payload.mut_docs) {
+			into.payload.mut_docs.push_back(doc);
+		}
+		from.payload.mut_docs.clear();
+		from.payload.mut_rows.clear();
+	} else {
+		into.payload.rows.insert(into.payload.rows.end(), from.payload.rows.begin(), from.payload.rows.end());
+		for (auto *doc : from.payload.docs) {
+			into.payload.docs.push_back(doc);
+		}
+		from.payload.docs.clear();
+		from.payload.rows.clear();
+	}
 	from.payload.parse_errors = 0;
 }
 
@@ -481,7 +527,7 @@ private:
 	void AppendBatch(Worker &worker, RawParsedPayload &parsed, DataChunk &chunk, bool allow_flush) {
 		auto &types = worker.local_types;
 		auto &slots = worker.local_slots;
-		RawExtractor extractor(*parsed.root, parsed.columns);
+		RawExtractor extractor(*parsed.root, parsed.columns, parsed.payload.UsesMutRows());
 		auto shape = HashPayloadShape(parsed.columns);
 		vector<idx_t> slot_of;
 		vector<bool> covered;
@@ -504,22 +550,40 @@ private:
 			worker.layout_cache.slot_of = slot_of;
 			worker.layout_cache.covered = covered;
 		}
-		auto &payload_rows = parsed.payload.rows;
-		for (idx_t start = 0; start < payload_rows.size(); start += STANDARD_VECTOR_SIZE) {
-			auto count = MinValue<idx_t>(payload_rows.size() - start, STANDARD_VECTOR_SIZE);
+		auto row_count = parsed.payload.RowCount();
+		for (idx_t start = 0; start < row_count; start += STANDARD_VECTOR_SIZE) {
+			auto count = MinValue<idx_t>(row_count - start, STANDARD_VECTOR_SIZE);
 			chunk.Reset();
 			extractor.Reset(count);
-			for (idx_t i = 0; i < count; i++) {
-				extractor.AssignRow(payload_rows[start + i], i);
-			}
-			for (idx_t col = 0; col < parsed.columns.size(); col++) {
-				auto slot = slot_of[col];
-				if (RawFillSupported(types[slot])) {
-					FillVector(extractor.ColumnValues(col), types[slot], chunk.data[slot], 0);
-				} else {
-					Vector source(parsed.columns[col].type, count);
-					FillVector(extractor.ColumnValues(col), parsed.columns[col].type, source, 0);
-					VectorOperations::DefaultCast(source, chunk.data[slot], count);
+			if (parsed.payload.UsesMutRows()) {
+				auto &payload_rows = parsed.payload.mut_rows;
+				for (idx_t i = 0; i < count; i++) {
+					extractor.AssignMutRow(payload_rows[start + i], i);
+				}
+				for (idx_t col = 0; col < parsed.columns.size(); col++) {
+					auto slot = slot_of[col];
+					if (RawFillSupported(types[slot])) {
+						FillVectorMut(extractor.ColumnMutValues(col), types[slot], chunk.data[slot], 0);
+					} else {
+						Vector source(parsed.columns[col].type, count);
+						FillVectorMut(extractor.ColumnMutValues(col), parsed.columns[col].type, source, 0);
+						VectorOperations::DefaultCast(source, chunk.data[slot], count);
+					}
+				}
+			} else {
+				auto &payload_rows = parsed.payload.rows;
+				for (idx_t i = 0; i < count; i++) {
+					extractor.AssignRow(payload_rows[start + i], i);
+				}
+				for (idx_t col = 0; col < parsed.columns.size(); col++) {
+					auto slot = slot_of[col];
+					if (RawFillSupported(types[slot])) {
+						FillVector(extractor.ColumnValues(col), types[slot], chunk.data[slot], 0);
+					} else {
+						Vector source(parsed.columns[col].type, count);
+						FillVector(extractor.ColumnValues(col), parsed.columns[col].type, source, 0);
+						VectorOperations::DefaultCast(source, chunk.data[slot], count);
+					}
 				}
 			}
 			for (idx_t slot = 0; slot < types.size(); slot++) {
@@ -579,8 +643,10 @@ private:
 // used instead.
 class RawIngestor {
 public:
-	RawIngestor(ClientContext &context, string target_p, RawParseOptions options_p)
-	    : context(context), target(RawResolveIngestTarget(context, target_p)), options(std::move(options_p)) {
+	RawIngestor(ClientContext &context, string target_p, RawParseOptions options_p,
+	            std::atomic<bool> *schema_plan_flag_p = nullptr)
+	    : context(context), target(RawResolveIngestTarget(context, target_p)), options(std::move(options_p)),
+	      schema_plan_flag(schema_plan_flag_p) {
 		qname = QualifiedName::Parse(target);
 		if (qname.catalog.empty() && !qname.schema.empty()) {
 			// two-part names: the first part may be a catalog (raw.events)
@@ -601,11 +667,35 @@ public:
 	}
 
 	void Ingest(const string &payload_str) {
-		auto parsed = RawParsedPayload::Process(payload_str, options);
+		auto parsed = RawParsedPayload::ParsePayload(payload_str, options);
 		IngestParsed(std::move(parsed), payload_str);
 	}
 
+	void FinalizeParsedSchema(RawParsedPayload &parsed) {
+		if (!parsed.columns.empty() || !parsed.payload.HasRows()) {
+			return;
+		}
+		// Skip inference only for later batches in the same raw_ingest_file call,
+		// after the first batch has absorbed a stable schema plan.
+		if (schema_plan_flag && schema_plan_flag->load(std::memory_order_acquire)) {
+			auto table = LookupTable();
+			if (table) {
+				auto cache_key = qname.catalog + "." + qname.schema + "." + qname.name;
+				auto &cache =
+				    *ObjectCache::GetObjectCache(context).GetOrCreate<RawSchemaCache>(RawSchemaCache::ObjectType());
+				lock_guard<mutex> guard(cache.lock);
+				auto entry = cache.tables.find(cache_key);
+				if (entry != cache.tables.end() &&
+				    TryApplyCachedShapePlan(parsed, entry->second, &table->GetStorage())) {
+					return;
+				}
+			}
+		}
+		parsed.InferColumns();
+	}
+
 	void IngestParsed(shared_ptr<RawParsedPayload> parsed, const string &payload_str) {
+		FinalizeParsedSchema(*parsed);
 		errors += parsed->payload.parse_errors;
 		if (native) {
 			IngestNative(std::move(parsed));
@@ -665,16 +755,10 @@ public:
 			if (pool && !adds.empty()) {
 				pool->PublishColumns(adds, table->GetStorage());
 			}
-			lock_guard<mutex> guard(cache.lock);
-			auto &entry = cache.tables[cache_key];
-			if (entry.storage_token != &table->GetStorage()) {
-				entry.storage_token = &table->GetStorage();
-				entry.absorbed_shapes.clear();
-			}
-			entry.absorbed_shapes.insert(shape);
+			CacheAbsorbedShape(&table->GetStorage(), shape, parsed);
 			last_batch_shape_absorbed = true;
 		}
-		if (parsed.payload.rows.empty()) {
+		if (!parsed.payload.HasRows()) {
 			return false;
 		}
 		MetaTransaction::Get(context).ModifyDatabase(Catalog::GetCatalog(context, qname.catalog).GetAttached(),
@@ -685,7 +769,7 @@ public:
 
 	void SubmitPreparedBatch(shared_ptr<RawParsedPayload> parsed_ptr, bool use_pool) {
 		auto &parsed = *parsed_ptr;
-		if (parsed.payload.rows.empty()) {
+		if (!parsed.payload.HasRows()) {
 			return;
 		}
 		if (use_pool && pool) {
@@ -803,7 +887,7 @@ private:
 	}
 
 	bool PoolEligible(TableCatalogEntry &table, RawParsedPayload &parsed) {
-		if (parsed.payload.rows.size() < write_settings.pool_min_rows) {
+		if (parsed.payload.RowCount() < write_settings.pool_min_rows) {
 			return false;
 		}
 		auto &columns_list = table.GetColumns();
@@ -818,12 +902,12 @@ private:
 	}
 
 	void EnsurePool(TableCatalogEntry &table, RawParsedPayload &parsed, bool shape_absorbed) {
-		if (pool || parsed.payload.rows.empty() || !PoolEligible(table, parsed)) {
+		if (pool || !parsed.payload.HasRows() || !PoolEligible(table, parsed)) {
 			return;
 		}
 		write_settings = RawWriteSettings::Get(context);
-		auto worker_count = write_settings.PoolThreadCount(parsed.payload.rows.size());
-		auto overlap = write_settings.OverlapFlushForBatch(context, shape_absorbed, parsed.payload.rows.size());
+		auto worker_count = write_settings.PoolThreadCount(parsed.payload.RowCount());
+		auto overlap = write_settings.OverlapFlushForBatch(context, shape_absorbed, parsed.payload.RowCount());
 		pool = make_uniq<RawAppendPool>(context, table, worker_count, overlap, write_settings.pipeline_depth);
 	}
 
@@ -866,16 +950,10 @@ private:
 			if (pool && !adds.empty()) {
 				pool->PublishColumns(adds, table->GetStorage());
 			}
-			lock_guard<mutex> guard(cache.lock);
-			auto &entry = cache.tables[cache_key];
-			if (entry.storage_token != &table->GetStorage()) {
-				entry.storage_token = &table->GetStorage();
-				entry.absorbed_shapes.clear();
-			}
-			entry.absorbed_shapes.insert(shape);
+			CacheAbsorbedShape(&table->GetStorage(), shape, parsed);
 			shape_absorbed = true;
 		}
-		if (parsed.payload.rows.empty()) {
+		if (!parsed.payload.HasRows()) {
 			return;
 		}
 		MetaTransaction::Get(context).ModifyDatabase(Catalog::GetCatalog(context, qname.catalog).GetAttached(),
@@ -929,7 +1007,7 @@ private:
 				pool->PublishColumns(adds, evolved->GetStorage());
 			}
 		}
-		if (parsed.payload.rows.empty()) {
+		if (!parsed.payload.HasRows()) {
 			return;
 		}
 		// re-resolve: DDL replaces the catalog entry
@@ -937,6 +1015,7 @@ private:
 		if (!table) {
 			throw InternalException("RawDuck: table %s disappeared during ingestion", target);
 		}
+		CacheAbsorbedShape(&table->GetStorage(), HashPayloadShape(parsed.columns), parsed);
 		EnsurePool(*table, parsed, true);
 		if (pool) {
 			pool->Submit(std::move(parsed_ptr));
@@ -999,26 +1078,43 @@ private:
 
 		DataChunk chunk;
 		chunk.Initialize(Allocator::Get(context), types);
-		RawExtractor extractor(*parsed.root, parsed.columns);
+		RawExtractor extractor(*parsed.root, parsed.columns, parsed.payload.UsesMutRows());
 		auto &storage = table.GetStorage();
-		auto &payload_rows = parsed.payload.rows;
+		auto row_count = parsed.payload.RowCount();
 
-		for (idx_t start = 0; start < payload_rows.size(); start += STANDARD_VECTOR_SIZE) {
-			auto count = MinValue<idx_t>(payload_rows.size() - start, STANDARD_VECTOR_SIZE);
+		for (idx_t start = 0; start < row_count; start += STANDARD_VECTOR_SIZE) {
+			auto count = MinValue<idx_t>(row_count - start, STANDARD_VECTOR_SIZE);
 			chunk.Reset();
 			extractor.Reset(count);
-			for (idx_t i = 0; i < count; i++) {
-				extractor.AssignRow(payload_rows[start + i], i);
-			}
-			for (idx_t col = 0; col < parsed.columns.size(); col++) {
-				auto slot = slot_of[col];
-				if (RawFillSupported(types[slot])) {
-					FillVector(extractor.ColumnValues(col), types[slot], chunk.data[slot], 0);
-				} else {
-					// extract in the payload's inferred type, then cast
-					Vector source(parsed.columns[col].type, count);
-					FillVector(extractor.ColumnValues(col), parsed.columns[col].type, source, 0);
-					VectorOperations::DefaultCast(source, chunk.data[slot], count);
+			if (parsed.payload.UsesMutRows()) {
+				auto &payload_rows = parsed.payload.mut_rows;
+				for (idx_t i = 0; i < count; i++) {
+					extractor.AssignMutRow(payload_rows[start + i], i);
+				}
+				for (idx_t col = 0; col < parsed.columns.size(); col++) {
+					auto slot = slot_of[col];
+					if (RawFillSupported(types[slot])) {
+						FillVectorMut(extractor.ColumnMutValues(col), types[slot], chunk.data[slot], 0);
+					} else {
+						Vector source(parsed.columns[col].type, count);
+						FillVectorMut(extractor.ColumnMutValues(col), parsed.columns[col].type, source, 0);
+						VectorOperations::DefaultCast(source, chunk.data[slot], count);
+					}
+				}
+			} else {
+				auto &payload_rows = parsed.payload.rows;
+				for (idx_t i = 0; i < count; i++) {
+					extractor.AssignRow(payload_rows[start + i], i);
+				}
+				for (idx_t col = 0; col < parsed.columns.size(); col++) {
+					auto slot = slot_of[col];
+					if (RawFillSupported(types[slot])) {
+						FillVector(extractor.ColumnValues(col), types[slot], chunk.data[slot], 0);
+					} else {
+						Vector source(parsed.columns[col].type, count);
+						FillVector(extractor.ColumnValues(col), parsed.columns[col].type, source, 0);
+						VectorOperations::DefaultCast(source, chunk.data[slot], count);
+					}
 				}
 			}
 			for (idx_t slot = 0; slot < types.size(); slot++) {
@@ -1158,7 +1254,7 @@ private:
 			for (auto &statement : statements) {
 				RunQuery(conn, statement);
 			}
-			if (!parsed.payload.rows.empty()) {
+			if (parsed.payload.HasRows()) {
 				string insert = "INSERT INTO " + qualified + " (";
 				string select_list;
 				for (idx_t i = 0; i < columns.size(); i++) {
@@ -1211,6 +1307,28 @@ private:
 	unique_ptr<Connection> fallback_conn;
 	bool fallback_exists = false;
 	case_insensitive_map_t<LogicalType> fallback_types;
+	std::atomic<bool> *schema_plan_flag = nullptr;
+
+	void NotifySchemaPlanReady() {
+		if (schema_plan_flag) {
+			schema_plan_flag->store(true, std::memory_order_release);
+		}
+	}
+
+	void CacheAbsorbedShape(void *storage_token, uint64_t shape, RawParsedPayload &parsed) {
+		auto cache_key = qname.catalog + "." + qname.schema + "." + qname.name;
+		auto &cache = *ObjectCache::GetObjectCache(context).GetOrCreate<RawSchemaCache>(RawSchemaCache::ObjectType());
+		lock_guard<mutex> guard(cache.lock);
+		auto &entry = cache.tables[cache_key];
+		if (entry.storage_token != storage_token) {
+			entry.storage_token = storage_token;
+			entry.absorbed_shapes.clear();
+			entry.plans.clear();
+		}
+		entry.absorbed_shapes.insert(shape);
+		SaveCachedShapePlan(entry, shape, parsed);
+		NotifySchemaPlanReady();
+	}
 };
 
 // Programmatic entry point (used by the HTTP API): runs a full ingest within
@@ -1434,6 +1552,11 @@ struct RawIngestPipeline {
 	};
 
 	idx_t capacity;
+	std::atomic<bool> schema_plan_ready {false};
+
+	void EnableSchemaPlan() {
+		schema_plan_ready.store(true, std::memory_order_release);
+	}
 
 	mutex lock;
 	std::condition_variable producer_cv;
@@ -1590,7 +1713,10 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 			try {
 				string batch;
 				while (pipeline.PopRaw(batch)) {
-					auto parsed = RawParsedPayload::Process(batch, options);
+					auto parsed = RawParsedPayload::ParsePayload(batch, options);
+					if (!pipeline.schema_plan_ready.load(std::memory_order_acquire)) {
+						parsed->InferColumns();
+					}
 					pipeline.Push(RawIngestPipeline::Item {std::move(parsed), std::move(batch)});
 				}
 			} catch (...) {
@@ -1621,7 +1747,7 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 		auto pending_shape = HashPayloadShape(pending_storage.parsed->columns);
 		auto item_shape = HashPayloadShape(item.parsed->columns);
 		if (pending_shape == item_shape &&
-		    pending_storage.parsed->payload.rows.size() + item.parsed->payload.rows.size() <
+		    pending_storage.parsed->payload.RowCount() + item.parsed->payload.RowCount() <
 		        write_settings.pool_min_rows) {
 			MergeParsedPayloads(*pending_storage.parsed, std::move(*item.parsed));
 			return;
@@ -1674,7 +1800,7 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 			batches_result = batches.load();
 			EmitIngestRow(output, bind_data.target, stream->GetStats());
 		} else {
-			RawIngestor ingestor(context, bind_data.target, bind_data.options);
+			RawIngestor ingestor(context, bind_data.target, bind_data.options, &pipeline.schema_plan_ready);
 			RawIngestPipeline::Item pending_storage;
 			bool has_pending = false;
 			RawIngestPipeline::Item item;

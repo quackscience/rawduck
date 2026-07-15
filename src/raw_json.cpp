@@ -12,6 +12,10 @@ namespace duckdb {
 
 using duckdb_yyjson::yyjson_arr_iter;
 using duckdb_yyjson::yyjson_doc;
+using duckdb_yyjson::yyjson_mut_arr_iter;
+using duckdb_yyjson::yyjson_mut_doc;
+using duckdb_yyjson::yyjson_mut_obj_iter;
+using duckdb_yyjson::yyjson_mut_val;
 using duckdb_yyjson::yyjson_obj_iter;
 using duckdb_yyjson::yyjson_val;
 
@@ -32,6 +36,9 @@ static constexpr auto RAW_READ_FLAGS = duckdb_yyjson::YYJSON_READ_ALLOW_INF_AND_
 RawPayload::~RawPayload() {
 	for (auto doc : docs) {
 		duckdb_yyjson::yyjson_doc_free(doc);
+	}
+	for (auto doc : mut_docs) {
+		duckdb_yyjson::yyjson_mut_doc_free(doc);
 	}
 }
 
@@ -59,6 +66,31 @@ static void CheckRowUniformity(const vector<yyjson_val *> &rows, bool &scalar_ro
 		throw InvalidInputException("RawDuck: payload mixes JSON objects with non-object values");
 	}
 	scalar_rows = !rows.empty() && object_rows == 0;
+}
+
+static void CheckMutRowUniformity(const vector<yyjson_mut_val *> &rows, bool &scalar_rows) {
+	idx_t object_rows = 0;
+	for (auto row : rows) {
+		if (duckdb_yyjson::yyjson_mut_is_obj(row)) {
+			object_rows++;
+		}
+	}
+	if (object_rows > 0 && object_rows != rows.size()) {
+		throw InvalidInputException("RawDuck: payload mixes JSON objects with non-object values");
+	}
+	scalar_rows = !rows.empty() && object_rows == 0;
+}
+
+static void CollectMutRows(yyjson_mut_val *root, vector<yyjson_mut_val *> &rows) {
+	if (duckdb_yyjson::yyjson_mut_is_arr(root)) {
+		yyjson_mut_arr_iter iter;
+		duckdb_yyjson::yyjson_mut_arr_iter_init(root, &iter);
+		while (auto element = duckdb_yyjson::yyjson_mut_arr_iter_next(&iter)) {
+			rows.push_back(element);
+		}
+	} else {
+		rows.push_back(root);
+	}
 }
 
 void RawPayload::Parse(const string &payload, const RawParseOptions &options) {
@@ -103,10 +135,12 @@ void RawPayload::Parse(const string &payload, const RawParseOptions &options) {
 			rows.push_back(duckdb_yyjson::yyjson_doc_get_root(line_doc));
 		}
 	}
-	CheckRowUniformity(rows, scalar_rows);
 	if (!options.explode_path.empty()) {
 		otlp_semantics = options.otlp;
 		Explode(options.explode_path);
+		CheckMutRowUniformity(mut_rows, scalar_rows);
+	} else {
+		CheckRowUniformity(rows, scalar_rows);
 	}
 }
 
@@ -460,25 +494,26 @@ void RawPayload::Explode(const vector<string> &path) {
 		}
 	}
 
-	auto exploded = duckdb_yyjson::yyjson_mut_doc_imut_copy(mut_doc, nullptr);
-	duckdb_yyjson::yyjson_mut_doc_free(mut_doc);
-	if (!exploded) {
-		throw InternalException("RawDuck: failed to materialize exploded payload");
-	}
 	for (auto old_doc : docs) {
 		duckdb_yyjson::yyjson_doc_free(old_doc);
 	}
 	docs.clear();
 	rows.clear();
-	docs.push_back(exploded);
-	CollectRows(duckdb_yyjson::yyjson_doc_get_root(exploded), rows);
-	CheckRowUniformity(rows, scalar_rows);
+	mut_docs.push_back(mut_doc);
+	CollectMutRows(out_rows, mut_rows);
+	CheckMutRowUniformity(mut_rows, scalar_rows);
 }
 
 unique_ptr<RawNode> RawPayload::InferSchema() const {
 	auto root = make_uniq<RawNode>();
-	for (auto row : rows) {
-		MergeValue(*root, row);
+	if (UsesMutRows()) {
+		for (auto row : mut_rows) {
+			MergeValueMut(*root, row);
+		}
+	} else {
+		for (auto row : rows) {
+			MergeValue(*root, row);
+		}
 	}
 	return root;
 }
@@ -497,20 +532,51 @@ void RawPayloadAddDocument(RawParsedPayload &parsed, const char *data, idx_t siz
 }
 
 void RawPayloadFinalize(RawParsedPayload &parsed, const RawParseOptions &options) {
-	CheckRowUniformity(parsed.payload.rows, parsed.payload.scalar_rows);
 	if (!options.explode_path.empty()) {
 		parsed.payload.otlp_semantics = options.otlp;
 		parsed.payload.Explode(options.explode_path);
+		CheckMutRowUniformity(parsed.payload.mut_rows, parsed.payload.scalar_rows);
+	} else {
+		CheckRowUniformity(parsed.payload.rows, parsed.payload.scalar_rows);
 	}
-	parsed.root = parsed.payload.InferSchema();
-	parsed.columns = FlattenSchema(*parsed.root, parsed.payload.scalar_rows);
+	parsed.InferColumns();
+}
+
+unique_ptr<RawNode> CloneRawNode(const RawNode &node) {
+	auto copy = make_uniq<RawNode>();
+	copy->node_class = node.node_class;
+	copy->scalar = node.scalar;
+	if (node.element) {
+		copy->element = CloneRawNode(*node.element);
+	}
+	for (auto &child : node.children) {
+		auto cloned = CloneRawNode(*child.second);
+		copy->child_lookup[child.first] = copy->children.size();
+		copy->children.emplace_back(child.first, std::move(cloned));
+	}
+	return copy;
+}
+
+void RawParsedPayload::InferColumns() {
+	root = payload.InferSchema();
+	columns = FlattenSchema(*root, payload.scalar_rows);
+}
+
+void RawParsedPayload::AttachCachedRoot(const RawNode &cached_root) {
+	root = CloneRawNode(cached_root);
+	columns = FlattenSchema(*root, payload.scalar_rows);
+}
+
+shared_ptr<RawParsedPayload> RawParsedPayload::ParsePayload(const string &payload_text,
+                                                            const RawParseOptions &options) {
+	auto result = make_shared_ptr<RawParsedPayload>();
+	result->payload.Parse(payload_text, options);
+	return result;
 }
 
 shared_ptr<RawParsedPayload> RawParsedPayload::Process(const string &payload_text, const RawParseOptions &options) {
-	auto result = make_shared_ptr<RawParsedPayload>();
-	result->payload.Parse(payload_text, options);
-	result->root = result->payload.InferSchema();
-	result->columns = FlattenSchema(*result->root, result->payload.scalar_rows);
+	auto result = ParsePayload(payload_text, options);
+	result->InferColumns();
 	return result;
 }
 
@@ -624,6 +690,93 @@ RawScalarKind SniffScalarKind(yyjson_val *val) {
 	default:
 		return RawScalarKind::VARCHAR;
 	}
+}
+
+static RawScalarKind SniffScalarKindMut(yyjson_mut_val *val) {
+	switch (duckdb_yyjson::yyjson_mut_get_type(val)) {
+	case YYJSON_TYPE_BOOL:
+		return RawScalarKind::BOOLEAN;
+	case YYJSON_TYPE_NUM:
+		if (duckdb_yyjson::yyjson_mut_is_real(val)) {
+			return RawScalarKind::DOUBLE;
+		}
+		if (duckdb_yyjson::yyjson_mut_is_uint(val) &&
+		    duckdb_yyjson::yyjson_mut_get_uint(val) > static_cast<uint64_t>(NumericLimits<int64_t>::Maximum())) {
+			return RawScalarKind::DOUBLE;
+		}
+		return RawScalarKind::BIGINT;
+	case YYJSON_TYPE_STR:
+		return SniffString(duckdb_yyjson::yyjson_mut_get_str(val), duckdb_yyjson::yyjson_mut_get_len(val));
+	default:
+		return RawScalarKind::VARCHAR;
+	}
+}
+
+static void MergeValueMutInternal(RawNode &node, yyjson_mut_val *val, idx_t depth);
+static void DemoteToJSON(RawNode &node);
+
+void MergeValueMut(RawNode &node, yyjson_mut_val *val) {
+	MergeValueMutInternal(node, val, 0);
+}
+
+static void MergeValueMutInternal(RawNode &node, yyjson_mut_val *val, idx_t depth) {
+	if (depth > RAW_MAX_NESTING) {
+		DemoteToJSON(node);
+		return;
+	}
+	if (!val || duckdb_yyjson::yyjson_mut_is_null(val)) {
+		return;
+	}
+	if (node.node_class == RawNodeClass::JSON) {
+		return;
+	}
+	if (duckdb_yyjson::yyjson_mut_is_obj(val)) {
+		if (node.node_class == RawNodeClass::UNSET) {
+			node.node_class = RawNodeClass::OBJECT;
+		}
+		if (node.node_class != RawNodeClass::OBJECT) {
+			DemoteToJSON(node);
+			return;
+		}
+		yyjson_mut_obj_iter iter;
+		duckdb_yyjson::yyjson_mut_obj_iter_init(val, &iter);
+		while (auto key = duckdb_yyjson::yyjson_mut_obj_iter_next(&iter)) {
+			auto child_val = duckdb_yyjson::yyjson_mut_obj_iter_get_val(key);
+			auto key_str = string(duckdb_yyjson::yyjson_mut_get_str(key), duckdb_yyjson::yyjson_mut_get_len(key));
+			MergeValueMutInternal(node.GetOrCreateChild(key_str), child_val, depth + 1);
+		}
+		return;
+	}
+	if (duckdb_yyjson::yyjson_mut_is_arr(val)) {
+		if (node.node_class == RawNodeClass::UNSET) {
+			node.node_class = RawNodeClass::ARRAY;
+			node.element = make_uniq<RawNode>();
+		}
+		if (node.node_class != RawNodeClass::ARRAY) {
+			DemoteToJSON(node);
+			return;
+		}
+		yyjson_mut_arr_iter iter;
+		duckdb_yyjson::yyjson_mut_arr_iter_init(val, &iter);
+		while (auto element = duckdb_yyjson::yyjson_mut_arr_iter_next(&iter)) {
+			MergeValueMutInternal(*node.element, element, depth + 1);
+		}
+		return;
+	}
+	if (node.node_class == RawNodeClass::SCALAR && node.scalar == RawScalarKind::VARCHAR) {
+		return;
+	}
+	auto kind = SniffScalarKindMut(val);
+	if (node.node_class == RawNodeClass::UNSET) {
+		node.node_class = RawNodeClass::SCALAR;
+		node.scalar = kind;
+		return;
+	}
+	if (node.node_class != RawNodeClass::SCALAR) {
+		DemoteToJSON(node);
+		return;
+	}
+	node.scalar = JoinScalarKinds(node.scalar, kind);
 }
 
 static void MergeValueInternal(RawNode &node, yyjson_val *val, idx_t depth);
@@ -820,8 +973,12 @@ bool RawFillSupported(const LogicalType &type) {
 	}
 }
 
-RawExtractor::RawExtractor(const RawNode &root_p, const vector<RawColumn> &columns) : root(root_p) {
+RawExtractor::RawExtractor(const RawNode &root_p, const vector<RawColumn> &columns, bool mut_rows_p)
+    : root(root_p), mut_rows(mut_rows_p) {
 	values.resize(columns.size());
+	if (mut_rows) {
+		mut_values.resize(columns.size());
+	}
 	for (idx_t col = 0; col < columns.size(); col++) {
 		if (columns[col].path.empty()) {
 			// "value" column: the row itself is the value
@@ -834,6 +991,11 @@ RawExtractor::RawExtractor(const RawNode &root_p, const vector<RawColumn> &colum
 void RawExtractor::Reset(idx_t row_count) {
 	for (auto &column_values : values) {
 		column_values.assign(row_count, nullptr);
+	}
+	if (mut_rows) {
+		for (auto &column_values : mut_values) {
+			column_values.assign(row_count, nullptr);
+		}
 	}
 }
 
@@ -866,6 +1028,35 @@ void RawExtractor::AssignRow(yyjson_val *row, idx_t row_idx) {
 		return;
 	}
 	Traverse(row, root, row_idx);
+}
+
+void RawExtractor::TraverseMut(yyjson_mut_val *val, const RawNode &node, idx_t row_idx) {
+	auto leaf = column_of.find(&node);
+	if (leaf != column_of.end()) {
+		mut_values[leaf->second][row_idx] = val;
+		return;
+	}
+	if (node.node_class != RawNodeClass::OBJECT || !duckdb_yyjson::yyjson_mut_is_obj(val)) {
+		return;
+	}
+	yyjson_mut_obj_iter iter;
+	duckdb_yyjson::yyjson_mut_obj_iter_init(val, &iter);
+	while (auto key = duckdb_yyjson::yyjson_mut_obj_iter_next(&iter)) {
+		auto entry =
+		    node.child_lookup.find(string(duckdb_yyjson::yyjson_mut_get_str(key), duckdb_yyjson::yyjson_mut_get_len(key)));
+		if (entry == node.child_lookup.end()) {
+			continue;
+		}
+		TraverseMut(duckdb_yyjson::yyjson_mut_obj_iter_get_val(key), *node.children[entry->second].second, row_idx);
+	}
+}
+
+void RawExtractor::AssignMutRow(yyjson_mut_val *row, idx_t row_idx) {
+	if (root_is_column) {
+		mut_values[column_of.at(&root)][row_idx] = row;
+		return;
+	}
+	TraverseMut(row, root, row_idx);
 }
 
 static string_t WriteJSONString(yyjson_val *val, Vector &result) {
@@ -1002,6 +1193,147 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 		ListVector::Reserve(result, child_offset + child_vals.size());
 		ListVector::SetListSize(result, child_offset + child_vals.size());
 		FillVector(child_vals, ListType::GetChildType(type), ListVector::GetEntry(result), child_offset);
+		break;
+	}
+	default:
+		for (idx_t i = 0; i < vals.size(); i++) {
+			set_null(i);
+		}
+		break;
+	}
+}
+
+static string_t WriteJSONStringMut(yyjson_mut_val *val, Vector &result) {
+	size_t len = 0;
+	auto data = duckdb_yyjson::yyjson_mut_val_write(val, 0, &len);
+	if (!data) {
+		throw InternalException("RawDuck: failed to serialize JSON value");
+	}
+	auto str = StringVector::AddString(result, data, len);
+	free(data);
+	return str;
+}
+
+void FillVectorMut(const vector<yyjson_mut_val *> &vals, const LogicalType &type, Vector &result, idx_t offset) {
+	auto &validity = FlatVector::Validity(result);
+	auto set_null = [&](idx_t i) {
+		validity.SetInvalid(offset + i);
+	};
+	if (IsRawJSONType(type)) {
+		auto data = FlatVector::GetData<string_t>(result);
+		for (idx_t i = 0; i < vals.size(); i++) {
+			auto val = vals[i];
+			if (!val || duckdb_yyjson::yyjson_mut_is_null(val)) {
+				set_null(i);
+				continue;
+			}
+			data[offset + i] = WriteJSONStringMut(val, result);
+		}
+		return;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN: {
+		auto data = FlatVector::GetData<bool>(result);
+		for (idx_t i = 0; i < vals.size(); i++) {
+			auto val = vals[i];
+			if (val && duckdb_yyjson::yyjson_mut_is_bool(val)) {
+				data[offset + i] = duckdb_yyjson::yyjson_mut_get_bool(val);
+			} else {
+				set_null(i);
+			}
+		}
+		break;
+	}
+	case LogicalTypeId::BIGINT: {
+		auto data = FlatVector::GetData<int64_t>(result);
+		for (idx_t i = 0; i < vals.size(); i++) {
+			auto val = vals[i];
+			if (val && duckdb_yyjson::yyjson_mut_is_sint(val)) {
+				data[offset + i] = duckdb_yyjson::yyjson_mut_get_sint(val);
+			} else if (val && duckdb_yyjson::yyjson_mut_is_uint(val)) {
+				data[offset + i] = static_cast<int64_t>(duckdb_yyjson::yyjson_mut_get_uint(val));
+			} else {
+				set_null(i);
+			}
+		}
+		break;
+	}
+	case LogicalTypeId::DOUBLE: {
+		auto data = FlatVector::GetData<double>(result);
+		for (idx_t i = 0; i < vals.size(); i++) {
+			auto val = vals[i];
+			if (val && duckdb_yyjson::yyjson_mut_is_num(val)) {
+				data[offset + i] = duckdb_yyjson::yyjson_mut_get_num(val);
+			} else {
+				set_null(i);
+			}
+		}
+		break;
+	}
+	case LogicalTypeId::DATE: {
+		auto data = FlatVector::GetData<date_t>(result);
+		for (idx_t i = 0; i < vals.size(); i++) {
+			auto val = vals[i];
+			idx_t pos = 0;
+			bool special = false;
+			if (!val || !duckdb_yyjson::yyjson_mut_is_str(val) ||
+			    Date::TryConvertDate(duckdb_yyjson::yyjson_mut_get_str(val), duckdb_yyjson::yyjson_mut_get_len(val),
+			                         pos, data[offset + i], special, true) != DateCastResult::SUCCESS) {
+				set_null(i);
+			}
+		}
+		break;
+	}
+	case LogicalTypeId::TIMESTAMP: {
+		auto data = FlatVector::GetData<timestamp_t>(result);
+		for (idx_t i = 0; i < vals.size(); i++) {
+			auto val = vals[i];
+			if (!val || !duckdb_yyjson::yyjson_mut_is_str(val) ||
+			    Timestamp::TryConvertTimestamp(duckdb_yyjson::yyjson_mut_get_str(val),
+			                                   duckdb_yyjson::yyjson_mut_get_len(val), data[offset + i],
+			                                   true) != TimestampCastResult::SUCCESS) {
+				set_null(i);
+			}
+		}
+		break;
+	}
+	case LogicalTypeId::VARCHAR: {
+		auto data = FlatVector::GetData<string_t>(result);
+		for (idx_t i = 0; i < vals.size(); i++) {
+			auto val = vals[i];
+			if (!val || duckdb_yyjson::yyjson_mut_is_null(val)) {
+				set_null(i);
+			} else if (duckdb_yyjson::yyjson_mut_is_str(val)) {
+				data[offset + i] = StringVector::AddString(result, duckdb_yyjson::yyjson_mut_get_str(val),
+				                                           duckdb_yyjson::yyjson_mut_get_len(val));
+			} else {
+				data[offset + i] = WriteJSONStringMut(val, result);
+			}
+		}
+		break;
+	}
+	case LogicalTypeId::LIST: {
+		auto entries = FlatVector::GetData<list_entry_t>(result);
+		auto child_offset = ListVector::GetListSize(result);
+		vector<yyjson_mut_val *> child_vals;
+		for (idx_t i = 0; i < vals.size(); i++) {
+			auto val = vals[i];
+			if (!val || !duckdb_yyjson::yyjson_mut_is_arr(val)) {
+				set_null(i);
+				entries[offset + i] = list_entry_t {child_offset + child_vals.size(), 0};
+				continue;
+			}
+			auto length = duckdb_yyjson::yyjson_mut_arr_size(val);
+			entries[offset + i] = list_entry_t {child_offset + child_vals.size(), length};
+			yyjson_mut_arr_iter iter;
+			duckdb_yyjson::yyjson_mut_arr_iter_init(val, &iter);
+			while (auto element = duckdb_yyjson::yyjson_mut_arr_iter_next(&iter)) {
+				child_vals.push_back(element);
+			}
+		}
+		ListVector::Reserve(result, child_offset + child_vals.size());
+		ListVector::SetListSize(result, child_offset + child_vals.size());
+		FillVectorMut(child_vals, ListType::GetChildType(type), ListVector::GetEntry(result), child_offset);
 		break;
 	}
 	default:

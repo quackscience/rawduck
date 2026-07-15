@@ -17,7 +17,6 @@ struct RawWriteSettings {
 	idx_t pipeline_threads = 0;
 	idx_t pipeline_consumers = 0;
 	idx_t pipeline_depth = DEFAULT_PIPELINE_DEPTH;
-	bool overlap_flush_auto = false;
 
 	static RawWriteSettings Get(ClientContext &context);
 	idx_t PoolThreadCount(idx_t batch_rows) const;

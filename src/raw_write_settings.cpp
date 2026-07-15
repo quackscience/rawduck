@@ -39,9 +39,6 @@ RawWriteSettings RawWriteSettings::Get(ClientContext &context) {
 			settings.pipeline_depth = NumericCast<idx_t>(depth);
 		}
 	}
-	if (context.TryGetCurrentSetting("rawduck_overlap_flush_auto", value) && !value.IsNull()) {
-		settings.overlap_flush_auto = value.GetValue<bool>();
-	}
 	return settings;
 }
 
@@ -77,7 +74,9 @@ bool RawWriteSettings::OverlapFlushForBatch(ClientContext &context, bool shape_a
 	    enabled.GetValue<bool>()) {
 		return true;
 	}
-	return overlap_flush_auto && shape_absorbed && batch_rows >= pool_min_rows;
+	(void)shape_absorbed;
+	(void)batch_rows;
+	return false;
 }
 
 } // namespace duckdb

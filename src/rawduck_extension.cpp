@@ -71,10 +71,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("rawduck_pipeline_depth",
 	                          "Bounded queue depth between reader, parse workers, and ingest consumer(s)",
 	                          LogicalType::BIGINT, Value::BIGINT(RawWriteSettings::DEFAULT_PIPELINE_DEPTH));
-	config.AddExtensionOption("rawduck_overlap_flush_auto",
-	                          "When true, overlap parse/flush on stable re-ingest batches that meet pool_min_rows "
-	                          "(without setting rawduck_overlap_flush globally)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	// ATTACH 'rawduck:store.db' AS raw
 	StorageExtension::Register(config, "rawduck", GetRawDuckStorageExtension());
 }

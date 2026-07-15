@@ -8,3 +8,4 @@ test/python/__pycache__/
 .Rhistory
 benchmark/data
 benchmark/work
+benchmark/results/otel_*.json

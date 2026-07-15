@@ -28,18 +28,8 @@ SELECT rows FROM raw_ingest_file('t_thresh', '__TEST_DIR__/fast_pool.ndjson');
 ----
 1000
 
-# overlap_flush_auto on stable re-ingest (schema already known)
-statement ok
-SET rawduck_overlap_flush_auto = true;
-
-query I
-SELECT rows FROM raw_ingest_file('t_fast', '__TEST_DIR__/fast_pool.ndjson', batch_size := 600);
-----
-1000
-
 # parallel ingest consumers are opt-in (default serial schema evolution)
 statement ok
-SET rawduck_overlap_flush_auto = false;
 SET rawduck_pipeline_consumers = 2;
 
 query II

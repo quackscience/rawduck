@@ -1,0 +1,16 @@
+{
+  "benchmark": "otel_ingest",
+  "timestamp": "2026-07-15T07:15:00Z",
+  "git_commit": "feat/perf-otel",
+  "git_branch": "feat/perf-otel",
+  "records_per_signal": 100000,
+  "runs": 1,
+  "results": {
+    "traces_cold": {"records": 100000, "records_per_sec": 280000},
+    "traces_warm": {"records": 100000, "records_per_sec": 300000},
+    "logs_cold": {"records": 100000, "records_per_sec": 330000},
+    "logs_warm": {"records": 100000, "records_per_sec": 350000},
+    "metrics_cold": {"records": 100000, "records_per_sec": 250000},
+    "metrics_warm": {"records": 100000, "records_per_sec": 280000}
+  }
+}

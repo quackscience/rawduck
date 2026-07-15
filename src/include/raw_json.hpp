@@ -65,6 +65,9 @@ struct RawParseOptions {
 struct RawPayload {
 	vector<duckdb_yyjson::yyjson_doc *> docs;
 	vector<duckdb_yyjson::yyjson_val *> rows;
+	// exploded rows kept in mut form to skip a bulk imut materialization copy
+	vector<duckdb_yyjson::yyjson_mut_doc *> mut_docs;
+	vector<duckdb_yyjson::yyjson_mut_val *> mut_rows;
 	// true when rows are bare scalars/arrays: they map to a single "value" column
 	bool scalar_rows = false;
 	// NDJSON lines skipped because they failed to parse (ignore_errors only)
@@ -76,6 +79,16 @@ struct RawPayload {
 	RawPayload(const RawPayload &) = delete;
 	RawPayload &operator=(const RawPayload &) = delete;
 	~RawPayload();
+
+	idx_t RowCount() const {
+		return mut_rows.empty() ? rows.size() : mut_rows.size();
+	}
+	bool HasRows() const {
+		return RowCount() > 0;
+	}
+	bool UsesMutRows() const {
+		return !mut_rows.empty();
+	}
 
 	// Accepts a JSON array of objects, a single object, or NDJSON; throws
 	// InvalidInputException otherwise.
@@ -93,6 +106,12 @@ struct RawParsedPayload {
 
 	static shared_ptr<RawParsedPayload> Process(const string &payload_text,
 	                                            const RawParseOptions &options = RawParseOptions());
+	// Parse + explode only; schema filled by InferColumns() or AttachCachedRoot().
+	static shared_ptr<RawParsedPayload> ParsePayload(const string &payload_text,
+	                                                 const RawParseOptions &options = RawParseOptions());
+	void InferColumns();
+	// Rebuild columns from a cached schema tree (warm ingest fast path).
+	void AttachCachedRoot(const RawNode &cached_root);
 };
 
 // Incremental payload assembly (zero-copy INSERT sink): parse documents one
@@ -111,9 +130,11 @@ RawParseOptions RawExplodeOptions(const string &path);
 RawScalarKind JoinScalarKinds(RawScalarKind a, RawScalarKind b);
 RawScalarKind SniffScalarKind(duckdb_yyjson::yyjson_val *val);
 void MergeValue(RawNode &node, duckdb_yyjson::yyjson_val *val);
+void MergeValueMut(RawNode &node, duckdb_yyjson::yyjson_mut_val *val);
 
 LogicalType NodeToType(const RawNode &node);
 vector<RawColumn> FlattenSchema(const RawNode &root, bool scalar_rows);
+unique_ptr<RawNode> CloneRawNode(const RawNode &node);
 
 bool IsRawJSONType(const LogicalType &type);
 
@@ -122,28 +143,41 @@ bool IsRawJSONType(const LogicalType &type);
 // and values are routed to their column slot via the schema-tree nodes.
 class RawExtractor {
 public:
-	RawExtractor(const RawNode &root, const vector<RawColumn> &columns);
+	RawExtractor(const RawNode &root, const vector<RawColumn> &columns, bool mut_rows_p = false);
 
 	// Routes one row's values into per-column slots at `row_idx`. Slots for
 	// absent paths keep their nullptr from Reset().
 	void AssignRow(duckdb_yyjson::yyjson_val *row, idx_t row_idx);
+	void AssignMutRow(duckdb_yyjson::yyjson_mut_val *row, idx_t row_idx);
 	void Reset(idx_t row_count);
+
+	bool UsesMutRows() const {
+		return mut_rows;
+	}
 
 	const vector<duckdb_yyjson::yyjson_val *> &ColumnValues(idx_t col) const {
 		return values[col];
 	}
+	const vector<duckdb_yyjson::yyjson_mut_val *> &ColumnMutValues(idx_t col) const {
+		return mut_values[col];
+	}
 
 private:
 	void Traverse(duckdb_yyjson::yyjson_val *val, const RawNode &node, idx_t row_idx);
+	void TraverseMut(duckdb_yyjson::yyjson_mut_val *val, const RawNode &node, idx_t row_idx);
 
 	const RawNode &root;
 	// schema-tree leaf -> column slot
 	unordered_map<const RawNode *, idx_t> column_of;
 	bool root_is_column = false;
+	bool mut_rows = false;
 	vector<vector<duckdb_yyjson::yyjson_val *>> values;
+	vector<vector<duckdb_yyjson::yyjson_mut_val *>> mut_values;
 };
 
 void FillVector(const vector<duckdb_yyjson::yyjson_val *> &vals, const LogicalType &type, Vector &result, idx_t offset);
+void FillVectorMut(const vector<duckdb_yyjson::yyjson_mut_val *> &vals, const LogicalType &type, Vector &result,
+                   idx_t offset);
 // whether FillVector can write this type directly (otherwise extract in the
 // inferred type and cast)
 bool RawFillSupported(const LogicalType &type);

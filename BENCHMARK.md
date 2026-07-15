@@ -5,6 +5,18 @@ runs at native columnar speed, instead of keeping opaque JSON and paying `->>` e
 scan. The primary benchmark is the realistic workload — **OTEL telemetry** (OTLP/JSON logs, metrics,
 traces) — with the GH Archive run kept below as a historical wide-schema stress test.
 
+### Harness
+
+```sh
+GEN=ninja make release
+./scripts/benchmark/run_otel.sh --records 1000000 --runs 3   # full baseline
+./scripts/benchmark/run_otel.sh --quick                      # CI smoke (100k)
+./scripts/benchmark/compare.sh benchmark/results/smoke.json    # vs committed baseline
+```
+
+See `scripts/benchmark/README.md` for details. Results JSON includes cold/warm ingest per
+signal (best of N wall-clock runs, extension load + `raw_ingest_file` + `CHECKPOINT`).
+
 ## OTEL ingestion (primary)
 
 Published results — Apple Silicon, 10 cores, DuckDB v1.5.3, 1,000,000 records per signal, OTLP/JSON

@@ -1,0 +1,25 @@
+# name: test/sql/raw_warm_schema.test
+# description: Warm re-ingest uses cached schema plan (inference skip)
+# group: [sql]
+
+require rawduck
+
+require json
+
+statement ok
+COPY (SELECT range AS n, 'v' || (range % 7) AS v FROM range(2000)) TO '__TEST_DIR__/warm.ndjson' (FORMAT json);
+
+query II
+SELECT rows, columns_added FROM raw_ingest_file('t_warm', '__TEST_DIR__/warm.ndjson', batch_size := 800);
+----
+2000	2
+
+query II
+SELECT rows, columns_added FROM raw_ingest_file('t_warm', '__TEST_DIR__/warm.ndjson', batch_size := 800);
+----
+2000	0
+
+query III
+SELECT count(*), count(DISTINCT n), sum(n) FROM t_warm;
+----
+4000	2000	3998000

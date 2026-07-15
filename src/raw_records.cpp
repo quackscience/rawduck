@@ -11,7 +11,7 @@ struct RawRecordsBindData : public TableFunctionData {
 
 struct RawRecordsState : public GlobalTableFunctionState {
 	explicit RawRecordsState(const RawRecordsBindData &bind_data)
-	    : extractor(*bind_data.parsed->root, bind_data.parsed->columns) {
+	    : extractor(*bind_data.parsed->root, bind_data.parsed->columns, bind_data.parsed->payload.UsesMutRows()) {
 	}
 
 	idx_t next_row = 0;
@@ -71,15 +71,27 @@ static unique_ptr<GlobalTableFunctionState> RawRecordsInit(ClientContext &contex
 static void RawRecordsFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<RawRecordsBindData>();
 	auto &state = data.global_state->Cast<RawRecordsState>();
-	auto &rows = bind_data.parsed->payload.rows;
+	auto &payload = bind_data.parsed->payload;
 	auto &columns = bind_data.parsed->columns;
-	auto count = MinValue<idx_t>(rows.size() - state.next_row, STANDARD_VECTOR_SIZE);
+	auto row_count = payload.RowCount();
+	auto count = MinValue<idx_t>(row_count - state.next_row, STANDARD_VECTOR_SIZE);
 	state.extractor.Reset(count);
-	for (idx_t i = 0; i < count; i++) {
-		state.extractor.AssignRow(rows[state.next_row + i], i);
-	}
-	for (idx_t col = 0; col < columns.size(); col++) {
-		FillVector(state.extractor.ColumnValues(col), columns[col].type, output.data[col], 0);
+	if (payload.UsesMutRows()) {
+		auto &rows = payload.mut_rows;
+		for (idx_t i = 0; i < count; i++) {
+			state.extractor.AssignMutRow(rows[state.next_row + i], i);
+		}
+		for (idx_t col = 0; col < columns.size(); col++) {
+			FillVectorMut(state.extractor.ColumnMutValues(col), columns[col].type, output.data[col], 0);
+		}
+	} else {
+		auto &rows = payload.rows;
+		for (idx_t i = 0; i < count; i++) {
+			state.extractor.AssignRow(rows[state.next_row + i], i);
+		}
+		for (idx_t col = 0; col < columns.size(); col++) {
+			FillVector(state.extractor.ColumnValues(col), columns[col].type, output.data[col], 0);
+		}
 	}
 	state.next_row += count;
 	output.SetCardinality(count);

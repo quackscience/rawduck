@@ -132,6 +132,8 @@ release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; f
 sqllogictests in `test/sql/`: `rawduck.test` (core types/records), `raw_ingest.test` (evolution),
 `raw_advanced.test` (streaming, transforms, pool, optimize, projections), `raw_attach.test`
 (stores, transactions, persistence), `raw_api.test` (server lifecycle), `ducklake.test` (`require ducklake`, skips when absent).
+OTEL ingest performance is gated by `./scripts/benchmark/run_otel.sh` + `./scripts/benchmark/compare.sh`
+(see `scripts/benchmark/README.md` and `BENCHMARK.md`); endpoint behavior remains curl-verified.
 Every feature needs: happy path, evolution interaction, error case, and—for anything that can
 return wrong data—a proof test (e.g. tampering with a projection to prove the rewrite engaged).
 `raw_ingest` output is `(table, created, columns_added, columns_widened, rows, errors)`;

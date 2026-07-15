@@ -98,8 +98,8 @@ def metric_point(ts: int) -> dict:
     }
 
 
-def write_envelopes(path: Path, total: int, per_line: int, record_fn, wrap_fn) -> None:
-    ts = 1_700_000_000_000_000_000
+def write_envelopes(path: Path, total: int, per_line: int, record_fn, wrap_fn, ts_base: int) -> None:
+    ts = ts_base
     written = 0
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -111,49 +111,57 @@ def write_envelopes(path: Path, total: int, per_line: int, record_fn, wrap_fn) -
             written += n
 
 
-def traces_path(out_dir: Path, total: int) -> Path:
-    path = out_dir / f"traces_{total // 1000}k.ndjson"
+def traces_path(out_dir: Path, total: int, ts_base: int = 1_700_000_000_000_000_000, suffix: str = "") -> Path:
+    path = out_dir / f"traces_{total // 1000}k{suffix}.ndjson"
     write_envelopes(
         path,
         total,
         80,
         span,
         lambda svc, spans: {"resourceSpans": [{"resource": res(svc), "scopeSpans": [{"spans": spans}]}]},
+        ts_base,
     )
     return path
 
 
-def logs_path(out_dir: Path, total: int) -> Path:
-    path = out_dir / f"logs_{total // 1000}k.ndjson"
+def logs_path(out_dir: Path, total: int, ts_base: int = 1_700_000_000_000_000_000, suffix: str = "") -> Path:
+    path = out_dir / f"logs_{total // 1000}k{suffix}.ndjson"
     write_envelopes(
         path,
         total,
         100,
         log_record,
         lambda svc, records: {"resourceLogs": [{"resource": res(svc), "scopeLogs": [{"logRecords": records}]}]},
+        ts_base,
     )
     return path
 
 
-def metrics_path(out_dir: Path, total: int) -> Path:
-    path = out_dir / f"metrics_{total // 1000}k.ndjson"
+def metrics_path(out_dir: Path, total: int, ts_base: int = 1_700_000_000_000_000_000, suffix: str = "") -> Path:
+    path = out_dir / f"metrics_{total // 1000}k{suffix}.ndjson"
     write_envelopes(
         path,
         total,
         120,
         metric_point,
         lambda svc, metrics: {"resourceMetrics": [{"resource": res(svc), "scopeMetrics": [{"metrics": metrics}]}]},
+        ts_base,
     )
     return path
 
 
 def main() -> int:
     if len(sys.argv) < 3:
-        print(f"usage: {sys.argv[0]} <traces|logs|metrics|all> <record_count> [output_dir]", file=sys.stderr)
+        print(
+            f"usage: {sys.argv[0]} <traces|logs|metrics|all> <record_count> [output_dir] [ts_base_ns] [suffix]",
+            file=sys.stderr,
+        )
         return 2
     signal = sys.argv[1]
     total = int(sys.argv[2])
     out_dir = Path(sys.argv[3]) if len(sys.argv) > 3 else Path(__file__).resolve().parents[2] / "benchmark" / "data"
+    ts_base = int(sys.argv[4]) if len(sys.argv) > 4 else 1_700_000_000_000_000_000
+    suffix = sys.argv[5] if len(sys.argv) > 5 else ""
 
     makers = {
         "traces": traces_path,
@@ -162,13 +170,13 @@ def main() -> int:
     }
     if signal == "all":
         for name, maker in makers.items():
-            p = maker(out_dir, total)
+            p = maker(out_dir, total, ts_base, suffix)
             print(p)
         return 0
     if signal not in makers:
         print(f"unknown signal: {signal}", file=sys.stderr)
         return 2
-    print(makers[signal](out_dir, total))
+    print(makers[signal](out_dir, total, ts_base, suffix))
     return 0
 
 

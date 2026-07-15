@@ -1,10 +1,12 @@
 #!/usr/bin/env zsh
-# OTEL ingest benchmark: cold (schema discovery) and warm (stable re-ingest) timings.
+# OTEL ingest benchmark: cold (schema discovery) then warm (same DuckDB session).
+#
+# Each run opens one DuckDB process, ingests a cold batch (schema discovery), then
+# appends a warm batch with fresh timestamps and an already-absorbed shape.
 #
 # Examples:
-#   ./scripts/benchmark/run_otel.sh --records 1000000 --runs 3
+#   ./scripts/benchmark/run_otel.sh --records 1000000 --runs 5
 #   ./scripts/benchmark/run_otel.sh --quick          # 100k, 1 run, CI-friendly
-#   ./scripts/benchmark/run_otel.sh --warm-only --records 1000000
 set -euo pipefail
 
 export PATH="/bin:/usr/bin:/usr/local/bin:${HOME}/.pyenv/shims:${PATH}"
@@ -18,7 +20,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=scripts/benchmark/lib.sh
 source "${ROOT}/scripts/benchmark/lib.sh"
 
-typeset RECORDS=1000000 RUNS=3 SIGNAL=all WARM_ONLY=0 COLD_ONLY=0
+typeset RECORDS=1000000 RUNS=5 SIGNAL=all WARM_ONLY=0 COLD_ONLY=0
 typeset OUTPUT=""
 
 usage() {
@@ -26,11 +28,11 @@ usage() {
 usage: $(basename "$0") [options]
 
   --records N       records per signal (default: 1000000)
-  --runs N          repetitions per mode (default: 3; best wall time reported)
+  --runs N          session repetitions (default: 5; best wall time reported)
   --signal NAME     traces|logs|metrics|all (default: all)
   --quick           100k records, 1 run (CI smoke)
-  --warm-only       skip cold ingest (schema already in DB from prior run)
-  --cold-only       skip warm re-ingest
+  --warm-only       report warm timing only (still runs cold first in-session)
+  --cold-only       report cold timing only
   --output PATH     write JSON results (default: benchmark/results/otel_<ts>.json)
   -h, --help        this message
 EOF
@@ -52,13 +54,15 @@ done
 
 bench_require_build
 
-typeset DUCKDB EXT DATA WORK RESULTS
+typeset DUCKDB EXT DATA WORK RESULTS SESSION
 DUCKDB="$(bench_duckdb)"
 EXT="$(bench_extension)"
 DATA="$(bench_data_dir)"
 WORK="$(bench_work_dir)/otel_$$"
 RESULTS="$(bench_results_dir)"
+SESSION="${ROOT}/scripts/benchmark/run_otel_session.py"
 /bin/mkdir -p "${DATA}" "${WORK}" "${RESULTS}"
+/bin/chmod +x "${SESSION}" 2>/dev/null || true
 
 typeset -a SIGNALS
 if [[ "${SIGNAL}" == "all" ]]; then
@@ -76,62 +80,23 @@ transform_for() {
 	esac
 }
 
+# Nanosecond timestamp base for warm batches (~1 day after cold base).
+WARM_TS_BASE=1700086400000000000
+
 ensure_data() {
 	local sig=$1
-	local path="${DATA}/${sig}_$((RECORDS / 1000))k.ndjson"
+	local kind=$2
+	local path="${DATA}/${sig}_$((RECORDS / 1000))k${kind}.ndjson"
 	if [[ ! -f "${path}" ]]; then
 		echo "Generating ${path} (${RECORDS} records)..." >&2
-		"${PYTHON}" "${ROOT}/scripts/benchmark/gen_otlp.py" "${sig}" "${RECORDS}" "${DATA}" >/dev/null
+		if [[ "${kind}" == "_warm" ]]; then
+			"${PYTHON}" "${ROOT}/scripts/benchmark/gen_otlp.py" "${sig}" "${RECORDS}" "${DATA}" \
+				"${WARM_TS_BASE}" "_warm" >/dev/null
+		else
+			"${PYTHON}" "${ROOT}/scripts/benchmark/gen_otlp.py" "${sig}" "${RECORDS}" "${DATA}" >/dev/null
+		fi
 	fi
 	echo "${path}"
-}
-
-run_ingest() {
-	local db=$1 table=$2 file=$3 transform=$4
-	"${PYTHON}" - "${DUCKDB}" "${EXT}" "${db}" "${table}" "${file}" "${transform}" <<'PY'
-import subprocess
-import sys
-import time
-
-duckdb, ext, db, table, path, transform = sys.argv[1:7]
-sql = f"""
-LOAD '{ext}';
-SELECT rows, columns_added, columns_widened, errors
-FROM raw_ingest_file('{table}', '{path}', transform := '{transform}');
-CHECKPOINT;
-"""
-start = time.perf_counter()
-proc = subprocess.run([duckdb, db, "-unsigned", "-batch", "-csv", "-noheader"], input=sql.encode(), capture_output=True)
-elapsed = time.perf_counter() - start
-if proc.returncode != 0:
-    sys.stderr.write(proc.stderr.decode())
-    sys.stderr.write(proc.stdout.decode())
-    raise SystemExit(proc.returncode)
-lines = [ln.strip() for ln in proc.stdout.decode().splitlines() if ln.strip()]
-parts = lines[-1].split(",") if lines else ["0", "0", "0", "0"]
-rows = int(parts[0]) if parts else 0
-print(f"{elapsed:.6f},{rows},{parts[1] if len(parts) > 1 else 0},{parts[2] if len(parts) > 2 else 0},{parts[3] if len(parts) > 3 else 0}")
-PY
-}
-
-prepare_warm_table() {
-	local db=$1 table=$2
-	"${PYTHON}" - "${DUCKDB}" "${EXT}" "${db}" "${table}" <<'PY'
-import subprocess
-import sys
-
-duckdb, ext, db, table = sys.argv[1:5]
-sql = f"""
-LOAD '{ext}';
-DELETE FROM {table};
-CHECKPOINT;
-"""
-proc = subprocess.run([duckdb, db, "-unsigned", "-batch"], input=sql.encode(), capture_output=True)
-if proc.returncode != 0:
-    sys.stderr.write(proc.stderr.decode())
-    sys.stderr.write(proc.stdout.decode())
-    raise SystemExit(proc.returncode)
-PY
 }
 
 py_cmp_lt() {
@@ -171,50 +136,50 @@ commit="$(git -C "${ROOT}" rev-parse HEAD)"
 branch="$(git -C "${ROOT}" rev-parse --abbrev-ref HEAD)"
 
 for sig in "${SIGNALS[@]}"; do
-	path="$(ensure_data "${sig}")"
+	cold_path="$(ensure_data "${sig}" "")"
+	warm_path="$(ensure_data "${sig}" "_warm")"
 	transform="$(transform_for "${sig}")"
-	bytes="$(file_bytes "${path}")"
+	bytes="$(file_bytes "${cold_path}")"
 	table="otel_${sig}"
 
-	if (( ! WARM_ONLY )); then
-		typeset cold_best="" cold_rows=0 cold_added=0 cold_widened=0 cold_errors=0
-		for (( r = 1; r <= RUNS; r++ )); do
-			db="${WORK}/${sig}_cold_${r}.db"
-			/bin/rm -f "${db}"
-			line="$(run_ingest "${db}" "${table}" "${path}" "${transform}")"
-			if [[ -z "${cold_best}" ]] || (( $(py_cmp_lt "${line%%,*}" "${cold_best}") )); then
-				cold_best="${line%%,*}"
-				IFS=',' read -r _ cold_rows cold_added cold_widened cold_errors <<<"${line}"
+	typeset cold_best="" warm_best=""
+	typeset cold_rows=0 cold_added=0 cold_widened=0 cold_errors=0
+	typeset warm_rows=0 warm_added=0 warm_widened=0 warm_errors=0
+
+	for (( r = 1; r <= RUNS; r++ )); do
+		db="${WORK}/${sig}_run_${r}.db"
+		/bin/rm -f "${db}"
+		lines="$("${PYTHON}" "${SESSION}" "${DUCKDB}" "${EXT}" "${db}" "${table}" \
+			"${cold_path}" "${warm_path}" "${transform}")"
+		cold_line="${lines%%$'\n'*}"
+		warm_line="${lines#*$'\n'}"
+		if (( ! WARM_ONLY )); then
+			if [[ -z "${cold_best}" ]] || (( $(py_cmp_lt "${cold_line%%,*}" "${cold_best}") )); then
+				cold_best="${cold_line%%,*}"
+				IFS=',' read -r _ cold_rows cold_added cold_widened cold_errors <<<"${cold_line}"
 			fi
-		done
+		fi
+		if (( ! COLD_ONLY )); then
+			if [[ -z "${warm_best}" ]] || (( $(py_cmp_lt "${warm_line%%,*}" "${warm_best}") )); then
+				warm_best="${warm_line%%,*}"
+				IFS=',' read -r _ warm_rows warm_added warm_widened warm_errors <<<"${warm_line}"
+			fi
+		fi
+	done
+
+	if (( ! WARM_ONLY )); then
 		rec_s=$(py_rec_s "${cold_rows}" "${cold_best}")
 		mb_s=$(py_mb_s "${bytes}" "${cold_best}")
-		echo "COLD ${sig}: ${cold_rows} rows in ${cold_best}s -> ${rec_s} rec/s, ${mb_s} MB/s (best of ${RUNS})" >&2
+		echo "COLD ${sig}: ${cold_rows} rows in ${cold_best}s -> ${rec_s} rec/s, ${mb_s} MB/s (best of ${RUNS} sessions)" >&2
 		JSON_PARTS+=("\"${sig}_cold\": {\"records\": ${cold_rows}, \"seconds\": ${cold_best}, \"records_per_sec\": ${rec_s}, \"mb_per_sec\": ${mb_s}, \"bytes\": ${bytes}, \"columns_added\": ${cold_added}, \"columns_widened\": ${cold_widened}, \"errors\": ${cold_errors}}")
 	fi
 
 	if (( ! COLD_ONLY )); then
-		warm_db="${WORK}/${sig}_warm.db"
-		if (( ! WARM_ONLY )); then
-			/bin/cp "${WORK}/${sig}_cold_1.db" "${warm_db}" 2>/dev/null || true
-		fi
-		if [[ ! -f "${warm_db}" ]]; then
-			/bin/rm -f "${warm_db}"
-			run_ingest "${warm_db}" "${table}" "${path}" "${transform}" >/dev/null
-		fi
-		typeset warm_best="" warm_rows=0
-		for (( r = 1; r <= RUNS; r++ )); do
-			prepare_warm_table "${warm_db}" "${table}"
-			line="$(run_ingest "${warm_db}" "${table}" "${path}" "${transform}")"
-			if [[ -z "${warm_best}" ]] || (( $(py_cmp_lt "${line%%,*}" "${warm_best}") )); then
-				warm_best="${line%%,*}"
-				IFS=',' read -r _ warm_rows _ _ _ <<<"${line}"
-			fi
-		done
+		warm_bytes="$(file_bytes "${warm_path}")"
 		warm_rec_s=$(py_rec_s "${warm_rows}" "${warm_best}")
-		warm_mb_s=$(py_mb_s "${bytes}" "${warm_best}")
-		echo "WARM ${sig}: ${warm_rows} rows in ${warm_best}s -> ${warm_rec_s} rec/s, ${warm_mb_s} MB/s (best of ${RUNS})" >&2
-		JSON_PARTS+=("\"${sig}_warm\": {\"records\": ${warm_rows}, \"seconds\": ${warm_best}, \"records_per_sec\": ${warm_rec_s}, \"mb_per_sec\": ${warm_mb_s}, \"bytes\": ${bytes}}")
+		warm_mb_s=$(py_mb_s "${warm_bytes}" "${warm_best}")
+		echo "WARM ${sig}: ${warm_rows} rows in ${warm_best}s -> ${warm_rec_s} rec/s, ${warm_mb_s} MB/s (best of ${RUNS} sessions, same process)" >&2
+		JSON_PARTS+=("\"${sig}_warm\": {\"records\": ${warm_rows}, \"seconds\": ${warm_best}, \"records_per_sec\": ${warm_rec_s}, \"mb_per_sec\": ${warm_mb_s}, \"bytes\": ${warm_bytes}, \"columns_added\": ${warm_added}, \"columns_widened\": ${warm_widened}, \"errors\": ${warm_errors}}")
 	fi
 done
 
@@ -235,6 +200,7 @@ fi
 	echo "  \"git_branch\": \"${branch}\","
 	echo "  \"records_per_signal\": ${RECORDS},"
 	echo "  \"runs\": ${RUNS},"
+	echo "  \"session\": \"single_process_cold_then_warm\","
 	echo "  \"results\": {"
 	printf "    %s\n" "$(IFS=$',\n'; echo "${JSON_PARTS[*]}")" | /usr/bin/sed '$!s/$/,/'
 	echo "  }"

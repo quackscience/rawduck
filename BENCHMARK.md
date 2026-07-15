@@ -14,9 +14,10 @@ GEN=ninja make release
 ./scripts/benchmark/compare.sh benchmark/results/smoke.json    # vs committed baseline
 ```
 
-See `scripts/benchmark/README.md` for details. Results JSON includes **cold** (fresh DB, schema
-discovery) and **warm** (re-ingest into an evolved empty table — rows deleted, DDL kept) per signal,
-best of N wall-clock runs (extension load + `raw_ingest_file` + `CHECKPOINT`).
+See `scripts/benchmark/README.md` for details. Each **session** is one DuckDB process: **cold**
+(first export, schema discovery) then **warm** (second export with fresh timestamps, same shape,
+`columns_added = 0`). `ObjectCache` schema plans stay hot across both ingests. Timings use
+`epoch_ms` markers around each `raw_ingest_file` + `CHECKPOINT` window.
 
 **Regression gate:** `./scripts/benchmark/compare.sh` fails if any metric drops below 98% of
 `benchmark/results/baseline-otel.json`. We only merge perf work that improves or matches every
@@ -37,28 +38,26 @@ cold/warm signal — features that regress a default path are removed, not shipp
 
 Published results — Apple Silicon, 10 cores, DuckDB v1.5.3, 1,000,000 records per signal, OTLP/JSON
 export envelopes (the exact bytes an OpenTelemetry Collector posts to an OTLP/HTTP json endpoint),
-default settings (no tuning), **best of 5 runs** via `./scripts/benchmark/run_otel.sh`
-(`benchmark/results/otel_1m_confirm.json`, commit `bc12481`):
+default settings (no tuning), **best of 5 sessions** via `./scripts/benchmark/run_otel.sh`
+(single DuckDB process per session; warm batch uses shifted timestamps, `columns_added = 0`):
 
-**Cold ingest** (fresh DB, schema discovery):
+**Cold ingest** (first batch in session — schema discovery):
 
 | signal | records | columns | source NDJSON | ingest | records/s | throughput | on disk |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| traces  | 1,000,000 | 23 | 704 MB | 0.87 s | 1.16M | 503 MB/s | 72 MB |
-| logs    | 1,000,000 | 20 | 598 MB | 0.64 s | 1.55M | 456 MB/s | 61 MB |
-| metrics | 1,000,000 | 13 | 495 MB | 0.79 s | 1.26M | 444 MB/s | 56 MB |
+| traces  | 1,000,000 | 23 | 704 MB | 1.04 s | 960k | 417 MB/s | 72 MB |
+| logs    | 1,000,000 | 20 | 598 MB | 0.77 s | 1.30M | 382 MB/s | 61 MB |
+| metrics | 1,000,000 | 13 | 495 MB | 0.79 s | 1.26M | 445 MB/s | 56 MB |
 
-**Warm re-ingest** (evolved schema, empty table — steady-state collector rate):
+**Warm ingest** (second batch, same session — absorbed shape, fresh timestamps):
 
-| signal | ingest | records/s | throughput |
-|---|---:|---:|---:|
-| traces  | 0.83 s | 1.20M | 522 MB/s |
-| logs    | 0.82 s | 1.22M | 359 MB/s |
-| metrics | 0.79 s | 1.26M | 444 MB/s |
+| signal | ingest | records/s | throughput | columns_added |
+|---|---:|---:|---:|---:|
+| traces  | 0.81 s | 1.24M | 538 MB/s | 0 |
+| logs    | 0.83 s | 1.21M | 354 MB/s | 0 |
+| metrics | 0.85 s | 1.18M | 417 MB/s | 0 |
 
-3M telemetry records shredded into typed columns in **~2.3 s cold (~1.3M records/s aggregate)**.
-Traces and metrics warm re-ingest match or beat cold; logs warm is within run-to-run variance on
-this machine. The OTLP transform explodes the nested
+3M telemetry records shredded into typed columns in **~2.6 s cold** per session. The OTLP transform explodes the nested
 `resource → scope → record` envelopes, flattens KeyValue attributes (`http.status_code`,
 `service.name`, …) into typed columns, and normalizes byte ids to hex — all in the parallel parse
 stage. Because each NDJSON line is a fat export envelope that explodes into many records, the

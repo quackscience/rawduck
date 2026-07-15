@@ -84,17 +84,17 @@ want to project or filter their result columns.
 ## Benchmark: OTEL at line speed
 
 Real OTLP/JSON export envelopes — logs, metrics, traces — shredded into typed columns on
-ingest. Apple Silicon, DuckDB v1.5.3, 1M records per signal, default settings, best of 5 runs
-(`./scripts/benchmark/run_otel.sh --records 1000000`):
+ingest. Apple Silicon, DuckDB v1.5.3, 1M records per signal, default settings, best of 5 sessions
+(single DuckDB process: cold batch then warm batch with fresh timestamps):
 
 | signal | records | columns | source NDJSON | ingest (cold) | records/s | throughput | on disk |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| traces  | 1,000,000 | 23 | 704 MB | 0.87 s | 1.16M | 503 MB/s | 72 MB |
-| logs    | 1,000,000 | 20 | 598 MB | 0.64 s | 1.55M | 456 MB/s | 61 MB |
-| metrics | 1,000,000 | 13 | 495 MB | 0.79 s | 1.26M | 444 MB/s | 56 MB |
+| traces  | 1,000,000 | 23 | 704 MB | 1.04 s | 960k | 417 MB/s | 72 MB |
+| logs    | 1,000,000 | 20 | 598 MB | 0.77 s | 1.30M | 382 MB/s | 61 MB |
+| metrics | 1,000,000 | 13 | 495 MB | 0.79 s | 1.26M | 445 MB/s | 56 MB |
 
-Warm re-ingest runs **1.20–1.26M records/s** on traces/metrics (logs ~1.22M).
-**3M telemetry records in ~2.3 s cold.** Queries on shredded spans run **15–38× faster** than a JSON
+Warm ingest (same session, `columns_added = 0`) runs **1.18–1.24M records/s**.
+**3M telemetry records in ~2.6 s cold per session.** Queries on shredded spans run **15–38× faster** than a JSON
 column with identical results; storage is **3.5× smaller**. One call handles envelope explode,
 KeyValue attribute flattening, and byte-id normalization — no schema upfront:
 

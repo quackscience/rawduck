@@ -43,6 +43,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BIGINT, Value::BIGINT(1024 * 1024));
 	config.AddExtensionOption("rawduck_async_busy_timeout_ms", "Async insert buffer flush age threshold",
 	                          LogicalType::BIGINT, Value::BIGINT(200));
+	config.AddExtensionOption("rawduck_async_flush_threads",
+	                          "Async flush worker count: due tables flush concurrently, one worker per table at a "
+	                          "time (0 = auto from hardware concurrency)",
+	                          LogicalType::BIGINT, Value::BIGINT(0));
 	config.AddExtensionOption("rawduck_use_projections",
 	                          "Rewrite eligible count(*) aggregations onto fresh materialized projections "
 	                          "(append-only workloads)",

@@ -8,3 +8,9 @@ test/python/__pycache__/
 **/__pycache__/
 .Rhistory
 .cache/
+benchmark/data
+benchmark/work
+# Local/ephemeral benchmark outputs; keep the committed CI baseline only.
+benchmark/results/*
+!benchmark/results/baseline-otel.json
+!benchmark/results/.gitkeep

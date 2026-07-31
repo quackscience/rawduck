@@ -1,0 +1,33 @@
+{
+  "benchmark": "otel_ingest",
+  "notes": "Conservative 100k floor for main; refresh after verified ingest wins. Gate is 98% of these values.",
+  "records_per_signal": 100000,
+  "runs": 3,
+  "session": "single_process_cold_then_warm",
+  "results": {
+    "traces_cold": {
+      "records": 100000,
+      "records_per_sec": 325000
+    },
+    "traces_warm": {
+      "records": 100000,
+      "records_per_sec": 325000
+    },
+    "logs_cold": {
+      "records": 100000,
+      "records_per_sec": 570000
+    },
+    "logs_warm": {
+      "records": 100000,
+      "records_per_sec": 355000
+    },
+    "metrics_cold": {
+      "records": 100000,
+      "records_per_sec": 285000
+    },
+    "metrics_warm": {
+      "records": 100000,
+      "records_per_sec": 285000
+    }
+  }
+}

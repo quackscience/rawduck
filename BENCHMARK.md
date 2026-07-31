@@ -7,7 +7,7 @@ traces) — with the GH Archive run kept below as a historical wide-schema stres
 
 ## OTEL ingestion (primary)
 
-Published results — Apple Silicon, 10 cores, DuckDB v1.5.3, 1,000,000 records per signal, OTLP/JSON
+Published results — Apple Silicon, 10 cores, DuckDB v1.5.5, 1,000,000 records per signal, OTLP/JSON
 export envelopes (the exact bytes an OpenTelemetry Collector posts to an OTLP/HTTP json endpoint),
 default settings (no tuning):
 
@@ -101,7 +101,7 @@ One hour of real [GH Archive](https://www.gharchive.org/) data — 247,199 event
 exploding to a **914-column** schema. This is the worst case for shredding (extreme, sparse schema
 churn), kept as a stress test rather than the representative workload.
 
-Published results (Apple Silicon, 10 cores, DuckDB v1.5.3):
+Published results (Apple Silicon, 10 cores, DuckDB v1.5.5):
 
 | | JSON column | RawDuck | |
 |---|---:|---:|---|
@@ -176,7 +176,7 @@ SET rawduck_use_projections = true; -- transparent rewrite of eligible count(*) 
 - The shell reports query times with `.timer on`; dot-commands don't work via `duckdb -c`, use
   `-f script.sql`.
 - A shallow duckdb submodule clone without tags makes the shell report `v0.0.1`; fetch the release
-  tag (`git -C duckdb fetch --depth 1 origin tag v1.5.3`) or extension installs 404.
+  tag (`git -C duckdb fetch --depth 1 origin tag v1.5.5`) or extension installs 404.
 - For large imports where each line is a fat container (OTLP envelopes, CloudWatch log groups), the
   loader auto-parallelizes via byte-aware batching; you only need `batch_size` to *raise* the line
   cap for very small flat records.

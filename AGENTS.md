@@ -11,7 +11,7 @@ real typed columns at ingest (one-time cost) so every query runs at native colum
 instead of storing opaque JSON strings and paying `->>` extraction on every scan (45–265× slower,
 see BENCHMARK.md).
 
-Pinned to DuckDB **v1.5.3**: the `duckdb/` submodule commit and the versions in
+Pinned to DuckDB **v1.5.5**: the `duckdb/` submodule commit and the versions in
 `.github/workflows/MainDistributionPipeline.yml` must stay in sync. Build with `GEN=ninja make
 release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; format with
 `make format-fix` (CI enforces it).

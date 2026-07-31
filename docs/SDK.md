@@ -2,7 +2,7 @@
 
 Use [`@rawtree/sdk`](https://www.npmjs.com/package/@rawtree/sdk) against RawDuck's HTTP API (`raw_serve`). Point the client at your local server with `baseUrl` — insert, query, and table metadata responses match the public API shape.
 
-**Requirements:** DuckDB 1.5.3 or higher with the RawDuck extension loaded, Node.js with `fetch` (≥ 18).
+**Requirements:** DuckDB 1.5.5 or higher with the RawDuck extension loaded, Node.js with `fetch` (≥ 18).
 
 ## Setup
 

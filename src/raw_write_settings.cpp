@@ -50,7 +50,7 @@ idx_t RawWriteSettings::PoolThreadCount(idx_t batch_rows) const {
 		return MinValue<idx_t>(pool_threads, MAX_POOL_THREADS);
 	}
 	if (batch_rows >= pool_min_rows) {
-		return MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() / 2, AUTO_POOL_THREAD_CAP));
+		return MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() / 2, MAX_POOL_THREADS));
 	}
 	return 1;
 }
@@ -59,7 +59,7 @@ idx_t RawWriteSettings::PipelineThreadCount() const {
 	if (pipeline_threads > 0) {
 		return MinValue<idx_t>(pipeline_threads, MAX_PIPELINE_THREADS);
 	}
-	return MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() * 2 / 3, AUTO_PIPELINE_THREAD_CAP));
+	return MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() * 2 / 3, MAX_PIPELINE_THREADS));
 }
 
 idx_t RawWriteSettings::PipelineConsumerCount() const {

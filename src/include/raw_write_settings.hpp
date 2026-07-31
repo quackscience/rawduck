@@ -9,8 +9,6 @@ struct RawWriteSettings {
 	static constexpr idx_t DEFAULT_PIPELINE_DEPTH = 4;
 	static constexpr idx_t MAX_POOL_THREADS = 16;
 	static constexpr idx_t MAX_PIPELINE_THREADS = 16;
-	static constexpr idx_t AUTO_POOL_THREAD_CAP = 4;
-	static constexpr idx_t AUTO_PIPELINE_THREAD_CAP = 8;
 
 	idx_t pool_min_rows = DEFAULT_POOL_MIN_ROWS;
 	idx_t pool_threads = 0;

@@ -5,6 +5,13 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 
+// httplib's default kernel accept-queue depth (5) is sized for interactive
+// use, not a fleet of OTel Collectors reconnecting concurrently (e.g. after a
+// network blip); widen it before the header defines the constant. Pure
+// socket-level tuning -- no ingestion path touched.
+#ifndef CPPHTTPLIB_LISTEN_BACKLOG
+#define CPPHTTPLIB_LISTEN_BACKLOG 512
+#endif
 #include "httplib.hpp"
 
 #include <thread>
@@ -622,6 +629,11 @@ static void RawServeFunction(ClientContext &context, TableFunctionInput &data, D
 	api.token = bind_data.token;
 	api.async = bind_data.async;
 	api.server = make_uniq<duckdb_httplib::Server>();
+	// httplib defaults TCP_NODELAY off; Nagle + delayed-ACK on small
+	// request/response pairs (every ingest POST, every OTLP envelope) adds
+	// tens of milliseconds of pure socket latency per call under concurrent
+	// keep-alive clients -- pure transport tuning, no ingestion path touched.
+	api.server->set_tcp_nodelay(true);
 	RegisterRoutes(*api.server);
 	if (!api.server->bind_to_port(bind_data.host.c_str(), bind_data.port)) {
 		api.server.reset();

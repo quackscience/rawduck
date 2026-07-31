@@ -118,7 +118,8 @@ private:
 		for (auto &entry : due) {
 			entries.emplace_back(&entry.first, &entry.second);
 		}
-		auto configured = flush_threads > 0 ? flush_threads : MaxValue<idx_t>(1, std::thread::hardware_concurrency() / 2);
+		auto configured =
+		    flush_threads > 0 ? flush_threads : MaxValue<idx_t>(1, std::thread::hardware_concurrency() / 2);
 		auto worker_count = MinValue<idx_t>(entries.size(), MinValue<idx_t>(configured, MAX_ASYNC_FLUSH_THREADS));
 		std::atomic<idx_t> next {0};
 		std::atomic<idx_t> total_rows {0};

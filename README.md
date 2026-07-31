@@ -11,7 +11,7 @@ flattens nested objects into real columns, transforms and evolves the schema as 
 ### ⚡ Benefits
 No `CREATE TABLE`, no schema declarations, no `json_extract` at query time. Because data lands
 shredded into native typed columns instead of opaque JSON strings, analytical queries run
-**15–38× faster** on telemetry queries, **3.5× smaller** on disk — see benchmark.
+**27–63× faster** on telemetry queries, **6× smaller** on disk — see benchmark.
 
 ### ⚙️ Under the hood
 RawDuck delivers a complete engine rather than a parser: ingestion is transactional, pipelined, and
@@ -84,22 +84,22 @@ want to project or filter their result columns.
 ## Benchmark: OTEL at line speed
 
 Real OTLP/JSON export envelopes — logs, metrics, traces — shredded into typed columns on
-ingest. Apple Silicon, DuckDB v1.5.5, 1M records per signal:
+ingest. DuckDB v1.5.5, 1M records per signal:
 | signal | records | columns | source NDJSON | ingest | records/s | throughput | on disk |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| traces  | 1,000,000 | 23 | 704 MB | 1.65 s | 604k | 426 MB/s | 72 MB |
-| logs    | 1,000,000 | 20 | 598 MB | 1.71 s | 586k | 350 MB/s | 61 MB |
-| metrics | 1,000,000 | 13 | 495 MB | 1.30 s | 771k | 381 MB/s | 56 MB |
+| traces  | 1,000,000 | 15 | 435 MB | 0.74 s | 1.35M | 586 MB/s | 50 MB |
+| logs    | 1,000,000 | 11 | 294 MB | 0.80 s | 1.26M | 369 MB/s | 9 MB |
+| metrics | 1,000,000 | 9  | 353 MB | 1.03 s | 970k | 342 MB/s | 88 MB |
 
-**3M telemetry records in 4.7 s.** Queries on shredded spans run **15–38× faster** than a JSON
-column with identical results; storage is **3.5× smaller**. One call handles envelope explode,
-KeyValue attribute flattening, and byte-id normalization — no schema upfront:
+**3M telemetry records in 2.6 s (~1.2M records/s).** Queries on shredded spans run **27–63× faster**
+than a JSON column with identical results; storage is **6× smaller**. One call handles envelope
+explode, KeyValue attribute flattening, and byte-id normalization — no schema upfront:
 
 ```sql
 CALL raw_ingest_file('traces', 'export.ndjson', transform := 'otlp-traces');
 
 SELECT "resource.service.name", count(*) FROM traces
-WHERE "http.status_code" >= 500 GROUP BY 1;   -- 3 ms
+WHERE "http.status_code" >= 500 GROUP BY 1;   -- 2 ms
 ```
 
 As a wide-schema stress test, one hour of [GH Archive](https://www.gharchive.org/) data (914

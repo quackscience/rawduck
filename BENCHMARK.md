@@ -5,19 +5,31 @@ runs at native columnar speed, instead of keeping opaque JSON and paying `->>` e
 scan. The primary benchmark is the realistic workload — **OTEL telemetry** (OTLP/JSON logs, metrics,
 traces) — with the GH Archive run kept below as a historical wide-schema stress test.
 
+### Harness
+
+```sh
+GEN=ninja make release
+./scripts/benchmark/run_otel.sh --quick                      # CI / remote smoke (100k)
+./scripts/benchmark/compare.sh benchmark/results/smoke.json  # vs committed baseline
+./scripts/benchmark/run_otel.sh --records 1000000 --runs 5   # full publishable numbers
+```
+
+Each session is **one DuckDB process**: cold ingest (schema discovery) then warm ingest (same
+process, fresh timestamps, `columns_added = 0`). See `scripts/benchmark/README.md`.
+
 ## OTEL ingestion (primary)
 
-Published results — Apple Silicon, 10 cores, DuckDB v1.5.5, 1,000,000 records per signal, OTLP/JSON
-export envelopes (the exact bytes an OpenTelemetry Collector posts to an OTLP/HTTP json endpoint),
-default settings (no tuning):
+Published results — multi-core commodity hardware, DuckDB v1.5.5, 1,000,000 records per signal,
+OTLP/JSON export envelopes (the exact bytes an OpenTelemetry Collector posts to an OTLP/HTTP json
+endpoint), default settings (no manual tuning):
 
 | signal | records | columns | source NDJSON | ingest | records/s | throughput | on disk |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| traces  | 1,000,000 | 23 | 704 MB | 1.65 s | 604k | 426 MB/s | 72 MB |
-| logs    | 1,000,000 | 20 | 598 MB | 1.71 s | 586k | 350 MB/s | 61 MB |
-| metrics | 1,000,000 | 13 | 495 MB | 1.30 s | 771k | 381 MB/s | 56 MB |
+| traces  | 1,000,000 | 15 | 435 MB | 0.74 s | 1.35M | 586 MB/s | 50 MB |
+| logs    | 1,000,000 | 11 | 294 MB | 0.80 s | 1.26M | 369 MB/s | 9 MB |
+| metrics | 1,000,000 | 9  | 353 MB | 1.03 s | 970k | 342 MB/s | 88 MB |
 
-3M telemetry records shredded into typed columns in **4.66 s (~644k records/s)**. The OTLP transform
+3M telemetry records shredded into typed columns in **2.6 s (~1.2M records/s)**. The OTLP transform
 explodes the nested `resource → scope → record` envelopes, flattens KeyValue attributes
 (`http.status_code`, `service.name`, …) into typed columns, and normalizes byte ids to hex — all in
 the parallel parse stage. Because each NDJSON line is a fat export envelope that explodes into many
@@ -31,10 +43,10 @@ JSON object per span, queried with `->>`):
 
 | query | JSON `->>` | RawDuck | speedup |
 |---|---:|---:|---:|
-| error count by service (`status>=500`) | 115 ms | 3 ms | 38× |
-| p99 latency by route | 283 ms | 9 ms | 31× |
-| status-code distribution | 92 ms | 6 ms | 15× |
-| storage | 250 MB | 72 MB | 3.5× smaller |
+| error count by service (`status>=500`) | 71 ms | 2 ms | 36× |
+| p99 latency by route | 136 ms | 5 ms | 27× |
+| status-code distribution | 63 ms | 1 ms | 63× |
+| storage | 232 MB | 38 MB | 6× smaller |
 
 This baseline is the *favorable* one. Real OTLP keeps attributes as KeyValue **arrays**, so querying
 them without shredding means `UNNEST`-ing the `resource → scope → span` nesting and scanning each

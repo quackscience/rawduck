@@ -2,7 +2,7 @@
 
 Use [`@rawtree/mcp`](https://github.com/rawtreedb/rawtree-mcp) as an MCP client for RawDuck's HTTP API (`raw_serve`). Point it at your local server with `--api-url` — the core ingest/query/table tools work; hosted-only tools (logs, API keys, URL ingest) do not.
 
-**Requirements:** DuckDB 1.5.3 or higher with the RawDuck extension loaded, Node.js ≥ 22.
+**Requirements:** DuckDB 1.5.5 or higher with the RawDuck extension loaded, Node.js ≥ 22.
 
 ## Setup
 

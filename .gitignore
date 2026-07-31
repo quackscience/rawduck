@@ -5,7 +5,11 @@ duckdb_unittest_tempdir/
 .DS_Store
 testext
 test/python/__pycache__/
+**/__pycache__/
 .Rhistory
+.cache/
 benchmark/data
 benchmark/work
-benchmark/results/otel_*.json
+# Local/ephemeral benchmark outputs; keep the committed CI baseline only.
+benchmark/results/*
+!benchmark/results/baseline-otel.json

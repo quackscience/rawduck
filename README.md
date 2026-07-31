@@ -84,7 +84,7 @@ want to project or filter their result columns.
 ## Benchmark: OTEL at line speed
 
 Real OTLP/JSON export envelopes — logs, metrics, traces — shredded into typed columns on
-ingest. Apple Silicon, DuckDB v1.5.3, 1M records per signal, default settings, best of 5 sessions
+ingest. Apple Silicon, DuckDB v1.5.5, 1M records per signal, default settings, best of 5 sessions
 (single DuckDB process: cold batch then warm batch with fresh timestamps):
 
 | signal | records | columns | source NDJSON | ingest (cold) | records/s | throughput | on disk |

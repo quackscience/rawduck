@@ -6,6 +6,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -18,7 +19,18 @@ namespace duckdb {
 // coalesces buffers and ingests them in one transaction per table when the
 // buffer exceeds rawduck_async_max_data_size bytes or its oldest entry
 // exceeds rawduck_async_busy_timeout_ms. raw_flush() drains synchronously.
+//
+// Due buffers fan out across a small worker pool, one table per worker at a
+// time: DIFFERENT tables flush concurrently (independent DataTable objects,
+// no contention), but each table's own flush stays single-threaded. Unlike
+// ClickHouse's MergeTree (many concurrent writers merge into parts later),
+// DuckDB's optimistic appends serialize badly across concurrent transactions
+// on the SAME table (see AGENTS.md), so sharding one hot table's buffer
+// across parallel flush transactions would regress, not help -- this only
+// parallelizes across the table dimension, which is always safe.
 //===--------------------------------------------------------------------===//
+
+static constexpr idx_t MAX_ASYNC_FLUSH_THREADS = 16;
 
 class RawAsyncBuffers : public ObjectCacheEntry {
 public:
@@ -81,18 +93,54 @@ public:
 			std::unique_lock<mutex> guard(lock);
 			taken.swap(buffers);
 		}
-		idx_t targets = 0;
-		idx_t total_rows = 0;
-		for (auto &entry : taken) {
-			total_rows += FlushBuffer(entry.first, entry.second);
-			targets++;
-		}
+		idx_t targets = taken.size();
+		idx_t total_rows = FlushDueParallel(taken);
 		return {targets, total_rows};
 	}
 
 	idx_t busy_timeout_ms = 200;
+	idx_t flush_threads = 0;
 
 private:
+	// dispatch each table's flush to its own worker, up to flush_threads
+	// concurrently; a single due table just runs inline (no thread spin-up
+	// for the common case). Each table's payloads still flush in the
+	// existing single-connection, single-transaction, sequential order.
+	idx_t FlushDueParallel(map<string, Buffer> &due) {
+		if (due.empty()) {
+			return 0;
+		}
+		if (due.size() == 1) {
+			return FlushBuffer(due.begin()->first, due.begin()->second);
+		}
+		vector<pair<const string *, Buffer *>> entries;
+		entries.reserve(due.size());
+		for (auto &entry : due) {
+			entries.emplace_back(&entry.first, &entry.second);
+		}
+		auto configured = flush_threads > 0 ? flush_threads : MaxValue<idx_t>(1, std::thread::hardware_concurrency() / 2);
+		auto worker_count = MinValue<idx_t>(entries.size(), MinValue<idx_t>(configured, MAX_ASYNC_FLUSH_THREADS));
+		std::atomic<idx_t> next {0};
+		std::atomic<idx_t> total_rows {0};
+		vector<std::thread> workers;
+		workers.reserve(worker_count);
+		for (idx_t w = 0; w < worker_count; w++) {
+			workers.emplace_back([this, &entries, &next, &total_rows] {
+				while (true) {
+					auto i = next.fetch_add(1);
+					if (i >= entries.size()) {
+						return;
+					}
+					total_rows += FlushBuffer(*entries[i].first, *entries[i].second);
+				}
+			});
+		}
+		for (auto &worker : workers) {
+			worker.join();
+		}
+		return total_rows.load();
+	}
+
 	idx_t FlushBuffer(const string &target, Buffer &buffer) {
 		auto db_locked = db.lock();
 		if (!db_locked) {
@@ -135,9 +183,7 @@ private:
 			}
 			if (!due.empty()) {
 				guard.unlock();
-				for (auto &entry : due) {
-					FlushBuffer(entry.first, entry.second);
-				}
+				FlushDueParallel(due);
 				guard.lock();
 			}
 		}
@@ -146,9 +192,7 @@ private:
 		// call raw_flush() before closing)
 		auto remaining = std::move(buffers);
 		guard.unlock();
-		for (auto &entry : remaining) {
-			FlushBuffer(entry.first, entry.second);
-		}
+		FlushDueParallel(remaining);
 	}
 
 	mutex lock;
@@ -166,13 +210,7 @@ static RawAsyncBuffers &GetAsyncBuffers(ClientContext &context) {
 	return *ObjectCache::GetObjectCache(context).GetOrCreate<RawAsyncBuffers>(RawAsyncBuffers::ObjectType());
 }
 
-bool RawAsyncEnabled(ClientContext &context) {
-	Value enabled;
-	return context.TryGetCurrentSetting("rawduck_async_insert", enabled) && enabled.GetValue<bool>();
-}
-
-void RawAsyncEnqueue(ClientContext &context, const string &target, string payload, RawParseOptions options) {
-	auto &buffers = GetAsyncBuffers(context);
+static void RawAsyncApplySettings(ClientContext &context, RawAsyncBuffers &buffers) {
 	Value setting;
 	if (context.TryGetCurrentSetting("rawduck_async_max_data_size", setting)) {
 		buffers.due_bytes = NumericCast<idx_t>(setting.GetValue<int64_t>());
@@ -180,6 +218,19 @@ void RawAsyncEnqueue(ClientContext &context, const string &target, string payloa
 	if (context.TryGetCurrentSetting("rawduck_async_busy_timeout_ms", setting)) {
 		buffers.busy_timeout_ms = NumericCast<idx_t>(setting.GetValue<int64_t>());
 	}
+	if (context.TryGetCurrentSetting("rawduck_async_flush_threads", setting)) {
+		buffers.flush_threads = NumericCast<idx_t>(setting.GetValue<int64_t>());
+	}
+}
+
+bool RawAsyncEnabled(ClientContext &context) {
+	Value enabled;
+	return context.TryGetCurrentSetting("rawduck_async_insert", enabled) && enabled.GetValue<bool>();
+}
+
+void RawAsyncEnqueue(ClientContext &context, const string &target, string payload, RawParseOptions options) {
+	auto &buffers = GetAsyncBuffers(context);
+	RawAsyncApplySettings(context, buffers);
 	buffers.Start(context.db);
 	buffers.Enqueue(target, std::move(payload), std::move(options), buffers.due_bytes);
 }
@@ -211,6 +262,7 @@ static void RawFlushFunction(ClientContext &context, TableFunctionInput &data, D
 	}
 	state.done = true;
 	auto &buffers = GetAsyncBuffers(context);
+	RawAsyncApplySettings(context, buffers);
 	buffers.Start(context.db);
 	auto flushed = buffers.FlushAll();
 	output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(flushed.first)));

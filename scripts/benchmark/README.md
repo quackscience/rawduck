@@ -92,5 +92,39 @@ python3 scripts/benchmark/gen_otlp.py traces 1000000 benchmark/data 170008640000
 | `run_otel_session.py` | Single-process cold→warm driver (host timing) |
 | `run_otel.sh` | Orchestrator: data gen, N sessions, JSON output (bash) |
 | `compare.sh` | Regression gate vs `baseline-otel.json` (bash) |
+| `run_variant.sh` / `run_variant.py` | VARIANT (DuckDB v1.5) vs RawDuck ingest + query + storage |
 
 Requires: bash, python3, a release build (`build/release/duckdb` + extension).
+
+## VARIANT vs RawDuck (branch `feat/variant-benchmark`)
+
+Compares DuckDB **VARIANT as of v1.5.5** (not the v2.0 shredded-execution preview)
+against RawDuck typed columns on the same OTLP/JSON traces envelopes.
+
+```sh
+# after: git clone --recurse-submodules … && git checkout feat/variant-benchmark
+#        GEN=ninja make release
+./scripts/benchmark/run_variant.sh --quick
+./scripts/benchmark/run_variant.sh --records 1000000 --runs 3 \
+  --output "benchmark/results/variant_1m_$(hostname -s)_$(date -u +%Y%m%dT%H%M%SZ).json"
+```
+
+`--quick` is 100k records / 1 ingest session (sanity). Publishable numbers use
+1M records and best-of-3 ingest sessions.
+
+Send back: the JSON file. It already embeds `git_commit`, `duckdb_version`, and a
+`host` block (CPU, cores, RAM, OS). Envelope ingest rows are **not** span
+records — the JSON labels grain so rec/s is not mixed.
+
+Paths in the result:
+
+| path | what it measures |
+|---|---|
+| `rawduck` | `raw_ingest_file` + typed columns (`otlp-traces`) |
+| `variant_envelope` | one VARIANT per NDJSON line (OTLP export envelope) |
+| `variant_otlp` | SQL unnest → one VARIANT `{resource, span}` per span (KeyValue arrays kept) |
+| `json_otlp` | same exploded shape stored as JSON |
+| `variant_flat` / `json_flat` | query/storage encodings of already-shredded RawDuck rows (not an ingest path) |
+
+Queries: error count by service, p99 latency by route, status-code distribution.
+`*_pos` uses generator-stable attribute indexes; `*_kv` does honest key lookup.

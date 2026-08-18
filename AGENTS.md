@@ -133,6 +133,8 @@ sqllogictests in `test/sql/`: `rawduck.test` (core types/records), `raw_ingest.t
 (stores, transactions, persistence), `raw_api.test` (server lifecycle), `ducklake.test` (`require ducklake`, skips when absent).
 OTEL ingest performance: `./scripts/benchmark/run_otel.sh` + `./scripts/benchmark/compare.sh`
 (see `scripts/benchmark/README.md` and `BENCHMARK.md`).
+VARIANT vs RawDuck (v1.5.5, traces): `./scripts/benchmark/run_variant.sh` on branch
+`feat/variant-benchmark`.
 Every feature needs: happy path, evolution interaction, error case, and—for anything that can
 return wrong data—a proof test (e.g. tampering with a projection to prove the rewrite engaged).
 `raw_ingest` output is `(table, created, columns_added, columns_widened, rows, errors)`;

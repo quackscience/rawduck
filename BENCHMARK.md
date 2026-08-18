@@ -107,6 +107,24 @@ SELECT j->>'resource.service.name', count(*) FROM traces_json
 
 Run each query three times (against a `-readonly` database) and report the best.
 
+## VARIANT vs RawDuck (in progress)
+
+DuckDB v1.5 shipped `VARIANT` (“JSON on steroids”: schema-less, binary, shredded
+in storage). RawDuck still does the OTLP explode + KeyValue flatten into **named
+typed columns**. This comparison uses VARIANT **as it exists in the v1.5.5 pin**,
+not the v2.0 preview (extraction pushdown / shredded execution from storage).
+
+```sh
+git checkout feat/variant-benchmark
+GEN=ninja make release
+./scripts/benchmark/run_variant.sh --quick
+./scripts/benchmark/run_variant.sh --records 1000000 --runs 3
+```
+
+Remote: same commands after `git clone --recurse-submodules` and checkout of this
+branch. Send back `benchmark/results/variant_*.json` (host + git + DuckDB version
+are inside the file). Methodology: `scripts/benchmark/README.md`.
+
 ## Appendix: GH Archive (historical, wide-schema stress test)
 
 One hour of real [GH Archive](https://www.gharchive.org/) data — 247,199 events / 956 MB NDJSON

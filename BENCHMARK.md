@@ -107,23 +107,65 @@ SELECT j->>'resource.service.name', count(*) FROM traces_json
 
 Run each query three times (against a `-readonly` database) and report the best.
 
-## VARIANT vs RawDuck (in progress)
+## VARIANT vs RawDuck (DuckDB v1.5.5)
 
 DuckDB v1.5 shipped `VARIANT` (“JSON on steroids”: schema-less, binary, shredded
 in storage). RawDuck still does the OTLP explode + KeyValue flatten into **named
 typed columns**. This comparison uses VARIANT **as it exists in the v1.5.5 pin**,
 not the v2.0 preview (extraction pushdown / shredded execution from storage).
 
+Published results — Apple M3 Ultra (32 cores, 512 GiB), 1,000,000 OTLP/JSON
+trace records, storage v1.5.0 for every path (VARIANT cannot persist on v1.0.0):
+
+### Ingest + storage
+
+| path | grain | ingest | records/s | on disk |
+|---|---|---:|---:|---:|
+| RawDuck typed columns | span | 0.53 s | 1.87M | 108 MB |
+| VARIANT exploded OTLP (`{resource,span}`) | span | 12.0 s | 83k | 106 MB |
+| JSON exploded OTLP | span | 4.7 s | 212k | 485 MB |
+| VARIANT envelope (1 row / NDJSON line) | envelope (12.5k) | 3.9 s | 3.2k lines | 408 MB |
+| VARIANT of shredded rows | span | encode only | — | **36 MB** |
+| JSON of shredded rows (`->>` baseline) | span | encode only | — | 142 MB |
+
+Envelope rec/s is **not** comparable to span rec/s (80 spans per export line).
+
+### Queries (best of 3, ms)
+
+| encoding | errors by service | p99 by route | status dist |
+|---|---:|---:|---:|
+| RawDuck typed columns | **1.3** | **2.9** | **2.4** |
+| JSON flat (`->>`) | 40 | 99 | 36 |
+| JSON OTLP positional | 224 | 313 | 201 |
+| JSON OTLP key lookup | 362 | 438 | 322 |
+| VARIANT flat (same keys as RawDuck) | 449 | 1263 | 431 |
+| VARIANT OTLP positional | 1219 | 3427 | 1138 |
+| VARIANT OTLP key lookup | 1510 | 3704 | 1431 |
+
+### Who is good at what (v1.5.5)
+
+- **RawDuck** wins ingest (~22× vs exploded VARIANT) and every query (15–34× vs
+  flat JSON `->>`, ~900× vs VARIANT-on-OTLP-shape). The OTLP explode + KeyValue
+  flatten into typed columns is the whole product.
+- **VARIANT** wins compression of *already-flat* rows (36 MB vs 108 MB typed vs
+  142 MB JSON). Query execution is not yet the v2.0 shredded path: VARIANT
+  extract is slower than JSON `->>` on the same shredded object.
+- **Keeping OTLP KeyValue arrays** (VARIANT or JSON) is the expensive query
+  shape. Positional extract helps a little; honest key lookup is worse. RawDuck
+  does that lookup once at ingest.
+- **Envelope VARIANT** is a cheap dump (no explode) and a bad table: 12.5k fat
+  rows, 408 MB, and every later query still has to unnest.
+
 ```sh
 git checkout feat/variant-benchmark
 GEN=ninja make release
 ./scripts/benchmark/run_variant.sh --quick
 ./scripts/benchmark/run_variant.sh --records 1000000 --runs 3
+# many-core ARM / oversubscribed hosts (DuckDB is CPU-only; CUDA does not apply):
+./scripts/benchmark/run_variant.sh --records 1000000 --runs 3 --threads 8
 ```
 
-Remote: same commands after `git clone --recurse-submodules` and checkout of this
-branch. Send back `benchmark/results/variant_*.json` (host + git + DuckDB version
-are inside the file). Methodology: `scripts/benchmark/README.md`.
+Methodology: `scripts/benchmark/README.md`.
 
 ## Appendix: GH Archive (historical, wide-schema stress test)
 

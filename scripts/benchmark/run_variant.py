@@ -278,6 +278,9 @@ class DuckSession:
             raise RuntimeError("failed to open duckdb pipes")
         threading.Thread(target=self._drain_stderr, daemon=True).start()
         self.exec("SET enable_progress_bar = false;")
+        threads = os.environ.get("DUCKDB_THREADS", "").strip()
+        if threads:
+            self.exec(f"SET threads = {int(threads)};")
         self.exec(f"LOAD '{escape_sql(str(ext))}';")
         if create:
             self.exec(
@@ -779,6 +782,12 @@ def main() -> int:
     parser.add_argument("--output", type=str, default="", help="JSON output path (default: benchmark/results/variant_<n>_<host>_<ts>.json)")
     parser.add_argument("--skip-kv", action="store_true", help="skip honest KeyValue-lookup queries")
     parser.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help="DuckDB worker threads (0 = DuckDB default / all cores). Pin this on many-core ARM.",
+    )
+    parser.add_argument(
         "--paths",
         type=str,
         default="rawduck,variant_envelope,variant_otlp,json_otlp,variant_flat,json_flat",
@@ -787,6 +796,8 @@ def main() -> int:
     if args.quick:
         args.records = 100_000
         args.runs = 1
+    if args.threads > 0:
+        os.environ["DUCKDB_THREADS"] = str(args.threads)
 
     binary = duckdb_bin()
     ext = extension_path()
@@ -902,6 +913,7 @@ def main() -> int:
         "records": args.records,
         "ingest_runs": args.runs,
         "query_runs": args.query_runs,
+        "threads": int(os.environ["DUCKDB_THREADS"]) if os.environ.get("DUCKDB_THREADS") else None,
         "source": str(cold_file),
         "source_bytes": src_bytes,
         "storage_version": "v1.5.0",

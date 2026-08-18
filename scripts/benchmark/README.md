@@ -112,6 +112,17 @@ against RawDuck typed columns on the same OTLP/JSON traces envelopes.
 `--quick` is 100k records / 1 ingest session (sanity). Publishable numbers use
 1M records and best-of-3 ingest sessions.
 
+DuckDB is **CPU-only** (a CUDA GPU does not accelerate this). On many-core ARM
+hosts, default `threads = nproc` often makes VARIANT extract / nested `UNNEST`
+thrash — pin workers:
+
+```sh
+./scripts/benchmark/run_variant.sh --quick --threads 8
+./scripts/benchmark/run_variant.sh --records 1000000 --runs 3 --threads 8
+# still stuck on queries: skip honest KeyValue lookups
+./scripts/benchmark/run_variant.sh --records 1000000 --runs 3 --threads 8 --skip-kv
+```
+
 Send back: the JSON file. It already embeds `git_commit`, `duckdb_version`, and a
 `host` block (CPU, cores, RAM, OS). Envelope ingest rows are **not** span
 records — the JSON labels grain so rec/s is not mixed.

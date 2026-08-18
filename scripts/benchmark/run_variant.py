@@ -380,6 +380,28 @@ def parse_ingest(lines: list[str]) -> tuple[int, int, int, int]:
     raise RuntimeError(f"no ingest result row in output: {lines!r}")
 
 
+def parse_db_size(lines: list[str]) -> dict:
+    """Parse total_blocks, used_blocks, free_blocks, block_size from pragma_database_size."""
+    for line in reversed(lines):
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 4 and all(p.lstrip("-").isdigit() for p in parts[:4]):
+            total, used, free, block = (int(p) for p in parts[:4])
+            return {
+                "total_blocks": total,
+                "used_blocks": used,
+                "free_blocks": free,
+                "block_size": block,
+                "used_bytes": used * block,
+            }
+    raise RuntimeError(f"no database size row in output: {lines!r}")
+
+
+DB_SIZE_SQL = (
+    "SELECT total_blocks, used_blocks, free_blocks, block_size "
+    "FROM pragma_database_size() WHERE total_blocks > 0 ORDER BY used_blocks DESC LIMIT 1;"
+)
+
+
 def parse_fingerprint(lines: list[str]) -> tuple[int, int]:
     """Parse `groups,sum_n` from the fingerprint SELECT."""
     for line in reversed(lines):
@@ -494,6 +516,7 @@ def run_ingest_session(
         else:
             cold_rows = parse_count(sess.exec(count_sql(path_name)))
             added = widened = errors = 0
+        cold_size = parse_db_size(sess.exec(DB_SIZE_SQL))
 
         sess.exec(delete_sql(path_name))
 
@@ -509,6 +532,7 @@ def run_ingest_session(
                 )
         else:
             warm_rows = parse_count(sess.exec(count_sql(path_name)))
+        warm_size = parse_db_size(sess.exec(DB_SIZE_SQL))
     except Exception as exc:
         sess.fail(f"{path_name} ingest failed: {exc}")
         raise
@@ -526,8 +550,18 @@ def run_ingest_session(
         "columns_added": added,
         "columns_widened": widened,
         "errors": errors,
-        "bytes": file_bytes(db_path),
+        "file_bytes": file_bytes(db_path),
+        "bytes": cold_size["used_bytes"],
+        "used_bytes": cold_size["used_bytes"],
+        "free_blocks": cold_size["free_blocks"],
+        "used_blocks": cold_size["used_blocks"],
+        "block_size": cold_size["block_size"],
+        "note_storage": (
+            "bytes/used_bytes is live data after cold CHECKPOINT (before DELETE). "
+            "file_bytes is the file after warm re-ingest and may include free-list holes."
+        ),
         "db": str(db_path),
+        "warm_size": warm_size,
     }
 
 
@@ -554,6 +588,7 @@ def encode_flat(
         sess.exec(sql)
         encode_sec = time.perf_counter() - t0
         rows = parse_count(sess.exec("SELECT count(*) FROM t;"))
+        size = parse_db_size(sess.exec(DB_SIZE_SQL))
     except Exception as exc:
         sess.fail(f"{encoding} encode failed: {exc}")
         raise
@@ -563,7 +598,12 @@ def encode_flat(
         "grain": "span",
         "encode_seconds": round(encode_sec, 6),
         "rows": rows,
-        "bytes": file_bytes(dst_db),
+        "bytes": size["used_bytes"],
+        "used_bytes": size["used_bytes"],
+        "file_bytes": file_bytes(dst_db),
+        "used_blocks": size["used_blocks"],
+        "free_blocks": size["free_blocks"],
+        "block_size": size["block_size"],
         "db": str(dst_db),
         "note": "query/storage encoding of already-shredded RawDuck rows; not an OTLP ingest path",
     }
@@ -722,11 +762,15 @@ def print_summary(doc: dict) -> None:
         cold = row.get("cold_seconds")
         warm = row.get("warm_seconds")
         disk = row["bytes"] / (1 << 20)
+        file_disk = row.get("file_bytes")
+        extra = ""
+        if file_disk and file_disk > row["bytes"] * 1.05:
+            extra = f" ({file_disk / (1 << 20):.1f} file)"
         cold_s = f"{cold:.3f}" if cold is not None else "—"
         warm_s = f"{warm:.3f}" if warm is not None else "—"
         rate = f"{row.get('cold_records_per_sec') or rec_s(rows, cold or 0):,}" if cold else "—"
         print(
-            f"{name:<20} {row.get('grain','?'):<10} {rows:>10,} {cold_s:>10} {rate:>12} {warm_s:>10} {disk:>8.1f} MB",
+            f"{name:<20} {row.get('grain','?'):<10} {rows:>10,} {cold_s:>10} {rate:>12} {warm_s:>10} {disk:>8.1f} MB{extra}",
             file=sys.stderr,
         )
 
@@ -764,6 +808,13 @@ def merge_best_ingest(acc: dict | None, row: dict) -> dict:
             "columns_widened",
             "errors",
             "bytes",
+            "used_bytes",
+            "file_bytes",
+            "free_blocks",
+            "used_blocks",
+            "block_size",
+            "warm_size",
+            "note_storage",
             "db",
         ):
             acc[k] = row[k]
@@ -790,7 +841,7 @@ def main() -> int:
     parser.add_argument(
         "--paths",
         type=str,
-        default="rawduck,variant_envelope,variant_otlp,json_otlp,variant_flat,json_flat",
+        default="rawduck,variant_otlp,json_otlp,variant_flat,json_flat",
     )
     args = parser.parse_args()
     if args.quick:

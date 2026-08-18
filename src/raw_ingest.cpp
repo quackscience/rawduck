@@ -232,7 +232,8 @@ public:
 			worker.local_types = types;
 			worker.local_slots = slots;
 			worker.writer = make_uniq<OptimisticDataWriter>(context, storage);
-			auto collection = worker.writer->CreateCollection(storage, types);
+			auto collection = worker.writer->CreateCollection(storage, types,
+			                                                   OptimisticWritePartialManagers::GLOBAL);
 			collection->collection->InitializeEmpty();
 			worker.append_state = make_uniq<TableAppendState>();
 			collection->collection->InitializeAppend(*worker.append_state);
@@ -289,9 +290,13 @@ public:
 		}
 		idx_t total = 0;
 		auto merge_threshold = storage.GetRowGroupSize() / 8;
-		// phase 1, parallel: finalize and flush each worker's collection.
-		// Writers capture the table's storage for compression metadata, so
-		// they are rebuilt against the CURRENT (possibly evolved) storage.
+		const bool flush_now = overlap_flush;
+		// phase 1, parallel: finalize each worker. Mid-append overlap_flush
+		// already wrote complete row groups; finish those to disk here. The
+		// default (in-memory until drain) skips that write: LocalMerge keeps
+		// uncompressed collections in local storage and CHECKPOINT packs them
+		// once — same GLOBAL partial-block path as DuckDB INSERT, without a
+		// second allocation that leaves free-list holes.
 		vector<std::thread> flushers;
 		for (auto &worker : workers) {
 			// pad to the full published schema so layouts match the table
@@ -309,10 +314,10 @@ public:
 			// created against it (no evolution) or rebuilt by ExtendWorker, and
 			// it holds the partial blocks from incremental flushes, so reuse it
 			// rather than dropping that state on the floor.
-			flushers.emplace_back([&worker, merge_threshold] {
+			flushers.emplace_back([&worker, merge_threshold, flush_now] {
 				auto &collection = *worker.collection->collection;
 				collection.FinalizeAppend(TransactionData(0, 0), *worker.append_state);
-				if (collection.GetTotalRows() >= merge_threshold) {
+				if (flush_now && collection.GetTotalRows() >= merge_threshold) {
 					worker.writer->WriteUnflushedRowGroups(*worker.collection);
 					worker.writer->FinalFlush();
 				}
@@ -341,7 +346,9 @@ public:
 				storage.FinalizeLocalAppend(append_state);
 			} else {
 				storage.LocalMerge(context, *worker.collection);
-				storage.GetOptimisticWriter(context).Merge(*worker.writer);
+				if (flush_now) {
+					storage.GetOptimisticWriter(context).Merge(*worker.writer);
+				}
 			}
 		}
 		workers.clear();
@@ -433,7 +440,11 @@ private:
 	}
 
 	// pads this worker's collection with NULL-filled columns: metadata-only
-	// work through RowGroupCollection::AddColumn. The worker may have already
+	// work through RowGroupCollection::AddColumn. GLOBAL partial-block packing
+	// (same as DuckDB LocalStorage INSERT) leaves this vector empty: leftover
+	// space is shared across columns so CHECKPOINT can truncate. PER_COLUMN
+	// managers (one nearly-empty tail block per column) were the VARIANT-flat
+	// file-size gap — same codecs, twice the file.
 	// flushed complete row groups to disk (incremental WriteNewRowGroup);
 	// AddColumn extends those checkpointed row groups too (existing columns
 	// stay on disk, the new column is materialized NULL in memory). The flush

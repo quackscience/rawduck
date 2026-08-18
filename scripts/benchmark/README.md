@@ -132,7 +132,7 @@ Paths in the result:
 | path | what it measures |
 |---|---|
 | `rawduck` | `raw_ingest_file` + typed columns (`otlp-traces`) |
-| `variant_envelope` | one VARIANT per NDJSON line (OTLP export envelope) |
+| `variant_envelope` | *(off by default)* one VARIANT per NDJSON line. Fat OTLP envelopes can hang for hours on Linux aarch64; pass `--paths …,variant_envelope` to include. |
 | `variant_otlp` | SQL unnest → one VARIANT `{resource, span}` per span (KeyValue arrays kept) |
 | `json_otlp` | same exploded shape stored as JSON |
 | `variant_flat` / `json_flat` | query/storage encodings of already-shredded RawDuck rows (not an ingest path) |

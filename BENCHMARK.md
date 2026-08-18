@@ -119,16 +119,24 @@ trace records, storage v1.5.0 for every path (VARIANT cannot persist on v1.0.0):
 
 ### Ingest + storage
 
-| path | grain | ingest | records/s | on disk |
+| path | grain | ingest | records/s | on disk (file) |
 |---|---|---:|---:|---:|
-| RawDuck typed columns | span | 0.53 s | 1.87M | 108 MB |
+| RawDuck typed columns | span | 0.53 s | 1.87M | 108 MB file (DELETE+holes) |
 | VARIANT exploded OTLP (`{resource,span}`) | span | 12.0 s | 83k | 106 MB |
 | JSON exploded OTLP | span | 4.7 s | 212k | 485 MB |
 | VARIANT envelope (1 row / NDJSON line) | envelope (12.5k) | 3.9 s | 3.2k lines | 408 MB |
 | VARIANT of shredded rows | span | encode only | — | **36 MB** |
 | JSON of shredded rows (`->>` baseline) | span | encode only | — | 142 MB |
 
+Those on-disk figures are **file size after cold+DELETE+warm**. VARIANT-flat is a fresh CTAS.
+`pragma_storage_info` shows the same codecs (`DICT_FSST` / `BitPacking`). The 108 vs 36 MB
+gap was free-list holes (optimistic flush then CHECKPOINT rewrite) plus DELETE residue,
+not a better VARIANT compressor. After packing (in-memory drain, one CHECKPOINT, global
+partial blocks) 100k traces is **4.0 MB used / 0 free** — same as VARIANT-flat CTAS.
+Re-run 1M for a packed publishable size.
+
 Envelope rec/s is **not** comparable to span rec/s (80 spans per export line).
+VARIANT envelope ingest is off by default (can hang for hours on Linux aarch64).
 
 ### Queries (best of 3, ms)
 
@@ -147,9 +155,10 @@ Envelope rec/s is **not** comparable to span rec/s (80 spans per export line).
 - **RawDuck** wins ingest (~22× vs exploded VARIANT) and every query (15–34× vs
   flat JSON `->>`, ~900× vs VARIANT-on-OTLP-shape). The OTLP explode + KeyValue
   flatten into typed columns is the whole product.
-- **VARIANT** wins compression of *already-flat* rows (36 MB vs 108 MB typed vs
-  142 MB JSON). Query execution is not yet the v2.0 shredded path: VARIANT
-  extract is slower than JSON `->>` on the same shredded object.
+- **Storage:** VARIANT-flat looked 3× smaller because the scoreboard used dirty
+  file size. Codecs are the same. Packed RawDuck used-blocks match VARIANT-flat
+  (4.0 MB on 100k). JSON-flat is still ~3.5× larger. Query execution is not the
+  v2.0 shredded path: VARIANT extract is slower than JSON `->>` on the same keys.
 - **Keeping OTLP KeyValue arrays** (VARIANT or JSON) is the expensive query
   shape. Positional extract helps a little; honest key lookup is worse. RawDuck
   does that lookup once at ingest.

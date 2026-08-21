@@ -114,56 +114,48 @@ in storage). RawDuck still does the OTLP explode + KeyValue flatten into **named
 typed columns**. This comparison uses VARIANT **as it exists in the v1.5.5 pin**,
 not the v2.0 preview (extraction pushdown / shredded execution from storage).
 
-Published results — Apple M3 Ultra (32 cores, 512 GiB), 1,000,000 OTLP/JSON
-trace records, storage v1.5.0 for every path (VARIANT cannot persist on v1.0.0):
+Published results — Apple M3 Ultra (32 cores, 512 GiB), DuckDB v1.5.5,
+`8cf4bf3` (packed drain), 1,000,000 OTLP/JSON trace records. Disk is
+**used_blocks × block_size** after cold CHECKPOINT (before DELETE). File size
+after warm is in parentheses and is *not* comparable (DELETE does not reclaim).
 
 ### Ingest + storage
 
-| path | grain | ingest | records/s | on disk (file) |
-|---|---|---:|---:|---:|
-| RawDuck typed columns | span | 0.53 s | 1.87M | 108 MB file (DELETE+holes) |
-| VARIANT exploded OTLP (`{resource,span}`) | span | 12.0 s | 83k | 106 MB |
-| JSON exploded OTLP | span | 4.7 s | 212k | 485 MB |
-| VARIANT envelope (1 row / NDJSON line) | envelope (12.5k) | 3.9 s | 3.2k lines | 408 MB |
-| VARIANT of shredded rows | span | encode only | — | **36 MB** |
-| JSON of shredded rows (`->>` baseline) | span | encode only | — | 142 MB |
+| path | grain | ingest | records/s | live disk | file after warm |
+|---|---|---:|---:|---:|---:|
+| RawDuck typed columns | span | 1.01 s | 988k | **38.8 MB** | 110 MB |
+| VARIANT of shredded rows | span | encode only | — | **38.8 MB** | — |
+| VARIANT exploded OTLP (`{resource,span}`) | span | 11.8 s | 85k | 53.5 MB | 106 MB |
+| JSON of shredded rows (`->>`) | span | encode only | — | 142 MB | — |
+| JSON exploded OTLP | span | 4.75 s | 210k | 241 MB | 484 MB |
 
-Those on-disk figures are **file size after cold+DELETE+warm**. VARIANT-flat is a fresh CTAS.
-`pragma_storage_info` shows the same codecs (`DICT_FSST` / `BitPacking`). The 108 vs 36 MB
-gap was free-list holes (optimistic flush then CHECKPOINT rewrite) plus DELETE residue,
-not a better VARIANT compressor. After packing (in-memory drain, one CHECKPOINT, global
-partial blocks) 100k traces is **4.0 MB used / 0 free** — same as VARIANT-flat CTAS.
-Re-run 1M for a packed publishable size.
-
-Envelope rec/s is **not** comparable to span rec/s (80 spans per export line).
-VARIANT envelope ingest is off by default (can hang for hours on Linux aarch64).
+Packed drain matches VARIANT-flat on live size. Ingest is ~2× slower than the
+pre-pack M3 run (0.53 s / 1.87M rec/s) because compression happens once at
+CHECKPOINT instead of a parallel optimistic flush that left holes.
 
 ### Queries (best of 3, ms)
 
-| encoding | errors by service | p99 by route | status dist |
-|---|---:|---:|---:|
-| RawDuck typed columns | **1.3** | **2.9** | **2.4** |
-| JSON flat (`->>`) | 40 | 99 | 36 |
-| JSON OTLP positional | 224 | 313 | 201 |
-| JSON OTLP key lookup | 362 | 438 | 322 |
-| VARIANT flat (same keys as RawDuck) | 449 | 1263 | 431 |
-| VARIANT OTLP positional | 1219 | 3427 | 1138 |
-| VARIANT OTLP key lookup | 1510 | 3704 | 1431 |
+| encoding | errors by service | p99 by route | status dist | vs RawDuck |
+|---|---:|---:|---:|---|
+| RawDuck typed columns | **1.3** | **3.0** | **2.5** | — |
+| JSON flat (`->>`) | 39 | 97 | 35 | 15–32× |
+| JSON OTLP positional | 222 | 313 | 201 | 80–170× |
+| JSON OTLP key lookup | 361 | 436 | 322 | 130–280× |
+| VARIANT flat (same keys) | 430 | 1264 | 425 | 170–420× |
+| VARIANT OTLP positional | 1224 | 3483 | 1161 | ~900× |
+| VARIANT OTLP key lookup | 1506 | 3725 | 1405 | ~1100× |
 
 ### Who is good at what (v1.5.5)
 
-- **RawDuck** wins ingest (~22× vs exploded VARIANT) and every query (15–34× vs
-  flat JSON `->>`, ~900× vs VARIANT-on-OTLP-shape). The OTLP explode + KeyValue
-  flatten into typed columns is the whole product.
-- **Storage:** VARIANT-flat looked 3× smaller because the scoreboard used dirty
-  file size. Codecs are the same. Packed RawDuck used-blocks match VARIANT-flat
-  (4.0 MB on 100k). JSON-flat is still ~3.5× larger. Query execution is not the
-  v2.0 shredded path: VARIANT extract is slower than JSON `->>` on the same keys.
-- **Keeping OTLP KeyValue arrays** (VARIANT or JSON) is the expensive query
-  shape. Positional extract helps a little; honest key lookup is worse. RawDuck
-  does that lookup once at ingest.
-- **Envelope VARIANT** is a cheap dump (no explode) and a bad table: 12.5k fat
-  rows, 408 MB, and every later query still has to unnest.
+- **RawDuck** wins ingest (~12× vs exploded VARIANT, ~5× vs exploded JSON) and
+  every query. Typed columns stay in the 1–3 ms club.
+- **Storage is a tie with VARIANT-flat** (38.8 MB). VARIANT was never a better
+  codec — same `DICT_FSST` / `BitPacking` after shredding. JSON-flat is 3.7×
+  larger; keeping OTLP KeyValue arrays is 1.4× (VARIANT) to 6× (JSON) larger.
+- **VARIANT extract is slower than JSON `->>`** on the same shredded object
+  (430 ms vs 39 ms). v2.0 shredded execution is not in this pin.
+- **OTLP KeyValue arrays at query time lose.** Flatten once at ingest.
+- **Envelope VARIANT** stays off the default path (Linux aarch64 can hang).
 
 ```sh
 git checkout feat/variant-benchmark

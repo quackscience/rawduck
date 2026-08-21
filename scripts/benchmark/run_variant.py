@@ -23,7 +23,7 @@ import argparse
 import json
 import os
 import platform
-import select
+import queue
 import shutil
 import subprocess
 import sys
@@ -34,6 +34,18 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+# DuckDB 1.5 CLI: terminal color / highlight probes can stall piped stdin on
+# Linux (and some remote TTYs). Force a non-interactive color scheme and skip
+# highlight detection — see duckdb/duckdb#21243 and the CLI troubleshooting guide.
+_DUCKDB_ENV = {
+    **os.environ,
+    "DUCKDB_NO_HIGHLIGHT": "1",
+}
+
+
+def escape_sql(path: str) -> str:
+    return path.replace("'", "''")
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -60,8 +72,32 @@ def results_dir() -> Path:
     return _env_path("BENCH_RESULTS", ROOT / "benchmark/results")
 
 
-def escape_sql(path: str) -> str:
-    return path.replace("'", "''")
+def _duckdb_argv(binary: Path, db_path: Path | None = None) -> list[str]:
+    argv = [str(binary)]
+    if db_path is not None:
+        argv.append(str(db_path))
+    # -dark-mode skips OSC-11 /dev/tty color probing; -batch forces non-TTY input.
+    argv.extend(["-unsigned", "-batch", "-csv", "-noheader", "-dark-mode"])
+    return argv
+
+
+def create_v15_database(binary: Path, db_path: Path) -> None:
+    """Create an empty storage-v1.5.0 file in a one-shot process (no interactive ATTACH)."""
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    for p in (db_path, Path(str(db_path) + ".wal")):
+        if p.exists():
+            p.unlink()
+    sql = f"ATTACH '{escape_sql(str(db_path))}' AS bench (STORAGE_VERSION 'v1.5.0');"
+    # Prefer -c over interactive stdin: avoids the v1.5 piped-script stall path.
+    subprocess.run(
+        _duckdb_argv(binary) + ["-c", sql],
+        check=True,
+        env=_DUCKDB_ENV,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=60,
+    )
 
 
 def explode_cte(file_sql: str) -> str:
@@ -254,38 +290,43 @@ QUERY_EXPECT = {
 
 
 class DuckSession:
-    """Interactive DuckDB CLI session.
+    """Interactive DuckDB CLI session (cold→warm needs one process).
 
-    New files must be ATTACH'd with STORAGE_VERSION v1.5.0 (VARIANT cannot
-    persist on the default v1.0.0 format). Existing files are opened as the
-    CLI's main database — re-ATTACH with STORAGE_VERSION deadlocks.
+    Hardening for Linux/arm64 (DuckDB v1.5 CLI):
+    - Always open an existing v1.5.0 file (pre-created via create_v15_database);
+      never ATTACH STORAGE_VERSION over an interactive pipe.
+    - Pass -dark-mode + DUCKDB_NO_HIGHLIGHT=1 so color probing cannot stall.
+    - Unbuffered pipes + a stdout reader thread (no select on BufferedReader).
     """
 
     def __init__(self, binary: Path, ext: Path, db_path: Path, *, create: bool):
-        self.db_path = db_path
+        self.db_path = Path(db_path)
         self._err_chunks: list[bytes] = []
+        self._lines: queue.Queue = queue.Queue()
+        self._reader_done = threading.Event()
+        self._last_sql = ""
+
         if create:
-            argv = [str(binary), "-unsigned", "-batch", "-csv", "-noheader"]
-        else:
-            argv = [str(binary), str(db_path), "-unsigned", "-batch", "-csv", "-noheader"]
+            create_v15_database(binary, self.db_path)
+
+        argv = _duckdb_argv(binary, self.db_path)
         self.proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=_DUCKDB_ENV,
+            bufsize=0,  # unbuffered: avoid Linux pipe + BufferedReader stalls
         )
         if self.proc.stdin is None or self.proc.stdout is None:
             raise RuntimeError("failed to open duckdb pipes")
         threading.Thread(target=self._drain_stderr, daemon=True).start()
+        threading.Thread(target=self._read_stdout, daemon=True).start()
         self.exec("SET enable_progress_bar = false;")
         threads = os.environ.get("DUCKDB_THREADS", "").strip()
         if threads:
             self.exec(f"SET threads = {int(threads)};")
         self.exec(f"LOAD '{escape_sql(str(ext))}';")
-        if create:
-            self.exec(
-                f"ATTACH '{escape_sql(str(db_path))}' AS bench (STORAGE_VERSION 'v1.5.0'); USE bench;"
-            )
 
     def _drain_stderr(self) -> None:
         assert self.proc.stderr is not None
@@ -295,33 +336,44 @@ class DuckSession:
                 break
             self._err_chunks.append(chunk)
 
+    def _read_stdout(self) -> None:
+        assert self.proc.stdout is not None
+        try:
+            while True:
+                raw = self.proc.stdout.readline()
+                if not raw:
+                    break
+                self._lines.put(raw.decode(errors="replace").rstrip("\n\r"))
+        finally:
+            self._reader_done.set()
+            self._lines.put(None)
+
     def _read_until_done(self, timeout_sec: float = 1800.0) -> list[str]:
         lines: list[str] = []
-        assert self.proc.stdout is not None
         deadline = time.monotonic() + timeout_sec
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError(
                     "timed out waiting for __bench_done__"
+                    + (f"\nlast_sql={self._last_sql[:200]!r}" if self._last_sql else "")
                     + (f"\n{self.stderr_text()}" if self.stderr_text() else "")
                 )
-            ready, _, _ = select.select([self.proc.stdout], [], [], min(remaining, 1.0))
-            if not ready:
-                if self.proc.poll() is not None:
+            try:
+                text = self._lines.get(timeout=min(remaining, 1.0))
+            except queue.Empty:
+                if self.proc.poll() is not None and self._reader_done.is_set():
                     raise RuntimeError(
                         "duckdb process ended before __bench_done__"
                         + (f"\n{self.stderr_text()}" if self.stderr_text() else "")
                     )
                 continue
-            raw = self.proc.stdout.readline()
-            if not raw:
-                err = self.stderr_text()
+            if text is None:
                 raise RuntimeError(
                     "duckdb process ended before __bench_done__"
-                    + (f"\n{err}" if err else "")
+                    + (f"\n{self.stderr_text()}" if self.stderr_text() else "")
                 )
-            text = raw.decode(errors="replace").strip()
+            text = text.strip()
             if not text:
                 continue
             if text == "__bench_done__" or text.startswith("__bench_done__,"):
@@ -334,7 +386,9 @@ class DuckSession:
         body = sql.rstrip()
         if not body.endswith(";"):
             body += ";"
-        self.proc.stdin.write((body + "\nSELECT '__bench_done__';\n").encode())
+        self._last_sql = body
+        payload = (body + "\nSELECT '__bench_done__';\n").encode()
+        self.proc.stdin.write(payload)
         self.proc.stdin.flush()
         return self._read_until_done()
 

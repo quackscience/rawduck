@@ -123,6 +123,18 @@ thrash — pin workers:
 ./scripts/benchmark/run_variant.sh --records 1000000 --runs 3 --threads 8 --skip-kv
 ```
 
+### Linux / arm64 hang (DuckDB 1.5 CLI)
+
+If the process sits idle with no CPU at `ingest …` (especially right after
+startup), that is usually the DuckDB **v1.5 CLI stdin/color-detection stall**,
+not RawDuck. The harness now passes `-dark-mode`, sets `DUCKDB_NO_HIGHLIGHT=1`,
+pre-creates the v1.5.0 DB with a one-shot `-c` (no interactive `ATTACH`), and
+reads stdout from a dedicated thread.
+
+If CPU is pegged on `variant_otlp` / `variant_envelope`, that is VARIANT
+shredding fat OTLP rows (slow, not a hang). Envelope ingest stays off by
+default; use `--paths rawduck,variant_otlp,json_otlp,variant_flat,json_flat`.
+
 Send back: the JSON file. It already embeds `git_commit`, `duckdb_version`, and a
 `host` block (CPU, cores, RAM, OS). Envelope ingest rows are **not** span
 records — the JSON labels grain so rec/s is not mixed.

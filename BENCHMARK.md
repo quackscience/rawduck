@@ -155,7 +155,25 @@ CHECKPOINT instead of a parallel optimistic flush that left holes.
 - **VARIANT extract is slower than JSON `->>`** on the same shredded object
   (430 ms vs 39 ms). v2.0 shredded execution is not in this pin.
 - **OTLP KeyValue arrays at query time lose.** Flatten once at ingest.
-- **Envelope VARIANT** stays off the default path (Linux aarch64 can hang).
+- **Envelope VARIANT** stays off the default path (fat export shred can be
+  extremely slow on Linux aarch64; not needed for the fair compare).
+
+### Cross-check: NVIDIA Spark GB10 (Linux aarch64, 100k)
+
+Same harness after the CLI stdin fix (`e88c6a7`, `--threads 8`). Confirms the
+ranking holds off Apple Silicon — idle hang is gone; DuckDB is CPU-only (CUDA
+unused).
+
+| path | ingest | live disk | errors / p99 / status (ms) |
+|---|---:|---:|---|
+| RawDuck | 0.31 s (325k rec/s) | **4.0 MB** | **1.0 / 1.6 / 3.6** |
+| VARIANT-flat | encode | **4.0 MB** | 389 / 1112 / 372 |
+| VARIANT OTLP | 1.72 s (58k) | 6.0 MB | 1271–3894 |
+| JSON OTLP | 1.17 s (85k) | 24.5 MB | 121–290 |
+| JSON-flat | encode | 14.5 MB | 33 / 72 / 30 |
+
+Same story: storage ties VARIANT-flat; typed columns win every query (~30–1000×);
+VARIANT extract still slower than JSON `->>` on identical keys.
 
 ```sh
 git checkout feat/variant-benchmark

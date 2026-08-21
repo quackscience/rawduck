@@ -114,66 +114,51 @@ in storage). RawDuck still does the OTLP explode + KeyValue flatten into **named
 typed columns**. This comparison uses VARIANT **as it exists in the v1.5.5 pin**,
 not the v2.0 preview (extraction pushdown / shredded execution from storage).
 
-Published results — Apple M3 Ultra (32 cores, 512 GiB), DuckDB v1.5.5,
-`8cf4bf3` (packed drain), 1,000,000 OTLP/JSON trace records. Disk is
-**used_blocks × block_size** after cold CHECKPOINT (before DELETE). File size
-after warm is in parentheses and is *not* comparable (DELETE does not reclaim).
+Disk is **used_blocks × block_size** after cold CHECKPOINT (before DELETE). File
+size after warm is in parentheses and is *not* comparable (DELETE does not reclaim).
 
-### Ingest + storage
+### Ingest + storage (1,000,000 spans)
 
-| path | grain | ingest | records/s | live disk | file after warm |
-|---|---|---:|---:|---:|---:|
-| RawDuck typed columns | span | 1.01 s | 988k | **38.8 MB** | 110 MB |
-| VARIANT of shredded rows | span | encode only | — | **38.8 MB** | — |
-| VARIANT exploded OTLP (`{resource,span}`) | span | 11.8 s | 85k | 53.5 MB | 106 MB |
-| JSON of shredded rows (`->>`) | span | encode only | — | 142 MB | — |
-| JSON exploded OTLP | span | 4.75 s | 210k | 241 MB | 484 MB |
+| path | M3 Ultra (32c / 512 GiB) | Spark GB10 aarch64 (20c / 122 GiB, `--threads 8`) |
+|---|---|---|
+| RawDuck | **1.01 s · 988k/s · 38.8 MB** (110 file) | **1.41 s · 709k/s · 35.5 MB** (71 file) |
+| VARIANT-flat | encode · **38.8 MB** | encode · **38.0 MB** |
+| VARIANT OTLP | 11.8 s · 85k · 53.5 MB (106) | 7.26 s · 138k · 54.5 MB (108) |
+| JSON-flat | encode · 142 MB | encode · 143 MB |
+| JSON OTLP | 4.75 s · 210k · 241 MB (484) | 4.76 s · 210k · 242 MB (484) |
 
-Packed drain matches VARIANT-flat on live size. Ingest is ~2× slower than the
-pre-pack M3 run (0.53 s / 1.87M rec/s) because compression happens once at
-CHECKPOINT instead of a parallel optimistic flush that left holes.
+Packed RawDuck live size matches or **beats** VARIANT-flat on both hosts. Spark
+VARIANT OTLP ingest is faster than M3; RawDuck still leads (~5× on Spark, ~12× on M3).
 
 ### Queries (best of 3, ms)
 
-| encoding | errors by service | p99 by route | status dist | vs RawDuck |
-|---|---:|---:|---:|---|
-| RawDuck typed columns | **1.3** | **3.0** | **2.5** | — |
-| JSON flat (`->>`) | 39 | 97 | 35 | 15–32× |
-| JSON OTLP positional | 222 | 313 | 201 | 80–170× |
-| JSON OTLP key lookup | 361 | 436 | 322 | 130–280× |
-| VARIANT flat (same keys) | 430 | 1264 | 425 | 170–420× |
-| VARIANT OTLP positional | 1224 | 3483 | 1161 | ~900× |
-| VARIANT OTLP key lookup | 1506 | 3725 | 1405 | ~1100× |
+| encoding | M3 Ultra errors / p99 / status | Spark GB10 errors / p99 / status |
+|---|---|---|
+| RawDuck | **1.3 / 3.0 / 2.5** | **1.0 / 4.0 / 5.4** |
+| JSON-flat (`->>`) | 39 / 97 / 35 | 51 / 133 / 47 |
+| JSON OTLP pos | 222 / 313 / 201 | 278 / 365 / 246 |
+| JSON OTLP kv | 361 / 436 / 322 | 445 / 526 / 400 |
+| VARIANT-flat | 430 / 1264 / 425 | 784 / 2160 / 762 |
+| VARIANT OTLP pos | 1224 / 3483 / 1161 | 2268 / 6716 / 2175 |
+| VARIANT OTLP kv | 1506 / 3725 / 1405 | 2775 / 6984 / 2438 |
 
 ### Who is good at what (v1.5.5)
 
-- **RawDuck** wins ingest (~12× vs exploded VARIANT, ~5× vs exploded JSON) and
-  every query. Typed columns stay in the 1–3 ms club.
-- **Storage is a tie with VARIANT-flat** (38.8 MB). VARIANT was never a better
-  codec — same `DICT_FSST` / `BitPacking` after shredding. JSON-flat is 3.7×
-  larger; keeping OTLP KeyValue arrays is 1.4× (VARIANT) to 6× (JSON) larger.
+- **RawDuck** wins ingest and every query on both hosts. Typed columns stay in
+  the low-ms club (1–5 ms).
+- **Storage ties or beats VARIANT-flat** (35.5–38.8 MB). VARIANT was never a
+  better codec — same `DICT_FSST` / `BitPacking` after shredding. JSON-flat is
+  ~4× larger; OTLP KeyValue shape is larger still.
 - **VARIANT extract is slower than JSON `->>`** on the same shredded object
-  (430 ms vs 39 ms). v2.0 shredded execution is not in this pin.
-- **OTLP KeyValue arrays at query time lose.** Flatten once at ingest.
+  (hundreds of ms vs tens). v2.0 shredded execution is not in this pin.
+- **OTLP KeyValue arrays at query time lose** (~500–7000× vs typed columns).
+  Flatten once at ingest.
+- **CUDA unused** — DuckDB is CPU-only; pin `--threads` on many-core ARM.
 - **Envelope VARIANT** stays off the default path (fat export shred can be
-  extremely slow on Linux aarch64; not needed for the fair compare).
+  extremely slow; not needed for the fair compare).
 
-### Cross-check: NVIDIA Spark GB10 (Linux aarch64, 100k)
-
-Same harness after the CLI stdin fix (`e88c6a7`, `--threads 8`). Confirms the
-ranking holds off Apple Silicon — idle hang is gone; DuckDB is CPU-only (CUDA
-unused).
-
-| path | ingest | live disk | errors / p99 / status (ms) |
-|---|---:|---:|---|
-| RawDuck | 0.31 s (325k rec/s) | **4.0 MB** | **1.0 / 1.6 / 3.6** |
-| VARIANT-flat | encode | **4.0 MB** | 389 / 1112 / 372 |
-| VARIANT OTLP | 1.72 s (58k) | 6.0 MB | 1271–3894 |
-| JSON OTLP | 1.17 s (85k) | 24.5 MB | 121–290 |
-| JSON-flat | encode | 14.5 MB | 33 / 72 / 30 |
-
-Same story: storage ties VARIANT-flat; typed columns win every query (~30–1000×);
-VARIANT extract still slower than JSON `->>` on identical keys.
+Commits: M3 Ultra `8cf4bf3`; Spark `e88c6a7`+ (CLI stdin fix). 100k Spark
+smoke matched this ranking before the 1M run.
 
 ```sh
 git checkout feat/variant-benchmark

@@ -1,9 +1,7 @@
 # RawDuck Benchmark
 
-RawDuck's bet: shred schema-less event JSON into real typed columns at ingest so every later query
-runs at native columnar speed, instead of keeping opaque JSON and paying `->>` extraction on every
-scan. The primary benchmark is the realistic workload — **OTEL telemetry** (OTLP/JSON logs, metrics,
-traces) — with the GH Archive run kept below as a historical wide-schema stress test.
+Primary workload: **OTEL telemetry** (OTLP/JSON logs, metrics, traces). GH Archive is a
+wide-schema stress test in the appendix.
 
 ### Harness
 
@@ -29,17 +27,11 @@ endpoint), default settings (no manual tuning):
 | logs    | 1,000,000 | 11 | 294 MB | 0.80 s | 1.26M | 369 MB/s | 9 MB |
 | metrics | 1,000,000 | 9  | 353 MB | 1.03 s | 970k | 342 MB/s | 88 MB |
 
-3M telemetry records shredded into typed columns in **2.6 s (~1.2M records/s)**. The OTLP transform
-explodes the nested `resource → scope → record` envelopes, flattens KeyValue attributes
-(`http.status_code`, `service.name`, …) into typed columns, and normalizes byte ids to hex — all in
-the parallel parse stage. Because each NDJSON line is a fat export envelope that explodes into many
-records, the loader batches by bytes (not just line count) so the parse threads stay fed
-automatically; no `batch_size` tuning is needed.
+3M telemetry records shredded into typed columns in **2.6 s (~1.2M records/s)**.
 
 ### Query speed (1,000,000 spans)
 
-Same spans, identical results — shredded typed columns vs the "just keep the JSON" baseline (one
-JSON object per span, queried with `->>`):
+Shredded typed columns vs one JSON object per span (`->>`):
 
 | query | JSON `->>` | RawDuck | speedup |
 |---|---:|---:|---:|
@@ -47,10 +39,6 @@ JSON object per span, queried with `->>`):
 | p99 latency by route | 136 ms | 5 ms | 27× |
 | status-code distribution | 63 ms | 1 ms | 63× |
 | storage | 232 MB | 38 MB | 6× smaller |
-
-This baseline is the *favorable* one. Real OTLP keeps attributes as KeyValue **arrays**, so querying
-them without shredding means `UNNEST`-ing the `resource → scope → span` nesting and scanning each
-attribute array by key — hundreds of times slower than reading a typed column.
 
 ### Reproduce
 
@@ -109,75 +97,59 @@ Run each query three times (against a `-readonly` database) and report the best.
 
 ## VARIANT vs RawDuck (DuckDB v1.5.5)
 
-DuckDB v1.5 shipped `VARIANT` (“JSON on steroids”: schema-less, binary, shredded
-in storage). RawDuck still does the OTLP explode + KeyValue flatten into **named
-typed columns**. This comparison uses VARIANT **as it exists in the v1.5.5 pin**,
-not the v2.0 preview (extraction pushdown / shredded execution from storage).
+Same OTLP/JSON traces as the OTEL ingest suite. Paths:
 
-Disk is **used_blocks × block_size** after cold CHECKPOINT (before DELETE). File
-size after warm is in parentheses and is *not* comparable (DELETE does not reclaim).
+| path | definition |
+|---|---|
+| RawDuck | `raw_ingest_file(..., transform := 'otlp-traces')` → typed columns |
+| VARIANT OTLP | SQL unnest → one `VARIANT` `{resource, span}` per span (KeyValue arrays kept) |
+| JSON OTLP | same exploded shape as `JSON` |
+| VARIANT-flat | `to_json(traces)::VARIANT` of already-shredded RawDuck rows (encode/query only) |
+| JSON-flat | same shredded rows as `JSON`, queried with `->>` |
+
+Disk is `used_blocks × block_size` after cold `CHECKPOINT` (before `DELETE`). Parenthetical
+file size is after warm re-ingest and includes free-list holes — not comparable across paths.
+VARIANT requires `STORAGE_VERSION 'v1.5.0'`. Measured with DuckDB VARIANT as of **v1.5.5**
+(not v2.0 shredded execution / extraction pushdown).
 
 ### Ingest + storage (1,000,000 spans)
 
-| path | M3 Ultra (32c / 512 GiB) | Spark GB10 aarch64 (20c / 122 GiB, `--threads 8`) |
+| path | M3 Ultra (32 cores, 512 GiB) | Spark GB10 aarch64 (20 cores, 122 GiB, `--threads 8`) |
 |---|---|---|
-| RawDuck | **1.01 s · 988k/s · 38.8 MB** (110 file) | **1.41 s · 709k/s · 35.5 MB** (71 file) |
-| VARIANT-flat | encode · **38.8 MB** | encode · **38.0 MB** |
-| VARIANT OTLP | 11.8 s · 85k · 53.5 MB (106) | 7.26 s · 138k · 54.5 MB (108) |
+| RawDuck | 1.01 s · 988k rec/s · 38.8 MB (110 MB file) | 1.41 s · 709k rec/s · 35.5 MB (71 MB file) |
+| VARIANT-flat | encode · 38.8 MB | encode · 38.0 MB |
+| VARIANT OTLP | 11.8 s · 85k · 53.5 MB (106 MB file) | 7.26 s · 138k · 54.5 MB (108 MB file) |
 | JSON-flat | encode · 142 MB | encode · 143 MB |
-| JSON OTLP | 4.75 s · 210k · 241 MB (484) | 4.76 s · 210k · 242 MB (484) |
-
-Packed RawDuck live size matches or **beats** VARIANT-flat on both hosts. Spark
-VARIANT OTLP ingest is faster than M3; RawDuck still leads (~5× on Spark, ~12× on M3).
+| JSON OTLP | 4.75 s · 210k · 241 MB (484 MB file) | 4.76 s · 210k · 242 MB (484 MB file) |
 
 ### Queries (best of 3, ms)
 
-| encoding | M3 Ultra errors / p99 / status | Spark GB10 errors / p99 / status |
+| encoding | M3 Ultra | Spark GB10 |
 |---|---|---|
-| RawDuck | **1.3 / 3.0 / 2.5** | **1.0 / 4.0 / 5.4** |
-| JSON-flat (`->>`) | 39 / 97 / 35 | 51 / 133 / 47 |
-| JSON OTLP pos | 222 / 313 / 201 | 278 / 365 / 246 |
-| JSON OTLP kv | 361 / 436 / 322 | 445 / 526 / 400 |
+| | errors / p99 / status | errors / p99 / status |
+| RawDuck | 1.3 / 3.0 / 2.5 | 1.0 / 4.0 / 5.4 |
+| JSON-flat | 39 / 97 / 35 | 51 / 133 / 47 |
+| JSON OTLP positional | 222 / 313 / 201 | 278 / 365 / 246 |
+| JSON OTLP key lookup | 361 / 436 / 322 | 445 / 526 / 400 |
 | VARIANT-flat | 430 / 1264 / 425 | 784 / 2160 / 762 |
-| VARIANT OTLP pos | 1224 / 3483 / 1161 | 2268 / 6716 / 2175 |
-| VARIANT OTLP kv | 1506 / 3725 / 1405 | 2775 / 6984 / 2438 |
+| VARIANT OTLP positional | 1224 / 3483 / 1161 | 2268 / 6716 / 2175 |
+| VARIANT OTLP key lookup | 1506 / 3725 / 1405 | 2775 / 6984 / 2438 |
 
-### Who is good at what (v1.5.5)
-
-- **RawDuck** wins ingest and every query on both hosts. Typed columns stay in
-  the low-ms club (1–5 ms).
-- **Storage ties or beats VARIANT-flat** (35.5–38.8 MB). VARIANT was never a
-  better codec — same `DICT_FSST` / `BitPacking` after shredding. JSON-flat is
-  ~4× larger; OTLP KeyValue shape is larger still.
-- **VARIANT extract is slower than JSON `->>`** on the same shredded object
-  (hundreds of ms vs tens). v2.0 shredded execution is not in this pin.
-- **OTLP KeyValue arrays at query time lose** (~500–7000× vs typed columns).
-  Flatten once at ingest.
-- **CUDA unused** — DuckDB is CPU-only; pin `--threads` on many-core ARM.
-- **Envelope VARIANT** stays off the default path (fat export shred can be
-  extremely slow; not needed for the fair compare).
-
-Commits: M3 Ultra `8cf4bf3`; Spark `e88c6a7`+ (CLI stdin fix). 100k Spark
-smoke matched this ranking before the 1M run.
+### Reproduce
 
 ```sh
-git checkout feat/variant-benchmark
 GEN=ninja make release
 ./scripts/benchmark/run_variant.sh --quick
 ./scripts/benchmark/run_variant.sh --records 1000000 --runs 3
-# many-core ARM / oversubscribed hosts (DuckDB is CPU-only; CUDA does not apply):
 ./scripts/benchmark/run_variant.sh --records 1000000 --runs 3 --threads 8
 ```
 
-Methodology: `scripts/benchmark/README.md`.
+Harness details: `scripts/benchmark/README.md`.
 
 ## Appendix: GH Archive (historical, wide-schema stress test)
 
-One hour of real [GH Archive](https://www.gharchive.org/) data — 247,199 events / 956 MB NDJSON
-exploding to a **914-column** schema. This is the worst case for shredding (extreme, sparse schema
-churn), kept as a stress test rather than the representative workload.
-
-Published results (Apple Silicon, 10 cores, DuckDB v1.5.5):
+One hour of [GH Archive](https://www.gharchive.org/) data — 247,199 events / 956 MB NDJSON /
+**914 columns**. Apple Silicon, 10 cores, DuckDB v1.5.5:
 
 | | JSON column | RawDuck | |
 |---|---:|---:|---|
@@ -222,37 +194,27 @@ SELECT date_trunc('minute', CAST(json->>'$.created_at' AS TIMESTAMP)) AS m, coun
 
 ### Warm-table ingest
 
-The cold GH numbers include schema discovery (CREATE + evolution sync points). Re-ingesting the same
-hour into the already-evolved table runs fully parallel: **~4.9 s** — the steady-state rate once a
-table's shape has stabilized (the realistic OTEL case, where the schema is stable after warmup).
+Re-ingest into the evolved table: **~4.9 s**.
 
-### INSERT-syntax streaming (fastest path)
-
-`INSERT INTO raw.ingest.t SELECT ...` streams any SQL source through a parallel zero-copy sink:
+### INSERT-syntax streaming
 
 ```sql
 ATTACH 'rawduck:store.db' AS raw;
 INSERT INTO raw.ingest.narrow SELECT '{"a":' || range || '}' FROM range(5000000);
--- 5M narrow rows in ~0.8 s  (~6.1M rows/s)
+-- 5M narrow rows in ~0.8 s (~6.1M rows/s)
 ```
 
 ### Adaptive layout and projections
 
 ```sql
 CALL raw_stats();
-CALL raw_optimize('gh_events');     -- physically reorders by hottest columns
-CALL raw_project('gh_events');      -- materializes the hottest aggregation
-SET rawduck_use_projections = true; -- transparent rewrite of eligible count(*) queries
+CALL raw_optimize('gh_events');
+CALL raw_project('gh_events');
+SET rawduck_use_projections = true;
 ```
 
 ## Pitfalls
 
-- Don't split NDJSON with Python's `splitlines()` — it splits on `\u2028`/`\u2029` which appear raw
-  inside real-world strings and corrupts records. Split on `\n` only.
-- The shell reports query times with `.timer on`; dot-commands don't work via `duckdb -c`, use
-  `-f script.sql`.
-- A shallow duckdb submodule clone without tags makes the shell report `v0.0.1`; fetch the release
-  tag (`git -C duckdb fetch --depth 1 origin tag v1.5.5`) or extension installs 404.
-- For large imports where each line is a fat container (OTLP envelopes, CloudWatch log groups), the
-  loader auto-parallelizes via byte-aware batching; you only need `batch_size` to *raise* the line
-  cap for very small flat records.
+- Split NDJSON on `\n` only (not `splitlines()` — `\u2028`/`\u2029` appear in strings).
+- Use `.timer on` via `duckdb -f script.sql` (not `duckdb -c`).
+- Shallow duckdb clones without tags report `v0.0.1`; fetch tag `v1.5.5`.

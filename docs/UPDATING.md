@@ -4,12 +4,17 @@ will inevitably come a time when a new DuckDB is released and the extension repo
 as follows:
 
 - Bump submodules
-  - `./duckdb` should be set to latest tagged release
-  - `./extension-ci-tools` should be set to updated branch corresponding to latest DuckDB release. So if you're building for DuckDB `v1.1.0` there will be a branch in `extension-ci-tools` named `v1.1.0` to which you should check out. 
+  - `./duckdb` should be set to latest tagged release (currently `v1.5.5`)
+  - `./extension-ci-tools` should be set to the matching branch tip. Prefer the
+    exact patch branch (`v1.5.5`) when it exists; otherwise the line branch
+    (`v1.5-variegata`). Keep the submodule SHA in sync with that tip.
 - Bump versions in `./github/workflows`
-  - `duckdb_version` input in `duckdb-stable-build` job in `MainDistributionPipeline.yml` should be set to latest tagged release
-  - `duckdb_version` input in `duckdb-stable-deploy` job in `MainDistributionPipeline.yml` should be set to latest tagged release
-  - the reusable workflow `duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml` for the `duckdb-stable-build` job should be set to latest tagged release
+  - `duckdb_version` / `ci_tools_version` in `MainDistributionPipeline.yml`,
+    `Release.yml`, and `QuackIntegration.yml` should be the latest tagged release
+  - the reusable workflow refs
+    (`duckdb/extension-ci-tools/.github/workflows/_extension_*.yml@…`) should use
+    the same tag/branch (e.g. `@v1.5.5`), not a moving alias unless intentional
+  - `DUCKDB_VERSION` in `Release.yml` must match (GitHub Pages path + CLI download)
 
 # API changes
 DuckDB extensions built with this extension template are built against the internal C++ API of DuckDB. This API is not guaranteed to be stable.

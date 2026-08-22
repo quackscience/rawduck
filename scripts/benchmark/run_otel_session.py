@@ -12,6 +12,7 @@ Warm must report columns_added=0 and columns_widened=0 or the session fails.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -19,6 +20,13 @@ import time
 
 def escape_sql_path(path: str) -> str:
     return path.replace("'", "''")
+
+
+# DuckDB 1.5 CLI: skip terminal color / highlight probes on piped stdin (Linux stalls).
+_DUCKDB_ENV = {
+    **os.environ,
+    "DUCKDB_NO_HIGHLIGHT": "1",
+}
 
 
 def _read_until_done(stdout) -> list[str]:
@@ -38,7 +46,10 @@ def _read_until_done(stdout) -> list[str]:
 
 def _exec(proc: subprocess.Popen, sql: str) -> list[str]:
     assert proc.stdin is not None and proc.stdout is not None
-    proc.stdin.write((sql.rstrip() + "\nSELECT '__bench_done__';\n").encode())
+    body = sql.rstrip()
+    if not body.endswith(";"):
+        body += ";"
+    proc.stdin.write((body + "\nSELECT '__bench_done__';\n").encode())
     proc.stdin.flush()
     return _read_until_done(proc.stdout)
 
@@ -65,10 +76,13 @@ def run_session(
     ext_sql = escape_sql_path(ext)
 
     proc = subprocess.Popen(
-        [duckdb, db_path, "-unsigned", "-batch", "-csv", "-noheader"],
+        # -dark-mode: skip OSC-11 /dev/tty color probe (DuckDB 1.5 CLI stall on Linux pipes)
+        [duckdb, db_path, "-unsigned", "-batch", "-csv", "-noheader", "-dark-mode"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=_DUCKDB_ENV,
+        bufsize=0,
     )
     assert proc.stdin is not None and proc.stdout is not None
 

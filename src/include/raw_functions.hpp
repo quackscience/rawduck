@@ -38,6 +38,17 @@ struct RawIngestStats {
 };
 RawIngestStats RawIngestPayload(ClientContext &context, const string &target, const string &payload,
                                 const RawParseOptions &options);
+// Ingest a payload that's already been parsed (RawParsedPayload::Process).
+// Lets a caller retry just the catalog/append step — e.g. after a concurrent
+// CREATE/ALTER conflict — without re-parsing and re-shredding the same bytes
+// on every attempt.
+RawIngestStats RawIngestParsedPayload(ClientContext &context, const string &target, shared_ptr<RawParsedPayload> parsed,
+                                      const string &payload, const RawParseOptions &options);
+// HTTP/programmatic ingest entry point: manages conn's transaction itself
+// and serializes a table's first-ever insert against concurrent racers
+// (see RawTableCreationCache in raw_ingest.cpp) instead of retrying blind.
+RawIngestStats RawIngestSerialized(Connection &conn, const string &target, shared_ptr<RawParsedPayload> parsed,
+                                   const string &payload, const RawParseOptions &options);
 
 TableFunction GetRawServeFunction();
 TableFunction GetRawServeStopFunction();

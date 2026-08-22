@@ -11,9 +11,11 @@ real typed columns at ingest (one-time cost) so every query runs at native colum
 instead of storing opaque JSON strings and paying `->>` extraction on every scan (45–265× slower,
 see BENCHMARK.md).
 
-Pinned to DuckDB **v1.5.5**: the `duckdb/` submodule commit and the versions in
-`.github/workflows/MainDistributionPipeline.yml` must stay in sync. Build with `GEN=ninja make
-release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; format with
+Pinned to DuckDB **v1.5.5** (latest stable as of this pin): the `duckdb/` submodule
+tag, `extension-ci-tools` on the matching `v1.5.5` tip, and `duckdb_version` /
+`ci_tools_version` in `.github/workflows/{MainDistributionPipeline,Release,QuackIntegration}.yml`
+must stay in sync. Build with `GEN=ninja make release`; test with
+`./build/release/test/unittest --test-dir . "test/sql/*"`; format with
 `make format-fix` (CI enforces it).
 
 ## Source map (src/)
@@ -133,6 +135,8 @@ sqllogictests in `test/sql/`: `rawduck.test` (core types/records), `raw_ingest.t
 (stores, transactions, persistence), `raw_api.test` (server lifecycle), `ducklake.test` (`require ducklake`, skips when absent).
 OTEL ingest performance: `./scripts/benchmark/run_otel.sh` + `./scripts/benchmark/compare.sh`
 (see `scripts/benchmark/README.md` and `BENCHMARK.md`).
+VARIANT vs RawDuck (v1.5.5, traces): `./scripts/benchmark/run_variant.sh` on branch
+`feat/variant-benchmark`.
 Every feature needs: happy path, evolution interaction, error case, and—for anything that can
 return wrong data—a proof test (e.g. tampering with a projection to prove the rewrite engaged).
 `raw_ingest` output is `(table, created, columns_added, columns_widened, rows, errors)`;

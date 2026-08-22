@@ -21,10 +21,10 @@ concurrency:
 jobs:
   quack-integration:
     name: rawduck:quack (linux_amd64)
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
     with:
       duckdb_version: v1.5.5
-      ci_tools_version: v1.5-variegata
+      ci_tools_version: v1.5.5
       extension_name: rawduck
       opt_in_archs: 'linux_amd64'
       use_merged_vcpkg_manifest: '1'

@@ -93,8 +93,50 @@ python3 scripts/benchmark/gen_otlp.py traces 1000000 benchmark/data 170008640000
 | `run_otel.sh` | Orchestrator: data gen, N sessions, JSON output (bash) |
 | `compare.sh` | Regression gate vs `baseline-otel.json` (bash) |
 | `run_variant.sh` / `run_variant.py` | VARIANT (DuckDB v1.5) vs RawDuck ingest + query + storage |
+| `run_otel_streaming.sh` / `.py` / `otel_gen_load.py` | Real OTLP/HTTP streaming ingestion via the actual OpenTelemetry SDK (see below) |
 
 Requires: bash, python3, a release build (`build/release/duckdb` + extension).
+
+## Realistic OTEL streaming ingestion (`run_otel_streaming.sh`)
+
+`run_otel.sh` and `run_variant.sh` both bulk-load one big NDJSON file — useful
+for measuring the shredding/ingest engine in isolation, but not how OTEL data
+actually arrives. This benchmark instead drives real traffic through
+`raw_serve()`'s HTTP OTLP endpoint using the **actual OpenTelemetry Python
+SDK** (`TracerProvider` + `BatchSpanProcessor` + `OTLPSpanExporter`, real
+protobuf wire format — not RawDuck's own NDJSON generator), from multiple
+concurrent *processes* (sidesteps Python's GIL, models multiple
+services/collectors exporting to the same collector hub concurrently).
+
+```sh
+GEN=ninja make release
+./scripts/benchmark/run_otel_streaming.sh --quick                              # smoke: 4 workers x 5k spans
+./scripts/benchmark/run_otel_streaming.sh --workers 16 --spans-per-worker 60000 # ~180k spans/sec on a 20-core arm64 box
+```
+
+First run creates a dedicated venv (`benchmark/work/otel-streaming-venv`) with
+the OpenTelemetry SDK — a plain system-wide `pip install` is refused on
+externally-managed Python installs (PEP 668), so this is required, not
+optional. Reports `spans_per_sec`, `rows_ingested` (checked against
+`total_spans_sent` — any mismatch is a real bug, not a benchmark artifact),
+and writes JSON to `benchmark/results/`.
+
+This benchmark caught a real concurrency bug: multiple exporter processes
+racing to `INSERT` into a table that doesn't exist yet each open their own
+transaction, and DuckDB's catalog allows only one of them to `CREATE TABLE`
+— the rest saw a `TransactionException` ("write-write conflict") surfaced as
+an HTTP 400, which OTLP exporters correctly do not retry (4xx = client
+error), silently dropping that batch. A blind bounded retry closed most of
+the gap but re-parsed the whole payload on every attempt — under a big
+enough pile-up (16-way concurrent cold start) that pushed request latency
+past clients' own read timeouts instead. Fixed properly with
+`RawIngestSerialized` (`raw_ingest.cpp`): a table's first-ever insert in this
+process queues behind an in-process lock instead of racing at all, while
+every request afterward (the steady-state case) never touches the lock —
+just a cached membership check. 30/30 clean in stress testing at 16-way
+concurrency, no throughput change. Regression-tested in
+`test/http/raw_api_compat.sh`'s "concurrent create" section (fires 8
+concurrent requests at a brand-new table).
 
 ## VARIANT vs RawDuck (branch `feat/variant-benchmark`)
 

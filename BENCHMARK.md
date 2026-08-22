@@ -158,22 +158,44 @@ CHECKPOINT instead of a parallel optimistic flush that left holes.
 - **Envelope VARIANT** stays off the default path (fat export shred can be
   extremely slow on Linux aarch64; not needed for the fair compare).
 
-### Cross-check: NVIDIA Spark GB10 (Linux aarch64, 100k)
+### Cross-check: NVIDIA Spark GB10 (Linux aarch64, 1M records)
 
-Same harness after the CLI stdin fix (`e88c6a7`, `--threads 8`). Confirms the
-ranking holds off Apple Silicon — idle hang is gone; DuckDB is CPU-only (CUDA
-unused).
+Same harness, full 1,000,000-record scale (matching the M3 Ultra run above),
+20-core heterogeneous host (10× Cortex-X925 + 10× Cortex-A725), after the row
+extraction hot-path fix (schema-tree child lookup: hash+allocation per JSON
+key replaced with an allocation-free linear scan for the common case of ≤24
+children — real-world OTLP/telemetry schemas overwhelmingly qualify) and the
+batch-reader copy-avoidance fix. Confirms the ranking holds off Apple Silicon
+on a different core architecture entirely — DuckDB is CPU-only (CUDA unused).
 
-| path | ingest | live disk | errors / p99 / status (ms) |
-|---|---:|---:|---|
-| RawDuck | 0.31 s (325k rec/s) | **4.0 MB** | **1.0 / 1.6 / 3.6** |
-| VARIANT-flat | encode | **4.0 MB** | 389 / 1112 / 372 |
-| VARIANT OTLP | 1.72 s (58k) | 6.0 MB | 1271–3894 |
-| JSON OTLP | 1.17 s (85k) | 24.5 MB | 121–290 |
-| JSON-flat | encode | 14.5 MB | 33 / 72 / 30 |
+| path | ingest | records/s | live disk | file after warm |
+|---|---:|---:|---:|---:|
+| RawDuck | 1.18 s | 850k | **35.5 MB** | 91.0 MB |
+| VARIANT of shredded rows | encode | — | **39.5 MB** | — |
+| VARIANT exploded OTLP | 7.96 s | 126k | 54.5 MB | 113.8 MB |
+| JSON of shredded rows | encode | — | 141.8 MB | — |
+| JSON exploded OTLP | 5.71 s | 175k | 241.5 MB | 484.0 MB |
 
-Same story: storage ties VARIANT-flat; typed columns win every query (~30–1000×);
-VARIANT extract still slower than JSON `->>` on identical keys.
+| encoding | errors by service | p99 by route | status dist | vs RawDuck |
+|---|---:|---:|---:|---|
+| RawDuck typed columns | **1.3** | **4.9** | **5.1** | — |
+| JSON flat (`->>`) | 64.9 | 135.5 | 62.6 | 12–50× |
+| JSON OTLP positional | 252.8 | 415.3 | 215.3 | 44–194× |
+| JSON OTLP key lookup | 396.9 | 580.1 | 366.3 | 72–305× |
+| VARIANT flat (same keys) | 699.6 | 1987.7 | 696.2 | 136–538× |
+| VARIANT OTLP positional | 2013.1 | 5946.8 | 1852.0 | 364–1549× |
+| VARIANT OTLP key lookup | 2107.0 | 5996.1 | 2049.2 | 402–1621× |
+
+Same story as M3 Ultra, same order of magnitude on every ratio: storage ties
+VARIANT-flat; typed columns win every query; VARIANT extract stays slower
+than JSON `->>` on identical keys. RawDuck's ingest edge over JSON-exploded
+matches M3 almost exactly (4.9× vs 4.7×); the edge over VARIANT-exploded is
+smaller here (6.8× vs 11.6× on M3) — plausibly less headroom for RawDuck's
+multi-threaded parse/append pipeline on 20 cores vs 32, not a regression
+(the VARIANT/JSON paths are DuckDB-native code, untouched by the fixes above).
+
+git=`4ceecc9` + row-routing fix + batch-reader fix, host=spark-ams01,
+cpu=aarch64 (Cortex-X925/A725), cores=20, ram=121.7 GiB.
 
 ```sh
 git checkout feat/variant-benchmark

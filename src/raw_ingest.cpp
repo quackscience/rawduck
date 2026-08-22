@@ -273,8 +273,7 @@ public:
 			worker.local_types = types;
 			worker.local_slots = slots;
 			worker.writer = make_uniq<OptimisticDataWriter>(context, storage);
-			auto collection = worker.writer->CreateCollection(storage, types,
-			                                                   OptimisticWritePartialManagers::GLOBAL);
+			auto collection = worker.writer->CreateCollection(storage, types, OptimisticWritePartialManagers::GLOBAL);
 			collection->collection->InitializeEmpty();
 			worker.append_state = make_uniq<TableAppendState>();
 			collection->collection->InitializeAppend(*worker.append_state);
@@ -1244,9 +1243,8 @@ RawIngestStats RawIngestPayload(ClientContext &context, const string &target, co
 // already-parsed payload across attempts instead of re-parsing and
 // re-shredding the same bytes every time — parsing isn't what conflicts,
 // only the catalog step is.
-RawIngestStats RawIngestParsedPayload(ClientContext &context, const string &target,
-                                      shared_ptr<RawParsedPayload> parsed, const string &payload,
-                                      const RawParseOptions &options) {
+RawIngestStats RawIngestParsedPayload(ClientContext &context, const string &target, shared_ptr<RawParsedPayload> parsed,
+                                      const string &payload, const RawParseOptions &options) {
 	RawIngestor ingestor(context, target, options);
 	ingestor.IngestParsed(std::move(parsed), payload);
 	ingestor.Finish();
@@ -1267,8 +1265,8 @@ RawIngestStats RawIngestParsedPayload(ClientContext &context, const string &targ
 // requests simultaneously discovering the same new column).
 RawIngestStats RawIngestSerialized(Connection &conn, const string &target, shared_ptr<RawParsedPayload> parsed,
                                    const string &payload, const RawParseOptions &options) {
-	auto &cache =
-	    *ObjectCache::GetObjectCache(*conn.context).GetOrCreate<RawTableCreationCache>(RawTableCreationCache::ObjectType());
+	auto &cache = *ObjectCache::GetObjectCache(*conn.context)
+	                   .GetOrCreate<RawTableCreationCache>(RawTableCreationCache::ObjectType());
 	auto known_to_exist = [&]() {
 		lock_guard<mutex> guard(cache.lock);
 		return cache.known_to_exist.count(target) > 0;

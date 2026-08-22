@@ -148,15 +148,15 @@ private:
 			return 0;
 		}
 		Connection conn(*db_locked);
-		conn.BeginTransaction();
+		RawBeginTransaction(*conn.context);
 		idx_t flushed = 0;
 		try {
 			for (auto &payload : buffer.payloads) {
 				flushed += RawIngestPayload(*conn.context, target, payload.first, payload.second).rows;
 			}
-			conn.Commit();
+			RawCommitTransaction(*conn.context);
 		} catch (...) {
-			conn.Rollback();
+			RawRollbackTransaction(*conn.context);
 			// fire-and-forget semantics: the batch is dropped, like
 			// ClickHouse async inserts without wait_for_async_insert
 			return 0;

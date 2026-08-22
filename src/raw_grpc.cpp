@@ -110,18 +110,18 @@ grpc::Status ExportSignal(const grpc::ServerContext &context, const google::prot
 		RawAsyncEnqueue(*conn.context, table, payload, parse_options);
 		return grpc::Status::OK;
 	}
-	conn.BeginTransaction();
+	RawBeginTransaction(*conn.context);
 	try {
 		auto parse_options = ResolveTransform(*conn.context, "otlp-" + signal, "");
 		auto stats = RawIngestPayload(*conn.context, table, payload, parse_options);
-		conn.Commit();
+		RawCommitTransaction(*conn.context);
 		rejected = stats.errors;
 		if (rejected > 0) {
 			error_message = "some records could not be parsed";
 		}
 		return grpc::Status::OK;
 	} catch (std::exception &ex) {
-		conn.Rollback();
+		RawRollbackTransaction(*conn.context);
 		return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, ErrorData(ex).RawMessage());
 	}
 }

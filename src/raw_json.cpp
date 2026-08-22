@@ -24,6 +24,13 @@ static constexpr idx_t RAW_MAX_COLUMNS = 10000;
 // of risking stack exhaustion on hostile inputs
 static constexpr idx_t RAW_MAX_NESTING = 128;
 static constexpr auto RAW_READ_FLAGS = duckdb_yyjson::YYJSON_READ_ALLOW_INF_AND_NAN;
+// Below this fanout, a linear scan over `children` beats `child_lookup`: no
+// temporary std::string, no hashing, and the scan stays within a couple of
+// cache lines. Real-world objects (OTLP resource/span attrs, log records)
+// overwhelmingly fall under this; wide flat schemas (GH Archive-style) still
+// fall back to the hash map so a single object with hundreds of keys stays
+// O(1) per lookup instead of O(n).
+static constexpr idx_t RAW_CHILD_LINEAR_SCAN_LIMIT = 24;
 
 //===--------------------------------------------------------------------===//
 // Payload parsing
@@ -32,6 +39,12 @@ static constexpr auto RAW_READ_FLAGS = duckdb_yyjson::YYJSON_READ_ALLOW_INF_AND_
 RawPayload::~RawPayload() {
 	for (auto doc : docs) {
 		duckdb_yyjson::yyjson_doc_free(doc);
+	}
+	// must run after the doc frees above: those write into their pool
+	// buffer's own free-list metadata (pool_free()), so a buffer can only be
+	// released once every doc allocated from it has been freed.
+	for (auto buffer : pool_buffers) {
+		free(buffer);
 	}
 }
 
@@ -61,8 +74,51 @@ static void CheckRowUniformity(const vector<yyjson_val *> &rows, bool &scalar_ro
 	scalar_rows = !rows.empty() && object_rows == 0;
 }
 
+// One malloc for the whole payload instead of one per yyjson_read call
+// (the common NDJSON case: one call per line). Sized via yyjson's own
+// worst-case estimator, which is linear in input length, so estimating once
+// for the whole payload safely covers the sum of however it's split into
+// documents. Returns nullptr (use the default allocator) on overflow or if
+// the single malloc fails — pooling is purely opportunistic, never required.
+static void *RawInitReadPool(const string &payload, duckdb_yyjson::yyjson_alc &pool_alc) {
+	if (payload.empty()) {
+		return nullptr;
+	}
+	auto pool_size = duckdb_yyjson::yyjson_read_max_memory_usage(payload.size(), RAW_READ_FLAGS);
+	if (pool_size == 0) {
+		return nullptr;
+	}
+	auto buffer = malloc(pool_size);
+	if (!buffer) {
+		return nullptr;
+	}
+	if (!duckdb_yyjson::yyjson_alc_pool_init(&pool_alc, buffer, pool_size)) {
+		free(buffer);
+		return nullptr;
+	}
+	return buffer;
+}
+
+// Falls back to the default allocator if the pool is exhausted (a sizing
+// edge case, not expected in practice) so pooling can never turn a payload
+// that would otherwise parse successfully into a parse error.
+static duckdb_yyjson::yyjson_doc *RawPoolRead(const char *data, size_t len, const duckdb_yyjson::yyjson_alc *alc) {
+	auto doc = duckdb_yyjson::yyjson_read_opts(const_cast<char *>(data), len, RAW_READ_FLAGS, alc, nullptr);
+	if (!doc && alc) {
+		doc = duckdb_yyjson::yyjson_read_opts(const_cast<char *>(data), len, RAW_READ_FLAGS, nullptr, nullptr);
+	}
+	return doc;
+}
+
 void RawPayload::Parse(const string &payload, const RawParseOptions &options) {
-	auto doc = duckdb_yyjson::yyjson_read(payload.c_str(), payload.size(), RAW_READ_FLAGS);
+	duckdb_yyjson::yyjson_alc pool_alc;
+	auto pool_buffer = RawInitReadPool(payload, pool_alc);
+	if (pool_buffer) {
+		pool_buffers.push_back(pool_buffer);
+	}
+	auto alc = pool_buffer ? &pool_alc : nullptr;
+
+	auto doc = RawPoolRead(payload.c_str(), payload.size(), alc);
 	if (doc) {
 		docs.push_back(doc);
 		CollectRows(duckdb_yyjson::yyjson_doc_get_root(doc), rows);
@@ -90,7 +146,7 @@ void RawPayload::Parse(const string &payload, const RawParseOptions &options) {
 			if (blank) {
 				continue;
 			}
-			auto line_doc = duckdb_yyjson::yyjson_read(line_begin, line_len, RAW_READ_FLAGS);
+			auto line_doc = RawPoolRead(line_begin, line_len, alc);
 			if (!line_doc) {
 				if (options.ignore_errors) {
 					parse_errors++;
@@ -329,17 +385,31 @@ static duckdb_yyjson::yyjson_mut_val *OtlpUnwrapAnyValue(duckdb_yyjson::yyjson_m
 	return nullptr;
 }
 
+// Objects rebuilt per row (merged span rows, nested "status" etc.) almost
+// always fit this inline capacity: only a pathologically wide object spills
+// to the heap. Avoids a malloc/free per object per row on the OTLP path.
+static constexpr idx_t OTLP_NORMALIZE_INLINE_MEMBERS = 32;
+
 static void OtlpNormalizeObject(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjson_mut_val *object,
                                 idx_t depth) {
+	using MemberPair = pair<duckdb_yyjson::yyjson_mut_val *, duckdb_yyjson::yyjson_mut_val *>;
 	// rebuild members so attribute lists can spread into the parent
-	vector<pair<duckdb_yyjson::yyjson_mut_val *, duckdb_yyjson::yyjson_mut_val *>> members;
+	MemberPair inline_members[OTLP_NORMALIZE_INLINE_MEMBERS];
+	idx_t inline_count = 0;
+	vector<MemberPair> overflow_members;
 	duckdb_yyjson::yyjson_mut_obj_iter iter;
 	duckdb_yyjson::yyjson_mut_obj_iter_init(object, &iter);
 	while (auto key = duckdb_yyjson::yyjson_mut_obj_iter_next(&iter)) {
-		members.emplace_back(key, duckdb_yyjson::yyjson_mut_obj_iter_get_val(key));
+		auto value = duckdb_yyjson::yyjson_mut_obj_iter_get_val(key);
+		if (inline_count < OTLP_NORMALIZE_INLINE_MEMBERS) {
+			inline_members[inline_count++] = MemberPair(key, value);
+		} else {
+			overflow_members.emplace_back(key, value);
+		}
 	}
 	duckdb_yyjson::yyjson_mut_obj_clear(object);
-	for (auto &member : members) {
+
+	auto process_member = [&](const MemberPair &member) {
 		auto key_str = duckdb_yyjson::yyjson_mut_get_str(member.first);
 		auto key_len = duckdb_yyjson::yyjson_mut_get_len(member.first);
 		if (key_len == 10 && memcmp(key_str, "attributes", 10) == 0 && OtlpIsKeyValueArray(member.second)) {
@@ -358,12 +428,18 @@ static void OtlpNormalizeObject(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjso
 					duckdb_yyjson::yyjson_mut_obj_add(object, name, normalized);
 				}
 			}
-			continue;
+			return;
 		}
 		auto normalized = OtlpNormalizeValue(doc, member.second, key_str, key_len, depth + 1);
 		if (!duckdb_yyjson::yyjson_mut_obj_getn(object, key_str, key_len)) {
 			duckdb_yyjson::yyjson_mut_obj_add(object, member.first, normalized ? normalized : member.second);
 		}
+	};
+	for (idx_t i = 0; i < inline_count; i++) {
+		process_member(inline_members[i]);
+	}
+	for (auto &member : overflow_members) {
+		process_member(member);
 	}
 }
 
@@ -553,13 +629,29 @@ RawParseOptions RawExplodeOptions(const string &path) {
 // Inference
 //===--------------------------------------------------------------------===//
 
-RawNode &RawNode::GetOrCreateChild(const string &key) {
-	auto entry = child_lookup.find(key);
-	if (entry != child_lookup.end()) {
-		return *children[entry->second].second;
+const RawNode *RawNode::FindChild(const char *key, idx_t key_len) const {
+	if (children.size() <= RAW_CHILD_LINEAR_SCAN_LIMIT) {
+		for (auto &entry : children) {
+			auto &name = entry.first;
+			if (name.size() == key_len && memcmp(name.data(), key, key_len) == 0) {
+				return entry.second.get();
+			}
+		}
+		return nullptr;
 	}
-	child_lookup[key] = children.size();
-	children.emplace_back(key, make_uniq<RawNode>());
+	auto entry = child_lookup.find(string(key, key_len));
+	return entry == child_lookup.end() ? nullptr : children[entry->second].second.get();
+}
+
+RawNode &RawNode::GetOrCreateChild(const char *key, idx_t key_len) {
+	if (auto existing = FindChild(key, key_len)) {
+		return *const_cast<RawNode *>(existing);
+	}
+	string key_str(key, key_len);
+	// keep child_lookup populated from the start so it's already correct once
+	// fanout crosses the linear-scan threshold and FindChild starts using it.
+	child_lookup[key_str] = children.size();
+	children.emplace_back(std::move(key_str), make_uniq<RawNode>());
 	return *children.back().second;
 }
 
@@ -662,8 +754,9 @@ static void MergeValueInternal(RawNode &node, yyjson_val *val, idx_t depth) {
 		duckdb_yyjson::yyjson_obj_iter_init(val, &iter);
 		while (auto key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
 			auto child_val = duckdb_yyjson::yyjson_obj_iter_get_val(key);
-			auto key_str = string(duckdb_yyjson::yyjson_get_str(key), duckdb_yyjson::yyjson_get_len(key));
-			MergeValueInternal(node.GetOrCreateChild(key_str), child_val, depth + 1);
+			MergeValueInternal(
+			    node.GetOrCreateChild(duckdb_yyjson::yyjson_get_str(key), duckdb_yyjson::yyjson_get_len(key)),
+			    child_val, depth + 1);
 		}
 		return;
 	}
@@ -851,12 +944,11 @@ void RawExtractor::Traverse(yyjson_val *val, const RawNode &node, idx_t row_idx)
 	yyjson_obj_iter iter;
 	duckdb_yyjson::yyjson_obj_iter_init(val, &iter);
 	while (auto key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
-		auto entry =
-		    node.child_lookup.find(string(duckdb_yyjson::yyjson_get_str(key), duckdb_yyjson::yyjson_get_len(key)));
-		if (entry == node.child_lookup.end()) {
+		auto child = node.FindChild(duckdb_yyjson::yyjson_get_str(key), duckdb_yyjson::yyjson_get_len(key));
+		if (!child) {
 			continue;
 		}
-		Traverse(duckdb_yyjson::yyjson_obj_iter_get_val(key), *node.children[entry->second].second, row_idx);
+		Traverse(duckdb_yyjson::yyjson_obj_iter_get_val(key), *child, row_idx);
 	}
 }
 

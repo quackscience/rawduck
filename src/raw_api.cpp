@@ -259,12 +259,11 @@ void HandleIngest(const duckdb_httplib::Request &req, duckdb_httplib::Response &
 			return;
 		}
 	}
-	conn.BeginTransaction();
 	try {
 		auto options = otlp_signal.empty() ? RequestParseOptions(*conn.context, req, body)
 		                                   : ResolveTransform(*conn.context, "otlp-" + otlp_signal, "");
-		auto stats = RawIngestPayload(*conn.context, table, body, options);
-		conn.Commit();
+		auto parsed = RawParsedPayload::Process(body, options);
+		auto stats = RawIngestSerialized(conn, table, std::move(parsed), body, options);
 		JsonDoc json;
 		auto root = duckdb_yyjson::yyjson_mut_obj(json.doc);
 		if (!otlp_signal.empty()) {
@@ -322,10 +321,9 @@ void HandleOtlpProtobuf(const duckdb_httplib::Request &req, duckdb_httplib::Resp
 		res.set_content(RawOtlpProtobufResponse(signal, 0, ""), "application/x-protobuf");
 		return;
 	}
-	conn.BeginTransaction();
 	try {
-		auto stats = RawIngestPayload(*conn.context, table, payload, options);
-		conn.Commit();
+		auto parsed = RawParsedPayload::Process(payload, options);
+		auto stats = RawIngestSerialized(conn, table, std::move(parsed), payload, options);
 		res.status = 200;
 		res.set_content(
 		    RawOtlpProtobufResponse(signal, stats.errors, stats.errors ? "some records could not be parsed" : ""),

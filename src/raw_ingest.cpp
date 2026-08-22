@@ -9,6 +9,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/enums/database_modification_type.hpp"
+#include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -68,6 +69,39 @@ public:
 	unordered_map<string, Entry> tables;
 };
 
+//===--------------------------------------------------------------------===//
+// Table-creation serialization: concurrent HTTP/programmatic requests each
+// open their own Connection/transaction. DuckDB's catalog allows only one
+// of them to CREATE a given table name — the rest see a TransactionException
+// ("write-write conflict") even though their payload is perfectly valid.
+// `known_to_exist` is the steady-state fast path (checked, never locked,
+// once a table has been seen): normal ingestion after a table's first-ever
+// insert never touches `creation_lock` at all. `creation_lock` is only
+// acquired for a table's *first* insert in this process, and held across
+// the whole attempt through commit — a losing racer's catalog lookup can't
+// see the winner's CREATE until that transaction actually commits, so
+// releasing any earlier would just move the race, not remove it. One
+// process-wide lock (not per-table): creating brand-new tables is rare and
+// one-time per table, so serializing unrelated tables' first inserts against
+// each other is an acceptable, simple tradeoff for never serializing
+// steady-state appends to already-existing tables.
+class RawTableCreationCache : public ObjectCacheEntry {
+public:
+	static string ObjectType() {
+		return "rawduck_table_creation";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx();
+	}
+
+	mutex lock;
+	case_insensitive_set_t known_to_exist;
+	mutex creation_lock;
+};
+
 static uint64_t HashPayloadShape(const vector<RawColumn> &columns) {
 	uint64_t shape = 0xcbf29ce484222325ULL;
 	for (auto &column : columns) {
@@ -87,6 +121,13 @@ static void MergeParsedPayloads(RawParsedPayload &into, RawParsedPayload &&from)
 	from.payload.docs.clear();
 	from.payload.rows.clear();
 	from.payload.parse_errors = 0;
+	// the moved docs' yyjson_alc still points at from's pool buffer(s): that
+	// ownership must move with them, or freeing `from` frees memory `into`'s
+	// docs still reference.
+	for (auto buffer : from.payload.pool_buffers) {
+		into.payload.pool_buffers.push_back(buffer);
+	}
+	from.payload.pool_buffers.clear();
 }
 
 //===--------------------------------------------------------------------===//
@@ -1195,8 +1236,19 @@ private:
 // the caller's active transaction.
 RawIngestStats RawIngestPayload(ClientContext &context, const string &target, const string &payload,
                                 const RawParseOptions &options) {
+	auto parsed = RawParsedPayload::Process(payload, options);
+	return RawIngestParsedPayload(context, target, std::move(parsed), payload, options);
+}
+
+// Split out of RawIngestPayload so a retrying caller can reuse the same
+// already-parsed payload across attempts instead of re-parsing and
+// re-shredding the same bytes every time — parsing isn't what conflicts,
+// only the catalog step is.
+RawIngestStats RawIngestParsedPayload(ClientContext &context, const string &target,
+                                      shared_ptr<RawParsedPayload> parsed, const string &payload,
+                                      const RawParseOptions &options) {
 	RawIngestor ingestor(context, target, options);
-	ingestor.Ingest(payload);
+	ingestor.IngestParsed(std::move(parsed), payload);
 	ingestor.Finish();
 	RawIngestStats stats;
 	stats.created = ingestor.created;
@@ -1204,6 +1256,52 @@ RawIngestStats RawIngestPayload(ClientContext &context, const string &target, co
 	stats.columns_widened = ingestor.columns_widened;
 	stats.rows = ingestor.rows;
 	stats.errors = ingestor.errors;
+	return stats;
+}
+
+// Entry point for the HTTP/programmatic ingest path: manages `conn`'s
+// transaction itself (a table's first insert must hold the creation lock
+// across the whole attempt through commit; see RawTableCreationCache) and
+// falls back to a single retry for the rarer conflict class the lock
+// doesn't cover — concurrent ALTER on an already-existing table (e.g. two
+// requests simultaneously discovering the same new column).
+RawIngestStats RawIngestSerialized(Connection &conn, const string &target, shared_ptr<RawParsedPayload> parsed,
+                                   const string &payload, const RawParseOptions &options) {
+	auto &cache =
+	    *ObjectCache::GetObjectCache(*conn.context).GetOrCreate<RawTableCreationCache>(RawTableCreationCache::ObjectType());
+	auto known_to_exist = [&]() {
+		lock_guard<mutex> guard(cache.lock);
+		return cache.known_to_exist.count(target) > 0;
+	};
+	auto mark_known = [&]() {
+		lock_guard<mutex> guard(cache.lock);
+		cache.known_to_exist.insert(target);
+	};
+
+	unique_lock<mutex> creation_guard(cache.creation_lock, std::defer_lock);
+	if (!known_to_exist()) {
+		creation_guard.lock();
+		if (known_to_exist()) {
+			// someone else created (and committed) it while we waited
+			creation_guard.unlock();
+		}
+	}
+
+	conn.BeginTransaction();
+	try {
+		auto stats = RawIngestParsedPayload(*conn.context, target, parsed, payload, options);
+		conn.Commit();
+		mark_known();
+		return stats;
+	} catch (TransactionException &) {
+		conn.Rollback();
+	}
+	// final attempt: no catch here. Any failure is left open for the
+	// caller's own catch/rollback, same as every other error path.
+	conn.BeginTransaction();
+	auto stats = RawIngestParsedPayload(*conn.context, target, parsed, payload, options);
+	conn.Commit();
+	mark_known();
 	return stats;
 }
 
@@ -1544,8 +1642,18 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 					for (idx_t line = 0; line < take; line++) {
 						split = pending.find('\n', split) + 1;
 					}
-					emit(pending.substr(0, split));
-					pending.erase(0, split);
+					// batches run several MB: copy the (small) unconsumed tail and move
+					// the (large) batch prefix out via resize-then-move, instead of
+					// copying the large prefix via substr on every batch boundary.
+					if (split >= pending.size()) {
+						emit(std::move(pending));
+						pending.clear();
+					} else {
+						string remainder(pending.data() + split, pending.size() - split);
+						pending.resize(split);
+						emit(std::move(pending));
+						pending = std::move(remainder);
+					}
 					pending_lines -= take;
 				}
 			}

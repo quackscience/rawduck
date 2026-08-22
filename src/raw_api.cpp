@@ -263,7 +263,7 @@ void HandleIngest(const duckdb_httplib::Request &req, duckdb_httplib::Response &
 		auto options = otlp_signal.empty() ? RequestParseOptions(*conn.context, req, body)
 		                                   : ResolveTransform(*conn.context, "otlp-" + otlp_signal, "");
 		auto parsed = RawParsedPayload::Process(body, options);
-		auto stats = RawIngestSerialized(conn, table, std::move(parsed), body, options);
+		auto stats = RawIngestGroupCommit(conn, table, std::move(parsed), body, options);
 		JsonDoc json;
 		auto root = duckdb_yyjson::yyjson_mut_obj(json.doc);
 		if (!otlp_signal.empty()) {
@@ -282,7 +282,10 @@ void HandleIngest(const duckdb_httplib::Request &req, duckdb_httplib::Response &
 		duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, root, "inserted", stats.rows);
 		Respond(res, 200, json, root);
 	} catch (std::exception &ex) {
-		conn.Rollback();
+		// no Rollback here: RawIngestGroupCommit already rolled back a
+		// failed batch on whichever request led it, and a waiter (or a
+		// parse failure before we ever got there) never opened a
+		// transaction on this connection to begin with.
 		RespondError(res, 400, ErrorData(ex).RawMessage());
 	}
 }
@@ -323,13 +326,13 @@ void HandleOtlpProtobuf(const duckdb_httplib::Request &req, duckdb_httplib::Resp
 	}
 	try {
 		auto parsed = RawParsedPayload::Process(payload, options);
-		auto stats = RawIngestSerialized(conn, table, std::move(parsed), payload, options);
+		auto stats = RawIngestGroupCommit(conn, table, std::move(parsed), payload, options);
 		res.status = 200;
 		res.set_content(
 		    RawOtlpProtobufResponse(signal, stats.errors, stats.errors ? "some records could not be parsed" : ""),
 		    "application/x-protobuf");
 	} catch (std::exception &ex) {
-		conn.Rollback();
+		// no Rollback here: see the equivalent comment in HandleIngest.
 		RespondOtlpStatus(res, 400, ErrorData(ex).RawMessage());
 	}
 }

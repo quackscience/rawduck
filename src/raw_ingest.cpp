@@ -16,6 +16,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/valid_checker.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -35,6 +36,7 @@
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <thread>
@@ -101,6 +103,111 @@ public:
 	case_insensitive_set_t known_to_exist;
 	mutex creation_lock;
 };
+
+//===--------------------------------------------------------------------===//
+// Group commit: coalesces concurrent HTTP/programmatic requests to the same
+// table into a single underlying transaction. DuckDB's single-writer WAL
+// serializes every commit's fsync regardless of how many independent
+// Connections are involved -- N concurrent requests each committing on their
+// own pay N times the WAL-write/fsync latency, and under high fan-in that
+// tail can exceed a client's read timeout even though no single commit is
+// slow in isolation (observed directly: 16-way concurrent first-time OTLP
+// ingest occasionally exceeded a 10s client timeout with every individual
+// commit under half a second). One request becomes the "leader" for a
+// table's currently-queued batch, merges every queued request's
+// already-parsed payload (MergeParsedPayloads — the same merge already used
+// for small-batch coalescing on the bulk-file path) and runs ONE
+// RawIngestSerialized call for all of them, then wakes every waiter with its
+// own row/error count against the batch's shared result.
+//===--------------------------------------------------------------------===//
+
+class RawCommitCoordinator : public ObjectCacheEntry {
+public:
+	static string ObjectType() {
+		return "rawduck_commit_coordinator";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx();
+	}
+
+	struct PendingItem {
+		shared_ptr<RawParsedPayload> parsed;
+		string payload_text;
+		idx_t rows = 0;
+		idx_t parse_errors = 0;
+		bool done = false;
+		bool failed = false;
+		string error_message;
+		RawIngestStats stats;
+	};
+
+	mutex lock;
+	std::condition_variable cv;
+	// FIFO of requests waiting for the next combined commit, per table.
+	unordered_map<string, std::deque<shared_ptr<PendingItem>>> pending;
+	// tables currently being drained/committed by a leader
+	case_insensitive_set_t committing;
+	// requests currently inside RawIngestGroupCommit for this table (from
+	// the moment they enter to the moment they return/throw) — the signal
+	// used to decide whether lingering is worth it at all. Unlike
+	// `pending`, this is incremented before the mutex serializes anything,
+	// so a request that becomes leader can see that siblings are already
+	// under way even though none of them have reached `pending` yet.
+	unordered_map<string, idx_t> active;
+};
+
+//===--------------------------------------------------------------------===//
+// Direct (non-SQL) transaction control. Connection::BeginTransaction() /
+// Commit() / Rollback() each run a full SQL statement ("BEGIN TRANSACTION" /
+// "COMMIT" / "ROLLBACK") through the parser, binder, optimizer, and the
+// task-scheduled executor -- real, measured overhead (profiling showed
+// Commit() alone accounting for a substantial share of per-request cost
+// under concurrent HTTP ingest). These call the same ClientContext::
+// transaction primitives PhysicalTransaction's operator uses, skipping the
+// SQL front end entirely. Semantically identical for RawDuck's usage: no
+// read-only/custom-invalidation-policy modifiers (matching a plain "BEGIN
+// TRANSACTION"), and immediate_transaction_mode defaults false and RawDuck
+// never sets it, so that setting's extra eager-attach behavior never
+// applies to these transactions either way.
+//===--------------------------------------------------------------------===//
+
+void RawBeginTransaction(ClientContext &context) {
+	if (!context.transaction.IsAutoCommit()) {
+		throw TransactionException("cannot start a transaction within a transaction");
+	}
+	context.transaction.SetAutoCommit(false);
+}
+
+void RawRollbackTransaction(ClientContext &context) {
+	auto &txn = context.transaction;
+	if (txn.IsAutoCommit()) {
+		throw TransactionException("cannot rollback - no transaction is active");
+	}
+	auto &valid_checker = ValidChecker::Get(txn.ActiveTransaction());
+	if (valid_checker.IsInvalidated()) {
+		ErrorData error(ExceptionType::TRANSACTION, valid_checker.InvalidatedMessage());
+		txn.Rollback(error);
+	} else {
+		txn.Rollback(nullptr);
+	}
+}
+
+void RawCommitTransaction(ClientContext &context) {
+	auto &txn = context.transaction;
+	if (txn.IsAutoCommit()) {
+		throw TransactionException("cannot commit - no transaction is active");
+	}
+	if (ValidChecker::IsInvalidated(txn.ActiveTransaction())) {
+		// mirrors PhysicalTransaction: an invalidated transaction can't be
+		// committed, so treat this exactly like a ROLLBACK instead.
+		RawRollbackTransaction(context);
+		return;
+	}
+	txn.Commit();
+}
 
 static uint64_t HashPayloadShape(const vector<RawColumn> &columns) {
 	uint64_t shape = 0xcbf29ce484222325ULL;
@@ -1285,22 +1392,146 @@ RawIngestStats RawIngestSerialized(Connection &conn, const string &target, share
 		}
 	}
 
-	conn.BeginTransaction();
+	RawBeginTransaction(*conn.context);
 	try {
 		auto stats = RawIngestParsedPayload(*conn.context, target, parsed, payload, options);
-		conn.Commit();
+		RawCommitTransaction(*conn.context);
 		mark_known();
 		return stats;
 	} catch (TransactionException &) {
-		conn.Rollback();
+		RawRollbackTransaction(*conn.context);
 	}
 	// final attempt: no catch here. Any failure is left open for the
 	// caller's own catch/rollback, same as every other error path.
-	conn.BeginTransaction();
+	RawBeginTransaction(*conn.context);
 	auto stats = RawIngestParsedPayload(*conn.context, target, parsed, payload, options);
-	conn.Commit();
+	RawCommitTransaction(*conn.context);
 	mark_known();
 	return stats;
+}
+
+// HTTP/programmatic ingest entry point (replaces calling RawIngestSerialized
+// directly): coalesces this request with any others concurrently targeting
+// the same table into one shared commit. See RawCommitCoordinator.
+//
+// Waiters never touch their own Connection's transaction state at all — the
+// leader runs the entire Begin/Ingest/Commit/Rollback sequence on its own
+// `conn`, so a failed batch is rolled back exactly once by the leader.
+// Callers must not call Rollback themselves after this throws.
+RawIngestStats RawIngestGroupCommit(Connection &conn, const string &target, shared_ptr<RawParsedPayload> parsed,
+                                    const string &payload, const RawParseOptions &options) {
+	auto &coord = *ObjectCache::GetObjectCache(*conn.context)
+	                   .GetOrCreate<RawCommitCoordinator>(RawCommitCoordinator::ObjectType());
+
+	auto item = make_shared_ptr<RawCommitCoordinator::PendingItem>();
+	item->parsed = parsed;
+	item->payload_text = payload;
+	item->rows = parsed->payload.rows.size();
+	item->parse_errors = parsed->payload.parse_errors;
+
+	unique_lock<mutex> guard(coord.lock);
+	// Mark ourselves "in flight" for this target before anything else: this
+	// is what lets a brand-new leader tell a genuine concurrent burst apart
+	// from a lone request with nobody to batch with, and it's set before
+	// `pending` is touched so it catches siblings that haven't reached
+	// `pending` yet either (all of it happens under the same lock, so the
+	// order within this one line doesn't race).
+	auto active_at_entry = ++coord.active[target];
+	struct ActiveGuard {
+		RawCommitCoordinator &coord;
+		const string &target;
+		~ActiveGuard() {
+			lock_guard<mutex> g(coord.lock);
+			auto it = coord.active.find(target);
+			if (it != coord.active.end() && --it->second == 0) {
+				coord.active.erase(it);
+			}
+		}
+	} active_guard {coord, target};
+
+	coord.pending[target].push_back(item);
+	coord.cv.notify_all(); // wake a lingering leader if the batch just grew
+	if (coord.committing.count(target) > 0) {
+		// someone else is already leading a batch for this table: wait for
+		// OUR item to be resolved by that (or a subsequent) leader round
+		coord.cv.wait(guard, [&] { return item->done; });
+	} else {
+		coord.committing.insert(target);
+		// Only linger if a sibling request for this table is *already*
+		// under way (active_at_entry > 1, counting ourselves): a lone,
+		// uncontended request has nothing to batch with, and waiting here
+		// regardless was a measured ~7x latency regression for that common
+		// case (single-digit ms -> ~30ms per request) for no throughput
+		// benefit — nobody was going to join anyway. When contention is
+		// real, wake immediately once a decent batch has formed rather
+		// than always paying the full window, bounded so a slow-to-arrive
+		// burst still resolves promptly.
+		if (active_at_entry > 1) {
+			constexpr idx_t LINGER_TARGET_BATCH = 3;
+			coord.cv.wait_for(guard, std::chrono::milliseconds(25),
+			                  [&] { return coord.pending[target].size() >= LINGER_TARGET_BATCH; });
+		}
+		while (!coord.pending[target].empty()) {
+			auto batch = std::move(coord.pending[target]);
+			coord.pending[target].clear();
+			guard.unlock();
+
+			// merge every queued request's payload into one combined ingest.
+			// A representative payload TEXT (NDJSON: one request's text per
+			// line) rides along for the non-native (DuckLake) fallback path,
+			// which re-parses raw text via raw_records() rather than reusing
+			// the already-parsed structure — an empty string there would
+			// silently insert zero rows for a merged batch.
+			shared_ptr<RawParsedPayload> combined = batch.front()->parsed;
+			string combined_text = batch.front()->payload_text;
+			for (idx_t i = 1; i < batch.size(); i++) {
+				MergeParsedPayloads(*combined, std::move(*batch[i]->parsed));
+				combined_text += "\n";
+				combined_text += batch[i]->payload_text;
+			}
+
+			RawIngestStats batch_stats;
+			bool ok = true;
+			string error_message;
+			try {
+				batch_stats = RawIngestSerialized(conn, target, combined, combined_text, options);
+			} catch (std::exception &ex) {
+				ok = false;
+				error_message = ErrorData(ex).RawMessage();
+				// RawIngestSerialized always leaves a failed attempt's
+				// transaction open for the caller to roll back exactly once
+				// (matching every other ingest error path) — this IS that
+				// caller now that the leader owns the whole batch's commit.
+				RawRollbackTransaction(*conn.context);
+			}
+			for (auto &b : batch) {
+				b->done = true;
+				b->failed = !ok;
+				b->error_message = error_message;
+				if (ok) {
+					// aggregate stats (created/columns_added/columns_widened)
+					// are batch-wide by nature; rows/errors are reported
+					// per-request against each request's own input, matching
+					// what a non-batched call would have returned.
+					b->stats = batch_stats;
+					b->stats.rows = b->rows;
+					b->stats.errors = b->parse_errors;
+				}
+			}
+
+			guard.lock();
+			coord.cv.notify_all();
+			// loop: more requests may have queued up while we were
+			// committing: drain them too instead of waking a new leader.
+		}
+		coord.committing.erase(target);
+	}
+	guard.unlock();
+
+	if (item->failed) {
+		throw InvalidInputException(item->error_message);
+	}
+	return item->stats;
 }
 
 // Streaming handle over RawIngestor for the INSERT-syntax path

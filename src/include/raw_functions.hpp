@@ -38,6 +38,14 @@ struct RawIngestStats {
 };
 RawIngestStats RawIngestPayload(ClientContext &context, const string &target, const string &payload,
                                 const RawParseOptions &options);
+// Direct (non-SQL) transaction control: skips the parser/binder/optimizer/
+// task-scheduled executor that Connection::BeginTransaction/Commit/Rollback
+// each go through for a plain "BEGIN TRANSACTION"/"COMMIT"/"ROLLBACK" -
+// measured to be a substantial share of per-request cost under concurrent
+// HTTP ingest. Semantically identical for RawDuck's usage (see raw_ingest.cpp).
+void RawBeginTransaction(ClientContext &context);
+void RawCommitTransaction(ClientContext &context);
+void RawRollbackTransaction(ClientContext &context);
 // Ingest a payload that's already been parsed (RawParsedPayload::Process).
 // Lets a caller retry just the catalog/append step — e.g. after a concurrent
 // CREATE/ALTER conflict — without re-parsing and re-shredding the same bytes
@@ -49,6 +57,14 @@ RawIngestStats RawIngestParsedPayload(ClientContext &context, const string &targ
 // (see RawTableCreationCache in raw_ingest.cpp) instead of retrying blind.
 RawIngestStats RawIngestSerialized(Connection &conn, const string &target, shared_ptr<RawParsedPayload> parsed,
                                    const string &payload, const RawParseOptions &options);
+// HTTP/programmatic ingest entry point: coalesces concurrent requests to the
+// same table into one shared commit (see RawCommitCoordinator). Preferred
+// over RawIngestSerialized directly for the HTTP path — a failed batch is
+// rolled back exactly once by whichever request led it, so a caller must
+// NOT call Rollback itself after this throws (it may not have even opened a
+// transaction, if it was a waiter rather than the leader).
+RawIngestStats RawIngestGroupCommit(Connection &conn, const string &target, shared_ptr<RawParsedPayload> parsed,
+                                    const string &payload, const RawParseOptions &options);
 
 TableFunction GetRawServeFunction();
 TableFunction GetRawServeStopFunction();

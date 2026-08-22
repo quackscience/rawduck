@@ -121,22 +121,43 @@ optional. Reports `spans_per_sec`, `rows_ingested` (checked against
 `total_spans_sent` — any mismatch is a real bug, not a benchmark artifact),
 and writes JSON to `benchmark/results/`.
 
-This benchmark caught a real concurrency bug: multiple exporter processes
-racing to `INSERT` into a table that doesn't exist yet each open their own
-transaction, and DuckDB's catalog allows only one of them to `CREATE TABLE`
-— the rest saw a `TransactionException` ("write-write conflict") surfaced as
-an HTTP 400, which OTLP exporters correctly do not retry (4xx = client
-error), silently dropping that batch. A blind bounded retry closed most of
-the gap but re-parsed the whole payload on every attempt — under a big
-enough pile-up (16-way concurrent cold start) that pushed request latency
-past clients' own read timeouts instead. Fixed properly with
-`RawIngestSerialized` (`raw_ingest.cpp`): a table's first-ever insert in this
-process queues behind an in-process lock instead of racing at all, while
-every request afterward (the steady-state case) never touches the lock —
-just a cached membership check. 30/30 clean in stress testing at 16-way
-concurrency, no throughput change. Regression-tested in
-`test/http/raw_api_compat.sh`'s "concurrent create" section (fires 8
-concurrent requests at a brand-new table).
+This benchmark caught two real concurrency issues under sustained 16-32-way
+concurrent OTLP/HTTP load, both fixed in `raw_ingest.cpp`:
+
+- **Concurrent first-insert races.** Multiple exporter processes racing to
+  `INSERT` into a table that doesn't exist yet each open their own
+  transaction, and DuckDB's catalog allows only one of them to `CREATE TABLE`
+  — the rest saw a `TransactionException` ("write-write conflict") surfaced
+  as an HTTP 400, which OTLP exporters correctly do not retry (4xx = client
+  error), silently dropping that batch. Fixed with `RawIngestSerialized`: a
+  table's first-ever insert in this process queues behind an in-process lock
+  instead of racing at all; every request afterward (the steady-state case)
+  never touches the lock, just a cached membership check.
+- **Per-commit WAL/fsync serialization tail latency.** Even with the race
+  fixed, DuckDB's single-writer WAL still serializes every commit's fsync
+  regardless of how many independent Connections are committing — no single
+  commit was ever slow in isolation (~200-450ms), but under a big enough
+  pile-up (16+ concurrent committers) the cumulative queueing occasionally
+  pushed one unlucky request's total latency past a 10s client read timeout.
+  Fixed with `RawIngestGroupCommit`: concurrent requests to the same table
+  coalesce into one shared commit (a "leader" merges every currently-queued
+  request's already-parsed payload via `MergeParsedPayloads` and runs a
+  single transaction for all of them). Lingering to let a batch form is
+  gated on an `active` in-flight counter, not unconditional: a lone,
+  uncontended request (no sibling already in flight for the same table)
+  skips the linger and the whole coalescing dance entirely, going straight
+  through at the same latency as a direct, non-batched call. The first cut
+  of this fix lingered unconditionally and regressed *every* request's
+  latency ~7x (single-digit ms -> ~30ms) even with nobody to batch with —
+  caught by explicitly re-benchmarking the solo/no-contention case after
+  the fix, not just the concurrent stress test that motivated it.
+
+Verified both ends: 45/45 clean in stress testing (16-way and 32-way
+concurrency, 0 failures) with throughput ~130-140k spans/sec while
+contention is genuinely engaged, *and* solo-request latency back to the
+same ~4-6ms baseline as before any of this (measured directly, sequential
+uncontended requests). Regression-tested in `test/http/raw_api_compat.sh`'s
+"concurrent create" section (fires 8 concurrent requests at a brand-new table).
 
 ## VARIANT vs RawDuck (branch `feat/variant-benchmark`)
 

@@ -35,7 +35,12 @@ struct RawNode {
 	unordered_map<string, idx_t> child_lookup;
 	unique_ptr<RawNode> element;
 
-	RawNode &GetOrCreateChild(const string &key);
+	RawNode &GetOrCreateChild(const char *key, idx_t key_len);
+	// Routing-only lookup (schema tree already built): linear-scans `children`
+	// for small fanout (the common case: no allocation, no hashing) and falls
+	// back to `child_lookup` once a node has enough children that scanning
+	// would lose. Returns nullptr if `key` isn't a known child.
+	const RawNode *FindChild(const char *key, idx_t key_len) const;
 };
 
 // A flattened output column: `name` is the dotted path, `path` the segments to
@@ -68,6 +73,17 @@ struct RawPayload {
 	idx_t parse_errors = 0;
 	// apply OTLP semantic normalization during Explode
 	bool otlp_semantics = false;
+	// Backs every yyjson_read call made by Parse(): one malloc sized for the
+	// whole payload's worst-case memory need (yyjson_read_max_memory_usage)
+	// instead of one malloc/free pair per NDJSON line — every doc in `docs`
+	// then bump-allocates from this single buffer instead of glibc's arena.
+	// A vector, not a single pointer: small schema-stable batches get merged
+	// (MergeParsedPayloads moves `docs` from one RawPayload into another),
+	// and every merged-in doc's yyjson_alc still points at the pool buffer
+	// its own payload allocated — that buffer must move (not free) with it,
+	// or freeing the donor payload frees memory the surviving docs still use.
+	// Freed after all docs are (~RawPayload).
+	vector<void *> pool_buffers;
 
 	RawPayload() = default;
 	RawPayload(const RawPayload &) = delete;

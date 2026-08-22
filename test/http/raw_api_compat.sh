@@ -46,4 +46,29 @@ echo "$DESC" | python3 -c 'import json,sys; cols={c["name"] for c in json.load(s
 echo "== transform query param =="
 curl -sf -X POST "${BASE}/v1/tables/traces2?transform=otlp-traces" "${AUTH[@]}" -d "$OTLP" | json_get "['inserted']" | grep -q 1
 
+echo "== concurrent create (first-insert serialization) =="
+# N clients racing to POST to a table that does not exist yet: each opens its
+# own Connection/transaction, so only one would win the CREATE TABLE and the
+# rest would see a DuckDB catalog conflict. RawIngestSerialized queues
+# first-time creators behind an in-process lock instead of letting them race
+# (and instead of retrying blind against an uncommitted winner), so every
+# request lands cleanly.
+CONCURRENT_TABLE="concurrent_create_test_$$"
+PIDS=()
+for i in $(seq 1 8); do
+	curl -sf -X POST "${BASE}/v1/tables/${CONCURRENT_TABLE}" "${AUTH[@]}" \
+		-d "{\"n\": ${i}}" -o "/tmp/concurrent_create_${i}.json" &
+	PIDS+=($!)
+done
+for pid in "${PIDS[@]}"; do
+	wait "${pid}"
+done
+for i in $(seq 1 8); do
+	json_get "['inserted']" <"/tmp/concurrent_create_${i}.json" | grep -q 1
+	rm -f "/tmp/concurrent_create_${i}.json"
+done
+COUNT=$(curl -sf -X POST "${BASE}/v1/query" "${AUTH[@]}" \
+	-d "{\"sql\":\"SELECT count(*) AS c FROM ${CONCURRENT_TABLE}\"}")
+echo "$COUNT" | json_get "['data'][0]['c']" | grep -q 8
+
 echo "OK: API compatibility smoke test passed"

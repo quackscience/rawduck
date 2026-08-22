@@ -116,24 +116,24 @@ VARIANT requires `STORAGE_VERSION 'v1.5.0'`. Measured with DuckDB VARIANT as of 
 
 | path | M3 Ultra (32 cores, 512 GiB) | Spark GB10 aarch64 (20 cores, 122 GiB, `--threads 8`) |
 |---|---|---|
-| RawDuck | 1.01 s · 988k rec/s · 38.8 MB (110 MB file) | 1.41 s · 709k rec/s · 35.5 MB (71 MB file) |
-| VARIANT-flat | encode · 38.8 MB | encode · 38.0 MB |
-| VARIANT OTLP | 11.8 s · 85k · 53.5 MB (106 MB file) | 7.26 s · 138k · 54.5 MB (108 MB file) |
-| JSON-flat | encode · 142 MB | encode · 143 MB |
-| JSON OTLP | 4.75 s · 210k · 241 MB (484 MB file) | 4.76 s · 210k · 242 MB (484 MB file) |
+| RawDuck | 1.01 s · 988k rec/s · 38.8 MB (110 MB file) | 1.18 s · 850k rec/s · 35.5 MB (91 MB file) |
+| VARIANT-flat | encode · 38.8 MB | encode · 39.5 MB |
+| VARIANT OTLP | 11.8 s · 85k · 53.5 MB (106 MB file) | 7.96 s · 126k · 54.5 MB (114 MB file) |
+| JSON-flat | encode · 142 MB | encode · 142 MB |
+| JSON OTLP | 4.75 s · 210k · 241 MB (484 MB file) | 5.71 s · 175k · 242 MB (484 MB file) |
 
 ### Queries (best of 3, ms)
 
 | encoding | M3 Ultra | Spark GB10 |
 |---|---|---|
 | | errors / p99 / status | errors / p99 / status |
-| RawDuck | 1.3 / 3.0 / 2.5 | 1.0 / 4.0 / 5.4 |
-| JSON-flat | 39 / 97 / 35 | 51 / 133 / 47 |
-| JSON OTLP positional | 222 / 313 / 201 | 278 / 365 / 246 |
-| JSON OTLP key lookup | 361 / 436 / 322 | 445 / 526 / 400 |
-| VARIANT-flat | 430 / 1264 / 425 | 784 / 2160 / 762 |
-| VARIANT OTLP positional | 1224 / 3483 / 1161 | 2268 / 6716 / 2175 |
-| VARIANT OTLP key lookup | 1506 / 3725 / 1405 | 2775 / 6984 / 2438 |
+| RawDuck | 1.3 / 3.0 / 2.5 | 1.3 / 4.9 / 5.1 |
+| JSON-flat | 39 / 97 / 35 | 65 / 136 / 63 |
+| JSON OTLP positional | 222 / 313 / 201 | 253 / 415 / 215 |
+| JSON OTLP key lookup | 361 / 436 / 322 | 397 / 580 / 366 |
+| VARIANT-flat | 430 / 1264 / 425 | 700 / 1988 / 696 |
+| VARIANT OTLP positional | 1224 / 3483 / 1161 | 2013 / 5947 / 1852 |
+| VARIANT OTLP key lookup | 1506 / 3725 / 1405 | 2107 / 5996 / 2049 |
 
 ### Reproduce
 

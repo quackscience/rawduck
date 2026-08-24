@@ -481,11 +481,18 @@ def file_bytes(path: Path) -> int:
 
 
 def ingest_sql(path_name: str, file_sql: str) -> str:
-    # INSERT (+ CHECKPOINT) only. CREATE lives in create_empty_sql() and runs
-    # once before cold ingest. DuckDB main (v2.0-dev) SIGSEGVs when a piped
-    # batch starts with CREATE TABLE IF NOT EXISTS on an already-existing table
-    # followed by a large INSERT into a JSON column — so never emit CREATE here
-    # (warm re-ingest also hits that path after DELETE leaves the table in place).
+    # INSERT (+ CHECKPOINT) only — CREATE is create_empty_sql(), once before cold.
+    # Cast / thread choices follow DuckDB's own sqllogictests on this tip, not
+    # ad-hoc workarounds:
+    #   STRUCT → VARIANT  : `{...}::VARIANT`
+    #     (test/sql/types/variant/variant_casts.test,
+    #      test/sql/storage/types/variant/variant_shredding_small.test)
+    #   STRUCT → JSON     : `to_json({...})`
+    #     (test/sql/json/scalar/test_json_create.test — to_json is the create path;
+    #      `{...}::JSON` is not what those tests use for structs)
+    #   Large nested cast : `SET threads = 1` around the INSERT
+    #     (test/sql/storage/types/variant/variant_parquet_shredding_bug.test_slow
+    #      — DuckDB's own 300k JSON::VARIANT build serializes threads explicitly)
     if path_name == "rawduck":
         return f"""
 SELECT rows, columns_added, columns_widened, errors
@@ -508,16 +515,11 @@ SELECT {{'resource': resource, 'span': span}}::VARIANT AS payload FROM spans;
 CHECKPOINT;
 """
     if path_name == "json_otlp":
-        # DuckDB main (v2.0-dev) intermittently SIGSEGVs on a single-shot
-        # unnest→struct→::JSON INSERT under parallel execution. Materialize the
-        # exploded STRUCT rows first, then cast — same bytes, stable on this tip.
         return f"""
-CREATE OR REPLACE TEMP TABLE _otlp_spans AS
-{cte}
-SELECT resource, span FROM spans;
+SET threads = 1;
 INSERT INTO t
-SELECT {{'resource': resource, 'span': span}}::JSON AS payload FROM _otlp_spans;
-DROP TABLE _otlp_spans;
+{cte}
+SELECT to_json({{'resource': resource, 'span': span}}) AS payload FROM spans;
 CHECKPOINT;
 """
     raise ValueError(path_name)

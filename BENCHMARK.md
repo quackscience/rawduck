@@ -29,7 +29,7 @@ GEN=ninja make release
 ## OTEL bulk ingest
 
 1,000,000 records per signal, OTLP/JSON export envelopes (collector POST bodies), best of 5
-sessions:
+sessions. **`main` pin (DuckDB v1.5.5):**
 
 | signal | records | source NDJSON | cold ingest | records/s | throughput |
 |---|---:|---:|---:|---:|---:|
@@ -39,6 +39,20 @@ sessions:
 
 3M telemetry records in **3.2 s** (~940k records/s average). Warm ingest matches cold within
 ~2% on each signal.
+
+### Branch `v2.0.0` (DuckDB main tip / v2.0-dev)
+
+Same machine and harness (`21447bd`): VARIANT overflow sink + OTLP metrics shredded to
+data-point grain (typed columns, not a `dataPoints` blob).
+
+| signal | cold ingest | records/s | throughput | vs v1.5.5 |
+|---|---:|---:|---:|---:|
+| traces | 0.80 s | 1.25M | 543 MB/s | 1.5× |
+| logs | 0.45 s | 2.20M | 646 MB/s | 1.9× |
+| metrics | 0.51 s | 1.96M | 690 MB/s | 2.2× |
+
+3M telemetry records in **~1.77 s** (~1.7M records/s average). Warm within a few percent of
+cold on every signal.
 
 ### Query speed (1,000,000 spans)
 
@@ -149,9 +163,10 @@ measure storage per branch.
 
 On `v2.0.0`, structural overflow columns (object/scalar conflicts, mixed arrays, empty
 objects, arrays of objects) are stored as **VARIANT** instead of JSON, so overflow
-queries use shredded VARIANT extract rather than `->>`. Typed OTLP shred columns are
-unchanged. Keep `main` on the JSON sink until a stable DuckDB release ships shredded
-VARIANT.
+queries use shredded VARIANT extract rather than `->>`. OTLP metrics fan out to
+data-point grain (like spans for traces) so `dataPoints` are typed columns, not an
+overflow blob. Typed OTLP shred for traces/logs is unchanged. Keep `main` on the JSON
+sink until a stable DuckDB release ships shredded VARIANT.
 
 ## Appendix: GH Archive (wide-schema stress test)
 

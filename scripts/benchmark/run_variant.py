@@ -413,12 +413,20 @@ class DuckSession:
         return self.stderr_text()
 
     def fail(self, message: str) -> None:
+        rc = self.proc.poll()
         err = self.close()
         if err:
             sys.stderr.write(err)
             if not err.endswith("\n"):
                 sys.stderr.write("\n")
-        raise RuntimeError(message)
+        detail = message
+        if rc is not None:
+            detail += f" (duckdb exit={rc})"
+        if err.strip():
+            detail += f"\nstderr:\n{err.strip()}"
+        if self._last_sql:
+            detail += f"\nlast_sql:\n{self._last_sql[:500]}"
+        raise RuntimeError(detail)
 
 
 def parse_count(lines: list[str]) -> int:
@@ -473,6 +481,11 @@ def file_bytes(path: Path) -> int:
 
 
 def ingest_sql(path_name: str, file_sql: str) -> str:
+    # INSERT (+ CHECKPOINT) only. CREATE lives in create_empty_sql() and runs
+    # once before cold ingest. DuckDB main (v2.0-dev) SIGSEGVs when a piped
+    # batch starts with CREATE TABLE IF NOT EXISTS on an already-existing table
+    # followed by a large INSERT into a JSON column — so never emit CREATE here
+    # (warm re-ingest also hits that path after DELETE leaves the table in place).
     if path_name == "rawduck":
         return f"""
 SELECT rows, columns_added, columns_widened, errors
@@ -481,7 +494,6 @@ CHECKPOINT;
 """
     if path_name == "variant_envelope":
         return f"""
-CREATE TABLE IF NOT EXISTS t (payload VARIANT);
 INSERT INTO t
 SELECT json::VARIANT
 FROM read_json('{file_sql}', format='newline_delimited', records='false', columns={{json:'JSON'}});
@@ -490,18 +502,22 @@ CHECKPOINT;
     cte = explode_cte(file_sql)
     if path_name == "variant_otlp":
         return f"""
-CREATE TABLE IF NOT EXISTS t (payload VARIANT);
 INSERT INTO t
 {cte}
 SELECT {{'resource': resource, 'span': span}}::VARIANT AS payload FROM spans;
 CHECKPOINT;
 """
     if path_name == "json_otlp":
+        # DuckDB main (v2.0-dev) intermittently SIGSEGVs on a single-shot
+        # unnest→struct→::JSON INSERT under parallel execution. Materialize the
+        # exploded STRUCT rows first, then cast — same bytes, stable on this tip.
         return f"""
-CREATE TABLE IF NOT EXISTS t (payload JSON);
-INSERT INTO t
+CREATE OR REPLACE TEMP TABLE _otlp_spans AS
 {cte}
-SELECT {{'resource': resource, 'span': span}}::JSON AS payload FROM spans;
+SELECT resource, span FROM spans;
+INSERT INTO t
+SELECT {{'resource': resource, 'span': span}}::JSON AS payload FROM _otlp_spans;
+DROP TABLE _otlp_spans;
 CHECKPOINT;
 """
     raise ValueError(path_name)

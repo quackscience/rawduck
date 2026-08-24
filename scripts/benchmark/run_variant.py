@@ -742,7 +742,7 @@ def variant_note(version: str) -> str:
     if "v2" in tag or "-dev" in tag:
         return (
             f"DuckDB {version} VARIANT (shredded execution / extract pushdown expected). "
-            "This is the v2.0-dev main tip, not the v1.5.5 pin."
+            "This is the development main tip (v2.0-dev preview), not the v1.5.5 pin."
         )
     return (
         f"DuckDB VARIANT as of {version}. The v2.0 preview (shredded execution from "

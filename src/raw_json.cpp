@@ -195,6 +195,26 @@ static void AddObjectFields(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::y
 	}
 }
 
+static void AddMutObjectFields(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjson_mut_val *merged,
+                               duckdb_yyjson::yyjson_mut_val *object, const string *skip_key) {
+	duckdb_yyjson::yyjson_mut_obj_iter iter;
+	duckdb_yyjson::yyjson_mut_obj_iter_init(object, &iter);
+	while (auto key = duckdb_yyjson::yyjson_mut_obj_iter_next(&iter)) {
+		auto key_str = duckdb_yyjson::yyjson_mut_get_str(key);
+		auto key_len = duckdb_yyjson::yyjson_mut_get_len(key);
+		if (skip_key && skip_key->size() == key_len && memcmp(skip_key->data(), key_str, key_len) == 0) {
+			continue;
+		}
+		if (duckdb_yyjson::yyjson_mut_obj_getn(merged, key_str, key_len)) {
+			continue;
+		}
+		auto key_copy = duckdb_yyjson::yyjson_mut_strncpy(doc, key_str, key_len);
+		duckdb_yyjson::yyjson_mut_obj_add(
+		    merged, key_copy,
+		    duckdb_yyjson::yyjson_mut_val_mut_copy(doc, duckdb_yyjson::yyjson_mut_obj_iter_get_val(key)));
+	}
+}
+
 static void EmitMergedRow(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjson_mut_val *out_rows, yyjson_val *leaf,
                           const vector<RawExplodeEnvelope> &envelopes) {
 	if (!duckdb_yyjson::yyjson_is_obj(leaf)) {
@@ -521,6 +541,56 @@ static duckdb_yyjson::yyjson_mut_val *OtlpNormalizeValue(duckdb_yyjson::yyjson_m
 	return value;
 }
 
+// OTLP metrics stop at the Metric message after the builtin path
+// (…metrics). The hot grain is NumberDataPoint / HistogramDataPoint — same
+// role spans play for traces. Without a second fan-out, sum/gauge/…dataPoints
+// land as a single overflow column (VARIANT on v2). Walk each metric type
+// field and explode its dataPoints array so attributes shred to typed columns.
+static void ExplodeOtlpMetricDataPoints(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjson_mut_val *&out_rows) {
+	static const char *METRIC_TYPES[] = {"sum", "gauge", "histogram", "exponentialHistogram", "summary"};
+	auto next_rows = duckdb_yyjson::yyjson_mut_arr(doc);
+	duckdb_yyjson::yyjson_mut_arr_iter metrics;
+	duckdb_yyjson::yyjson_mut_arr_iter_init(out_rows, &metrics);
+	while (auto metric = duckdb_yyjson::yyjson_mut_arr_iter_next(&metrics)) {
+		if (!duckdb_yyjson::yyjson_mut_is_obj(metric)) {
+			duckdb_yyjson::yyjson_mut_arr_append(next_rows, metric);
+			continue;
+		}
+		duckdb_yyjson::yyjson_mut_val *type_obj = nullptr;
+		const char *type_key = nullptr;
+		for (auto key : METRIC_TYPES) {
+			auto candidate = duckdb_yyjson::yyjson_mut_obj_get(metric, key);
+			if (candidate && duckdb_yyjson::yyjson_mut_is_obj(candidate)) {
+				type_obj = candidate;
+				type_key = key;
+				break;
+			}
+		}
+		auto data_points = type_obj ? duckdb_yyjson::yyjson_mut_obj_get(type_obj, "dataPoints") : nullptr;
+		if (!data_points || !duckdb_yyjson::yyjson_mut_is_arr(data_points) ||
+		    duckdb_yyjson::yyjson_mut_arr_size(data_points) == 0) {
+			duckdb_yyjson::yyjson_mut_arr_append(next_rows, metric);
+			continue;
+		}
+		string type_key_str(type_key);
+		string data_points_key("dataPoints");
+		duckdb_yyjson::yyjson_mut_arr_iter points;
+		duckdb_yyjson::yyjson_mut_arr_iter_init(data_points, &points);
+		while (auto point = duckdb_yyjson::yyjson_mut_arr_iter_next(&points)) {
+			auto merged = duckdb_yyjson::yyjson_mut_obj(doc);
+			// data point fields first, then type fields, then metric envelope
+			if (duckdb_yyjson::yyjson_mut_is_obj(point)) {
+				AddMutObjectFields(doc, merged, point, nullptr);
+			}
+			AddMutObjectFields(doc, merged, type_obj, &data_points_key);
+			AddMutObjectFields(doc, merged, metric, &type_key_str);
+			duckdb_yyjson::yyjson_mut_arr_append(next_rows, merged);
+		}
+	}
+	out_rows = next_rows;
+	duckdb_yyjson::yyjson_mut_doc_set_root(doc, out_rows);
+}
+
 void RawPayload::Explode(const vector<string> &path) {
 	auto mut_doc = duckdb_yyjson::yyjson_mut_doc_new(nullptr);
 	auto out_rows = duckdb_yyjson::yyjson_mut_arr(mut_doc);
@@ -529,6 +599,10 @@ void RawPayload::Explode(const vector<string> &path) {
 	vector<RawExplodeEnvelope> envelopes;
 	for (auto row : rows) {
 		ExplodeInto(mut_doc, out_rows, row, path, 0, envelopes);
+	}
+	// otlp-metrics path ends in "metrics": shred to data-point grain next
+	if (otlp_semantics && !path.empty() && path.back() == "metrics") {
+		ExplodeOtlpMetricDataPoints(mut_doc, out_rows);
 	}
 	if (otlp_semantics) {
 		duckdb_yyjson::yyjson_mut_arr_iter normalized_rows;

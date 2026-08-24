@@ -452,3 +452,16 @@ SELECT "traceId", "spanId"
 FROM raw_records('{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"traceId":"5B8EFFF798038103D269B633813FC60C","spanId":"EEE19B7EC3C1B174","body":{"stringValue":"x"}}]}]}]}', transform := 'otlp-logs');
 ----
 5B8EFFF798038103D269B633813FC60C	EEE19B7EC3C1B174
+
+# otlp-metrics shreds to data-point grain (not a VARIANT dataPoints blob)
+query IIIII
+SELECT name, asDouble, "service.name", aggregationTemporality, typeof(asDouble)
+FROM raw_records('{"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"api"}}]},"scopeMetrics":[{"metrics":[{"name":"q.depth","unit":"1","sum":{"aggregationTemporality":2,"isMonotonic":true,"dataPoints":[{"asDouble":1.5,"attributes":[{"key":"service.name","value":{"stringValue":"search"}}]},{"asDouble":2.5,"attributes":[{"key":"service.name","value":{"stringValue":"cart"}}]}]}}]}]}]}', transform := 'otlp-metrics') ORDER BY asDouble;
+----
+q.depth	1.5	search	2	DOUBLE
+q.depth	2.5	cart	2	DOUBLE
+
+query I
+SELECT count(*) FROM raw_records('{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"m","gauge":{"dataPoints":[{"asInt":7},{"asInt":9}]}}]}]}]}', transform := 'otlp-metrics');
+----
+2

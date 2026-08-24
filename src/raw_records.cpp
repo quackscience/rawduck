@@ -52,7 +52,7 @@ static unique_ptr<FunctionData> RawRecordsBind(ClientContext &context, TableFunc
 	result->parsed = RawParsedPayload::Process(payload_str, RawBindParseOptions(context, input.named_parameters));
 	if (result->parsed->columns.empty()) {
 		// empty payload: keep a valid (empty) result shape
-		return_types.push_back(LogicalType::JSON());
+		return_types.push_back(RawOverflowType());
 		names.push_back("value");
 		result->parsed->payload.rows.clear();
 		return std::move(result);

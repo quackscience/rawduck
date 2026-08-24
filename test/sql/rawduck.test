@@ -121,11 +121,11 @@ SELECT raw_infer('{"a":1,"b":{"c":"x"},"tags":["a"]}');
 ----
 OBJECT(a BIGINT, b.c VARCHAR, tags VARCHAR[])
 
-# arrays of objects are kept as JSON
+# arrays of objects are kept as VARIANT (overflow sink)
 query I
 SELECT raw_infer('[{"a":1}]');
 ----
-JSON
+VARIANT
 
 #===----------------------------------------------------------------------===#
 # raw_records: typed rows out of a JSON payload
@@ -187,17 +187,17 @@ SELECT v FROM raw_records('[{"v":1},{"v":"x"}]');
 1
 x
 
-# object/scalar conflict degrades to JSON
+# object/scalar conflict degrades to VARIANT
 query I
 SELECT typeof(v) FROM raw_records('[{"v":{"a":1}},{"v":2}]') LIMIT 1;
 ----
-JSON
+VARIANT
 
-# arrays of objects stay JSON
+# arrays of objects stay VARIANT
 query II
-SELECT typeof(items), items FROM raw_records('[{"items":[{"x":1}]}]');
+SELECT typeof(items), items::VARCHAR FROM raw_records('[{"items":[{"x":1}]}]');
 ----
-JSON	[{"x":1}]
+VARIANT	[{'x': 1}]
 
 # integers out of BIGINT range degrade to DOUBLE
 query I
@@ -211,11 +211,11 @@ SELECT typeof(x), x FROM raw_records('[{"x":null}]');
 ----
 VARCHAR	NULL
 
-# empty objects are kept as JSON
+# empty objects are kept as VARIANT
 query II
-SELECT typeof(o), o FROM raw_records('[{"o":{}}]');
+SELECT typeof(o), o::VARCHAR FROM raw_records('[{"o":{}}]');
 ----
-JSON	{}
+VARIANT	{}
 
 # temporal sniffing
 query II

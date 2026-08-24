@@ -96,7 +96,7 @@ SELECT typeof(d), min(d) FROM t_time GROUP BY ALL;
 TIMESTAMP	2024-01-15 00:00:00
 
 #===----------------------------------------------------------------------===#
-# structural conflicts degrade to JSON
+# structural conflicts degrade to VARIANT
 #===----------------------------------------------------------------------===#
 
 # scalar column hit by an array value
@@ -111,15 +111,15 @@ t_arrmix	false	0	1	1	0
 query I
 SELECT typeof(v) FROM t_arrmix LIMIT 1;
 ----
-JSON
+VARIANT
 
 query I
-SELECT v FROM t_arrmix ORDER BY 1;
+SELECT v::VARCHAR FROM t_arrmix ORDER BY v::VARCHAR;
 ----
 1
-[1,2]
+[1, 2]
 
-# in-payload object/scalar conflict lands as JSON, later scalars are wrapped
+# in-payload object/scalar conflict lands as VARIANT, later scalars are wrapped
 statement ok
 SELECT * FROM raw_ingest('t_js', '[{"v":{"a":1}},{"v":5}]');
 
@@ -129,9 +129,31 @@ SELECT * FROM raw_ingest('t_js', '[{"v":7}]');
 t_js	false	0	0	1	0
 
 query I
-SELECT count(*) FROM t_js WHERE v = '7';
+SELECT typeof(v) FROM t_js LIMIT 1;
+----
+VARIANT
+
+query I
+SELECT count(*) FROM t_js WHERE v::VARCHAR = '7';
 ----
 1
+
+# JSON overflow columns widen monotonically to VARIANT
+statement ok
+CREATE TABLE t_json_widen (v JSON);
+
+statement ok
+INSERT INTO t_json_widen VALUES ('1'::JSON);
+
+query IIIIII
+SELECT * FROM raw_ingest('t_json_widen', '[{"v":[1,2]}]');
+----
+t_json_widen	false	0	1	1	0
+
+query I
+SELECT typeof(v) FROM t_json_widen LIMIT 1;
+----
+VARIANT
 
 #===----------------------------------------------------------------------===#
 # RawMergeTree-style semantics: ints and floats group by value

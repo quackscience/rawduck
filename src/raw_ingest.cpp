@@ -259,7 +259,7 @@ static bool IsIntegerType(const LogicalType &type) {
 }
 
 static bool IsPlainScalar(const LogicalType &type) {
-	if (IsRawJSONType(type)) {
+	if (IsRawOverflowType(type)) {
 		return false;
 	}
 	switch (type.id()) {
@@ -282,10 +282,11 @@ static LogicalType JoinColumnTypes(const LogicalType &existing, const LogicalTyp
 	if (existing == incoming) {
 		return existing;
 	}
-	auto existing_json = IsRawJSONType(existing);
-	auto incoming_json = IsRawJSONType(incoming);
-	if (existing_json || incoming_json) {
-		return LogicalType::JSON();
+	auto existing_overflow = IsRawOverflowType(existing);
+	auto incoming_overflow = IsRawOverflowType(incoming);
+	if (existing_overflow || incoming_overflow) {
+		// JSON (legacy) and VARIANT both widen to the current overflow sink
+		return RawOverflowType();
 	}
 	if (existing.id() == LogicalTypeId::LIST && incoming.id() == LogicalTypeId::LIST) {
 		return LogicalType::LIST(JoinColumnTypes(ListType::GetChildType(existing), ListType::GetChildType(incoming)));
@@ -294,7 +295,7 @@ static LogicalType JoinColumnTypes(const LogicalType &existing, const LogicalTyp
 		if (!IsPlainScalar(existing) && !IsPlainScalar(incoming)) {
 			return existing;
 		}
-		return LogicalType::JSON();
+		return RawOverflowType();
 	}
 	if (!IsPlainScalar(existing)) {
 		return existing;
@@ -1130,7 +1131,18 @@ private:
 			}
 			auto column_ref = make_uniq<ColumnRefExpression>(Identifier(column.name));
 			unique_ptr<ParsedExpression> expression;
-			if (IsRawJSONType(target_type) && !IsRawJSONType(existing.Type())) {
+			if (IsRawVariantType(target_type) && !IsRawVariantType(existing.Type())) {
+				// JSON→VARIANT is a plain cast; other types go through to_json first
+				// (same rationale as the JSON sink rewrite — bare strings reject).
+				if (IsRawJSONType(existing.Type())) {
+					expression = make_uniq<CastExpression>(target_type, std::move(column_ref));
+				} else {
+					vector<unique_ptr<ParsedExpression>> children;
+					children.push_back(std::move(column_ref));
+					auto to_json = make_uniq<FunctionExpression>("to_json", std::move(children));
+					expression = make_uniq<CastExpression>(target_type, std::move(to_json));
+				}
+			} else if (IsRawJSONType(target_type) && !IsRawJSONType(existing.Type())) {
 				// a plain cast to JSON would reject bare strings
 				vector<unique_ptr<ParsedExpression>> children;
 				children.push_back(std::move(column_ref));
@@ -1223,8 +1235,8 @@ private:
 			return;
 		}
 		// Catalogs like DuckLake cannot rewrite a column with an expression
-		// (ALTER ... USING), which JSON-widening needs; when that fails we
-		// retry once with widening to JSON disabled, converting incoming
+		// (ALTER ... USING), which overflow widening (JSON/VARIANT) needs; when
+		// that fails we retry once with widening disabled, converting incoming
 		// values to the existing column type instead.
 		try {
 			FallbackBatch(parsed, payload_str, true);
@@ -1238,7 +1250,7 @@ private:
 		}
 	}
 
-	void FallbackBatch(RawParsedPayload &parsed, const string &payload_str, bool allow_json_widening) {
+	void FallbackBatch(RawParsedPayload &parsed, const string &payload_str, bool allow_overflow_widening) {
 		auto &conn = *fallback_conn;
 		auto qualified = RawQualifiedTarget(target);
 		auto &columns = parsed.columns;
@@ -1274,15 +1286,21 @@ private:
 					final_types.push_back(target_type);
 					continue;
 				}
-				bool needs_rewrite = IsRawJSONType(target_type) && !IsRawJSONType(entry->second);
-				if (needs_rewrite && !allow_json_widening) {
+				bool needs_rewrite = IsRawOverflowType(target_type) && !IsRawOverflowType(entry->second);
+				if (needs_rewrite && !allow_overflow_widening) {
 					final_types.push_back(entry->second);
 					continue;
 				}
 				string alter = "ALTER TABLE " + qualified + " ALTER COLUMN " + RawQuoteIdentifier(column.name) +
 				               " SET DATA TYPE " + target_type.ToString();
 				if (needs_rewrite) {
-					alter += " USING to_json(" + RawQuoteIdentifier(column.name) + ")";
+					if (IsRawVariantType(target_type)) {
+						alter += " USING to_json(" + RawQuoteIdentifier(column.name) + ")::VARIANT";
+					} else {
+						alter += " USING to_json(" + RawQuoteIdentifier(column.name) + ")";
+					}
+				} else if (IsRawVariantType(target_type) && IsRawJSONType(entry->second)) {
+					alter += " USING " + RawQuoteIdentifier(column.name) + "::VARIANT";
 				}
 				statements.push_back(alter);
 				final_types.push_back(target_type);
@@ -1303,10 +1321,16 @@ private:
 					insert += (i ? ", " : "") + RawQuoteIdentifier(columns[i].name);
 					auto expr = RawQuoteIdentifier(columns[i].name);
 					auto incoming_structural =
-					    IsRawJSONType(columns[i].type) || columns[i].type.id() == LogicalTypeId::LIST;
-					if (IsRawJSONType(final_types[i]) && !IsRawJSONType(columns[i].type)) {
+					    IsRawOverflowType(columns[i].type) || columns[i].type.id() == LogicalTypeId::LIST;
+					if (IsRawVariantType(final_types[i]) && !IsRawVariantType(columns[i].type)) {
+						if (IsRawJSONType(columns[i].type)) {
+							expr = expr + "::VARIANT";
+						} else {
+							expr = "to_json(" + expr + ")::VARIANT";
+						}
+					} else if (IsRawJSONType(final_types[i]) && !IsRawJSONType(columns[i].type)) {
 						expr = "to_json(" + expr + ")";
-					} else if (!IsRawJSONType(final_types[i]) && incoming_structural &&
+					} else if (!IsRawOverflowType(final_types[i]) && incoming_structural &&
 					           final_types[i] != columns[i].type) {
 						// degraded widening: render structural values as JSON
 						// text and cast to the existing column type

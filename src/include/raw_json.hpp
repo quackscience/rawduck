@@ -10,9 +10,10 @@ namespace duckdb {
 //
 // Implements the RawMergeTree-style "ingest first, schema later" model:
 // every JSON payload is merged into a schema tree where scalar types widen
-// along a lattice and structural conflicts degrade to JSON. Nested objects
-// are flattened into dotted column paths so values land in real typed
-// columns instead of opaque JSON strings.
+// along a lattice and structural conflicts degrade to the overflow type
+// (VARIANT on DuckDB v2 — shredded execution; see RawOverflowType()). Nested
+// objects are flattened into dotted column paths so values land in real typed
+// columns instead of opaque overflow blobs.
 //===--------------------------------------------------------------------===//
 
 // Scalar widening lattice: UNSET < BOOLEAN | BIGINT < DOUBLE | DATE < TIMESTAMP,
@@ -24,7 +25,7 @@ enum class RawNodeClass : uint8_t {
 	SCALAR,    // scalar values, type tracked in `scalar`
 	OBJECT,    // nested object, children flattened into dotted columns
 	ARRAY,     // homogeneous array, element type tracked in `element`
-	JSON       // structural conflict or unflattenable value: stored as JSON text
+	VARIANT    // structural conflict or unflattenable value → RawOverflowType()
 };
 
 struct RawNode {
@@ -129,6 +130,12 @@ LogicalType NodeToType(const RawNode &node);
 vector<RawColumn> FlattenSchema(const RawNode &root, bool scalar_rows);
 
 bool IsRawJSONType(const LogicalType &type);
+// Structural-conflict / unflattenable sink type. On this v2.0.0 pin that is
+// VARIANT (shredded execution + extract pushdown). Legacy JSON overflow
+// columns still widen monotonically into VARIANT.
+LogicalType RawOverflowType();
+bool IsRawVariantType(const LogicalType &type);
+bool IsRawOverflowType(const LogicalType &type);
 
 // Vectorized extraction. Rows are typically sparse compared to the unified
 // schema, so extraction is row-major: each row's JSON tree is traversed once

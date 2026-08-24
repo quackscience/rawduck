@@ -147,6 +147,12 @@ GEN=ninja make release
 VARIANT still needs `STORAGE_VERSION 'v1.5.0'`. Do not copy databases across pins —
 measure storage per branch.
 
+On `v2.0.0`, structural overflow columns (object/scalar conflicts, mixed arrays, empty
+objects, arrays of objects) are stored as **VARIANT** instead of JSON, so overflow
+queries use shredded VARIANT extract rather than `->>`. Typed OTLP shred columns are
+unchanged. Keep `main` on the JSON sink until a stable DuckDB release ships shredded
+VARIANT.
+
 ## Appendix: GH Archive (wide-schema stress test)
 
 One hour of [GH Archive](https://www.gharchive.org/) data — 247,199 events / 956 MB NDJSON /

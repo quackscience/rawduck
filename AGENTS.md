@@ -49,9 +49,12 @@ must stay in sync. Build with `GEN=ninja make release`; test with
 
 1. **The type lattice widens monotonically, never destructively.**
    `BOOLEAN | BIGINT→DOUBLE | DATE→TIMESTAMP` → scalar conflicts sink to `VARCHAR`; structural
-   conflicts (object vs scalar, mixed arrays) sink to `JSON`. Nothing is ever dropped; widening is
-   `ALTER ... SET DATA TYPE`, with `to_json()` for JSON rewrites (a plain VARCHAR→JSON cast rejects
-   bare strings).
+   conflicts (object vs scalar, mixed arrays) sink to **VARIANT** on branch `v2.0.0` (DuckDB
+   shredded VARIANT) and to **JSON** on `main` (v1.5.5 pin — VARIANT extract was slower than
+   `->>` there). Nothing is ever dropped; widening is `ALTER ... SET DATA TYPE`, with
+   `to_json()` then `::VARIANT` (or `to_json()` alone on v1.5.5) for overflow rewrites — a plain
+   cast to JSON rejects bare strings; JSON→VARIANT is monotonic (never VARIANT→JSON). Do not
+   merge VARIANT-as-default overflow into `main` while it is pinned to v1.5.5.
 
 2. **Native ingestion runs in the caller's transaction.** DDL goes through
    `Catalog::CreateTable`/`Alter`, appends through `DataTable::LocalAppend` / optimistic
@@ -156,9 +159,25 @@ return wrong data—a proof test (e.g. tampering with a projection to prove the 
 ## Known boundaries (documented, not hidden)
 
 - DuckLake fallback can't widen columns with expressions (`ALTER ... USING` unsupported there);
-  RawDuck retries with JSON-widening disabled and converts incoming values instead.
+  RawDuck retries with overflow-widening disabled and converts incoming values instead.
 - Missing payload keys insert `NULL`, not column defaults.
 - Projection rewriting doesn't detect in-place UPDATEs of group columns (token is row-count based).
 - Generated columns and indexed/constrained tables use the serial append path.
 - Builds without protobuf (wasm, `RAWDUCK_DISABLE_OTLP_PROTOBUF=1`) answer OTLP/HTTP protobuf
   bodies with a 415 pointing at `http/json`; everything else is unaffected.
+
+## Future work — hot/cold VARIANT bag (Phase 2)
+
+Phase 1 (this branch) only changes the *overflow sink* to VARIANT. A separate PR should add a
+long-tail bag for wide/sparse schemas (GH Archive-class):
+
+- Cap typed column growth (setting or adaptive limit). Hot keys — from `raw_stats` frequency /
+  predicate observation — remain shredded typed columns.
+- New sparse keys merge into a single bag column (e.g. `_raw VARIANT`) instead of unbounded
+  `ALTER ADD COLUMN`.
+- Lattice stays monotonic: bag is VARIANT; promoting a bag key to a typed column is an explicit
+  optimize step, never silent demotion of typed → bag.
+- Optional later: `raw_optimize` / projection rewrite prefers typed cols; bag extract only when
+  the query needs cold keys.
+
+Do not land bag semantics in the same change as Phase 1 overflow retargeting.

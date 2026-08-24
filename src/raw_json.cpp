@@ -6,6 +6,7 @@
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 
 #include <cstdlib>
 
@@ -16,12 +17,12 @@ using duckdb_yyjson::yyjson_doc;
 using duckdb_yyjson::yyjson_obj_iter;
 using duckdb_yyjson::yyjson_val;
 
-// Objects nested deeper than this are kept as JSON columns instead of being
+// Objects nested deeper than this are kept as overflow (VARIANT) columns instead of being
 // flattened further.
 static constexpr idx_t RAW_MAX_FLATTEN_DEPTH = 16;
 // guard against pathological payloads exploding the table schema
 static constexpr idx_t RAW_MAX_COLUMNS = 10000;
-// recursion guard: nesting beyond this is preserved verbatim as JSON instead
+// recursion guard: nesting beyond this is preserved verbatim as overflow instead
 // of risking stack exhaustion on hostile inputs
 static constexpr idx_t RAW_MAX_NESTING = 128;
 static constexpr auto RAW_READ_FLAGS = duckdb_yyjson::YYJSON_READ_ALLOW_INF_AND_NAN;
@@ -721,8 +722,8 @@ RawScalarKind SniffScalarKind(yyjson_val *val) {
 
 static void MergeValueInternal(RawNode &node, yyjson_val *val, idx_t depth);
 
-static void DemoteToJSON(RawNode &node) {
-	node.node_class = RawNodeClass::JSON;
+static void DemoteToOverflow(RawNode &node) {
+	node.node_class = RawNodeClass::VARIANT;
 	node.children.clear();
 	node.child_lookup.clear();
 	node.element.reset();
@@ -734,13 +735,13 @@ void MergeValue(RawNode &node, yyjson_val *val) {
 
 static void MergeValueInternal(RawNode &node, yyjson_val *val, idx_t depth) {
 	if (depth > RAW_MAX_NESTING) {
-		DemoteToJSON(node);
+		DemoteToOverflow(node);
 		return;
 	}
 	if (!val || duckdb_yyjson::yyjson_is_null(val)) {
 		return;
 	}
-	if (node.node_class == RawNodeClass::JSON) {
+	if (node.node_class == RawNodeClass::VARIANT) {
 		return;
 	}
 	if (duckdb_yyjson::yyjson_is_obj(val)) {
@@ -748,7 +749,7 @@ static void MergeValueInternal(RawNode &node, yyjson_val *val, idx_t depth) {
 			node.node_class = RawNodeClass::OBJECT;
 		}
 		if (node.node_class != RawNodeClass::OBJECT) {
-			DemoteToJSON(node);
+			DemoteToOverflow(node);
 			return;
 		}
 		yyjson_obj_iter iter;
@@ -767,7 +768,7 @@ static void MergeValueInternal(RawNode &node, yyjson_val *val, idx_t depth) {
 			node.element = make_uniq<RawNode>();
 		}
 		if (node.node_class != RawNodeClass::ARRAY) {
-			DemoteToJSON(node);
+			DemoteToOverflow(node);
 			return;
 		}
 		yyjson_arr_iter iter;
@@ -789,7 +790,7 @@ static void MergeValueInternal(RawNode &node, yyjson_val *val, idx_t depth) {
 		return;
 	}
 	if (node.node_class != RawNodeClass::SCALAR) {
-		DemoteToJSON(node);
+		DemoteToOverflow(node);
 		return;
 	}
 	node.scalar = JoinScalarKinds(node.scalar, kind);
@@ -832,12 +833,12 @@ LogicalType NodeToType(const RawNode &node) {
 		case RawNodeClass::ARRAY:
 			return LogicalType::LIST(NodeToType(element));
 		default:
-			// arrays of objects (or mixed) stay as a single JSON value
-			return LogicalType::JSON();
+			// arrays of objects (or mixed) stay as a single overflow value
+			return RawOverflowType();
 		}
 	}
 	default:
-		return LogicalType::JSON();
+		return RawOverflowType();
 	}
 }
 
@@ -895,8 +896,20 @@ bool IsRawJSONType(const LogicalType &type) {
 	return type.id() == LogicalTypeId::VARCHAR && type.GetAlias() == LogicalType::JSON_TYPE_NAME;
 }
 
+LogicalType RawOverflowType() {
+	return LogicalType::VARIANT();
+}
+
+bool IsRawVariantType(const LogicalType &type) {
+	return type.id() == LogicalTypeId::VARIANT;
+}
+
+bool IsRawOverflowType(const LogicalType &type) {
+	return IsRawVariantType(type) || IsRawJSONType(type);
+}
+
 bool RawFillSupported(const LogicalType &type) {
-	if (IsRawJSONType(type)) {
+	if (IsRawOverflowType(type)) {
 		return true;
 	}
 	switch (type.id()) {
@@ -993,6 +1006,30 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 			}
 			data[offset + i] = WriteJSONString(val, result);
 		}
+		return;
+	}
+	if (IsRawVariantType(type)) {
+		// DuckDB's idiomatic path is JSON text → VARIANT (json_cast.test /
+		// VARIANT storage tests). Serialize yyjson → JSON, then cast.
+		Vector json_source(LogicalType::JSON(), vals.size());
+		FlatVector::SetSize(json_source, vals.size());
+		auto json_data = FlatVector::GetDataMutable<string_t>(json_source);
+		auto &json_validity = FlatVector::ValidityMutable(json_source);
+		for (idx_t i = 0; i < vals.size(); i++) {
+			auto val = vals[i];
+			if (!val || duckdb_yyjson::yyjson_is_null(val)) {
+				json_validity.SetInvalid(i);
+				continue;
+			}
+			json_data[i] = WriteJSONString(val, json_source);
+		}
+		if (offset == 0) {
+			VectorOperations::DefaultCast(json_source, result, vals.size());
+			return;
+		}
+		Vector variant_tmp(LogicalType::VARIANT(), vals.size());
+		VectorOperations::DefaultCast(json_source, variant_tmp, vals.size());
+		VectorOperations::Copy(variant_tmp, result, vals.size(), 0, offset);
 		return;
 	}
 	switch (type.id()) {

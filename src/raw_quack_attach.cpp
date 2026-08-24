@@ -6,9 +6,12 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/common/sql_identifier.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/extension_helper.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/main/extension_load_options.hpp"
+#include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/logical_operator.hpp"
@@ -24,7 +27,7 @@
 namespace duckdb {
 
 static string RawQuackSQLString(const string &value) {
-	return KeywordHelper::WriteQuoted(value, '\'');
+	return SQLString::ToString(value);
 }
 
 static void RawEnsureQuackLoaded(ClientContext &context) {
@@ -33,7 +36,7 @@ static void RawEnsureQuackLoaded(ClientContext &context) {
 		return;
 	}
 	if (!Catalog::TryAutoLoad(context, "quack")) {
-		ExtensionHelper::LoadExternalExtension(context, "quack");
+		ExtensionHelper::LoadExternalExtension(context, ExtensionLoadOptions("quack"));
 	}
 	if (!StorageExtension::Find(config, "quack")) {
 		throw InvalidInputException(
@@ -172,7 +175,7 @@ public:
 	}
 
 	void DropSchema(ClientContext &context, DropInfo &info) override {
-		if (info.name == "ingest") {
+		if (info.GetQualifiedName().Name() == "ingest") {
 			throw NotImplementedException("RawDuck: the ingest schema is virtual");
 		}
 		inner->DropEntry(context, info);
@@ -247,7 +250,7 @@ public:
 		auto &gstate = input.global_state.Cast<RawQuackIngestGlobalState>();
 		auto &state = input.local_state.Cast<RawQuackIngestLocalState>();
 		UnifiedVectorFormat payloads;
-		chunk.data[0].ToUnifiedFormat(chunk.size(), payloads);
+		chunk.data[0].ToUnifiedFormat(payloads);
 		auto strings = UnifiedVectorFormat::GetData<string_t>(payloads);
 		for (idx_t i = 0; i < chunk.size(); i++) {
 			auto idx = payloads.sel->get_index(i);
@@ -277,8 +280,8 @@ public:
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override {
 		auto &state = sink_state->Cast<RawQuackIngestGlobalState>();
-		chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(state.rows)));
-		chunk.SetCardinality(1);
+		chunk.data[0].Append(Value::BIGINT(NumericCast<int64_t>(state.rows)));
+		chunk.CheckCardinality(1);
 		return SourceResultType::FINISHED;
 	}
 
@@ -322,7 +325,7 @@ PhysicalOperator &RawPlanQuackIngestInsert(ClientContext &context, PhysicalPlanG
 	}
 	auto quack_uri = RawDuckQuackUri(catalog);
 	auto token = RawDuckQuackToken(catalog);
-	auto table_name = op.table.name;
+	auto table_name = op.table.name.GetIdentifierName();
 	auto &ingest = planner.Make<PhysicalRawQuackIngest>(std::move(quack_uri), std::move(token), std::move(table_name),
 	                                                    op.estimated_cardinality);
 	ingest.children.push_back(*plan);

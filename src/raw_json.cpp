@@ -5,6 +5,7 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
 
 #include <cstdlib>
 
@@ -975,12 +976,15 @@ static string_t WriteJSONString(yyjson_val *val, Vector &result) {
 // Inference guarantees values fit the column type; anything that does not
 // (or is null/missing) becomes NULL.
 void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vector &result, idx_t offset) {
-	auto &validity = FlatVector::Validity(result);
+	// vectors carry their own size in DuckDB v2: writing through the raw data
+	// pointer does not grow them, so declare the rows we are about to write
+	FlatVector::SetSize(result, offset + vals.size());
+	auto &validity = FlatVector::ValidityMutable(result);
 	auto set_null = [&](idx_t i) {
 		validity.SetInvalid(offset + i);
 	};
 	if (IsRawJSONType(type)) {
-		auto data = FlatVector::GetData<string_t>(result);
+		auto data = FlatVector::GetDataMutable<string_t>(result);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (!val || duckdb_yyjson::yyjson_is_null(val)) {
@@ -993,7 +997,7 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 	}
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN: {
-		auto data = FlatVector::GetData<bool>(result);
+		auto data = FlatVector::GetDataMutable<bool>(result);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (val && duckdb_yyjson::yyjson_is_bool(val)) {
@@ -1005,7 +1009,7 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 		break;
 	}
 	case LogicalTypeId::BIGINT: {
-		auto data = FlatVector::GetData<int64_t>(result);
+		auto data = FlatVector::GetDataMutable<int64_t>(result);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (val && duckdb_yyjson::yyjson_is_sint(val)) {
@@ -1019,7 +1023,7 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 		break;
 	}
 	case LogicalTypeId::DOUBLE: {
-		auto data = FlatVector::GetData<double>(result);
+		auto data = FlatVector::GetDataMutable<double>(result);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (val && duckdb_yyjson::yyjson_is_num(val)) {
@@ -1031,33 +1035,39 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 		break;
 	}
 	case LogicalTypeId::DATE: {
-		auto data = FlatVector::GetData<date_t>(result);
+		auto data = FlatVector::GetDataMutable<date_t>(result);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			idx_t pos = 0;
 			bool special = false;
+			date_t converted;
 			if (!val || !duckdb_yyjson::yyjson_is_str(val) ||
 			    Date::TryConvertDate(duckdb_yyjson::yyjson_get_str(val), duckdb_yyjson::yyjson_get_len(val), pos,
-			                         data[offset + i], special, true) != DateCastResult::SUCCESS) {
+			                         converted, special, true) != DateCastResult::SUCCESS) {
 				set_null(i);
+			} else {
+				data[offset + i] = converted;
 			}
 		}
 		break;
 	}
 	case LogicalTypeId::TIMESTAMP: {
-		auto data = FlatVector::GetData<timestamp_t>(result);
+		auto data = FlatVector::GetDataMutable<timestamp_t>(result);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
+			timestamp_t converted;
 			if (!val || !duckdb_yyjson::yyjson_is_str(val) ||
 			    Timestamp::TryConvertTimestamp(duckdb_yyjson::yyjson_get_str(val), duckdb_yyjson::yyjson_get_len(val),
-			                                   data[offset + i], true) != TimestampCastResult::SUCCESS) {
+			                                   converted, true) != TimestampCastResult::SUCCESS) {
 				set_null(i);
+			} else {
+				data[offset + i] = converted;
 			}
 		}
 		break;
 	}
 	case LogicalTypeId::VARCHAR: {
-		auto data = FlatVector::GetData<string_t>(result);
+		auto data = FlatVector::GetDataMutable<string_t>(result);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (!val || duckdb_yyjson::yyjson_is_null(val)) {
@@ -1073,7 +1083,7 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 		break;
 	}
 	case LogicalTypeId::LIST: {
-		auto entries = FlatVector::GetData<list_entry_t>(result);
+		auto entries = FlatVector::GetDataMutable<list_entry_t>(result);
 		auto child_offset = ListVector::GetListSize(result);
 		vector<yyjson_val *> child_vals;
 		for (idx_t i = 0; i < vals.size(); i++) {
@@ -1093,7 +1103,7 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 		}
 		ListVector::Reserve(result, child_offset + child_vals.size());
 		ListVector::SetListSize(result, child_offset + child_vals.size());
-		FillVector(child_vals, ListType::GetChildType(type), ListVector::GetEntry(result), child_offset);
+		FillVector(child_vals, ListType::GetChildType(type), ListVector::GetChildMutable(result), child_offset);
 		break;
 	}
 	default:

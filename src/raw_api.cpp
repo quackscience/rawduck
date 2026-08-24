@@ -370,11 +370,12 @@ void HandleQuery(const duckdb_httplib::Request &req, duckdb_httplib::Response &r
 	JsonDoc json;
 	auto root = duckdb_yyjson::yyjson_mut_obj(json.doc);
 	auto meta = duckdb_yyjson::yyjson_mut_arr(json.doc);
+	auto &column_names = result->GetNames();
 	for (idx_t col = 0; col < result->ColumnCount(); col++) {
 		auto column = duckdb_yyjson::yyjson_mut_obj(json.doc);
-		duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, column, "name", result->names[col].c_str(),
-		                                          result->names[col].size());
-		auto type = ApiTypeName(result->types[col].ToString());
+		duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, column, "name", column_names[col].c_str(),
+		                                          column_names[col].size());
+		auto type = ApiTypeName(result->GetTypes()[col].ToString());
 		duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, column, "type", type.c_str(), type.size());
 		duckdb_yyjson::yyjson_mut_arr_append(meta, column);
 	}
@@ -384,7 +385,7 @@ void HandleQuery(const duckdb_httplib::Request &req, duckdb_httplib::Response &r
 	for (auto &row : *result) {
 		auto row_obj = duckdb_yyjson::yyjson_mut_obj(json.doc);
 		for (idx_t col = 0; col < result->ColumnCount(); col++) {
-			auto &name = result->names[col];
+			auto &name = column_names[col];
 			duckdb_yyjson::yyjson_mut_obj_add_val(json.doc, row_obj, name.c_str(),
 			                                      ValueToJson(json, row.GetValue<Value>(col)));
 		}
@@ -582,7 +583,7 @@ struct RawServeState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> RawServeBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<RawServeBindData>();
 	auto host = input.named_parameters.find("host");
 	if (host != input.named_parameters.end() && !host->second.IsNull()) {
@@ -613,7 +614,7 @@ static void RawServeFunction(ClientContext &context, TableFunctionInput &data, D
 	auto &bind_data = data.bind_data->Cast<RawServeBindData>();
 	auto &state = data.global_state->Cast<RawServeState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -644,16 +645,16 @@ static void RawServeFunction(ClientContext &context, TableFunctionInput &data, D
 	api.thread = std::thread([server] { server->listen_after_bind(); });
 	api.running = true;
 
-	output.SetValue(0, 0, Value(bind_data.host));
-	output.SetValue(1, 0, Value::INTEGER(bind_data.port));
-	output.SetValue(2, 0, Value::BOOLEAN(!bind_data.token.empty()));
-	output.SetCardinality(1);
+	output.data[0].Append(Value(bind_data.host));
+	output.data[1].Append(Value::INTEGER(bind_data.port));
+	output.data[2].Append(Value::BOOLEAN(!bind_data.token.empty()));
+	output.CheckCardinality(1);
 }
 
 static void RawServeStopFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<RawServeState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -662,12 +663,12 @@ static void RawServeStopFunction(ClientContext &context, TableFunctionInput &dat
 	lock_guard<mutex> guard(api.lock);
 	bool was_running = api.running;
 	api.Shutdown();
-	output.SetValue(0, 0, Value::BOOLEAN(was_running));
-	output.SetCardinality(1);
+	output.data[0].Append(Value::BOOLEAN(was_running));
+	output.CheckCardinality(1);
 }
 
 static unique_ptr<FunctionData> RawServeStopBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::BOOLEAN};
 	names = {"stopped"};
 	return make_uniq<TableFunctionData>();

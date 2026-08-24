@@ -8,6 +8,7 @@
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/storage/table_storage_info.hpp"
 
 namespace duckdb {
 
@@ -57,7 +58,7 @@ public:
 		auto name = lookup_info.GetEntryName();
 		auto entry = tables.find(name);
 		if (entry == tables.end()) {
-			CreateTableInfo info(catalog.GetName(), this->name, name);
+			CreateTableInfo info(QualifiedName(catalog.GetName(), this->name, Identifier(name)));
 			info.columns.AddColumn(ColumnDefinition("payload", LogicalType::VARCHAR));
 			auto table = make_uniq<RawIngestTableEntry>(catalog, *this, info);
 			table->internal = true;
@@ -121,7 +122,8 @@ private:
 
 unique_ptr<SchemaCatalogEntry> RawCreateIngestSchema(Catalog &catalog) {
 	auto info = make_uniq<CreateSchemaInfo>();
-	info->schema = "ingest";
+	// CreateSchemaInfo encodes the path as [schema..., <empty name>]
+	info->SetQualifiedName(QualifiedName({Identifier("ingest")}, Identifier()));
 	info->internal = true;
 	return make_uniq<RawIngestSchemaEntry>(catalog, *info);
 }
@@ -200,7 +202,7 @@ public:
 			state.building = make_shared_ptr<RawParsedPayload>();
 		}
 		UnifiedVectorFormat payloads;
-		chunk.data[0].ToUnifiedFormat(chunk.size(), payloads);
+		chunk.data[0].ToUnifiedFormat(payloads);
 		auto strings = UnifiedVectorFormat::GetData<string_t>(payloads);
 		for (idx_t i = 0; i < chunk.size(); i++) {
 			auto idx = payloads.sel->get_index(i);
@@ -234,8 +236,8 @@ public:
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override {
 		auto &state = sink_state->Cast<RawIngestSinkState>();
-		chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(state.ingestor->Rows())));
-		chunk.SetCardinality(1);
+		chunk.data[0].Append(Value::BIGINT(NumericCast<int64_t>(state.ingestor->Rows())));
+		chunk.CheckCardinality(1);
 		return SourceResultType::FINISHED;
 	}
 
@@ -260,7 +262,8 @@ PhysicalOperator &RawPlanIngestInsert(ClientContext &context, PhysicalPlanGenera
 	if (!plan) {
 		throw NotImplementedException("RawDuck: INSERT INTO ingest tables requires a data source");
 	}
-	auto target = RawQuoteIdentifier(op.table.ParentCatalog().GetName()) + ".main." + RawQuoteIdentifier(op.table.name);
+	auto target = RawQuoteIdentifier(op.table.ParentCatalog().GetName().GetIdentifierName()) + ".main." +
+	              RawQuoteIdentifier(op.table.name.GetIdentifierName());
 	auto &ingest = planner.Make<PhysicalRawIngest>(std::move(target), op.estimated_cardinality);
 	ingest.children.push_back(*plan);
 	return ingest;

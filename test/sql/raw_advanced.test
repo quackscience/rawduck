@@ -394,6 +394,11 @@ SELECT count(*), count(DISTINCT u), max(code) FROM t_rt;
 statement ok
 SET rawduck_async_insert = true;
 
+# park the background flusher so raw_flush() is provably the drain: with the
+# 200ms default a loaded machine lets the flusher win the race first
+statement ok
+SET rawduck_async_busy_timeout_ms = 600000;
+
 # enqueued, not yet visible
 query II
 SELECT rows, created FROM raw_ingest('t_async', '[{"a":1},{"a":2}]');
@@ -418,6 +423,9 @@ query II
 SELECT count(*), count(b) FROM t_async;
 ----
 3	1
+
+statement ok
+SET rawduck_async_busy_timeout_ms = 200;
 
 statement ok
 SET rawduck_async_insert = false;

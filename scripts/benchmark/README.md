@@ -164,6 +164,12 @@ uncontended requests). Regression-tested in `test/http/raw_api_compat.sh`'s
 Compares DuckDB **VARIANT as of v1.5.5** (not the v2.0 shredded-execution preview)
 against RawDuck typed columns on the same OTLP/JSON traces envelopes.
 
+For the same comparison against v2's VARIANT, build on branch `v2.0.0` (both
+submodules track DuckDB main / v2.0-dev) and run the identical commands — the
+harness reads `pragma_version()` and labels the run, so a v2 result file is never
+confused with a v1.5.5 one. See "Running the same comparison on DuckDB v2.0-dev"
+in `BENCHMARK.md`.
+
 ```sh
 # after: git clone --recurse-submodules … && git checkout feat/variant-benchmark
 #        GEN=ninja make release

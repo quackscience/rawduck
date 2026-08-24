@@ -245,7 +245,7 @@ struct RawFlushState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> RawFlushBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::BIGINT, LogicalType::BIGINT};
 	names = {"targets", "rows"};
 	return make_uniq<TableFunctionData>();
@@ -258,7 +258,7 @@ static unique_ptr<GlobalTableFunctionState> RawFlushInit(ClientContext &context,
 static void RawFlushFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<RawFlushState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -266,9 +266,9 @@ static void RawFlushFunction(ClientContext &context, TableFunctionInput &data, D
 	RawAsyncApplySettings(context, buffers);
 	buffers.Start(context.db);
 	auto flushed = buffers.FlushAll();
-	output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(flushed.first)));
-	output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(flushed.second)));
-	output.SetCardinality(1);
+	output.data[0].Append(Value::BIGINT(NumericCast<int64_t>(flushed.first)));
+	output.data[1].Append(Value::BIGINT(NumericCast<int64_t>(flushed.second)));
+	output.CheckCardinality(1);
 }
 
 TableFunction GetRawFlushFunction() {

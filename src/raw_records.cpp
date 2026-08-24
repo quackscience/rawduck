@@ -19,7 +19,7 @@ struct RawRecordsState : public GlobalTableFunctionState {
 };
 
 string RawNamedStringParameter(const named_parameter_map_t &parameters, const string &name) {
-	auto entry = parameters.find(name);
+	auto entry = parameters.find(Identifier(name));
 	if (entry == parameters.end() || entry->second.IsNull()) {
 		return string();
 	}
@@ -43,7 +43,7 @@ void RawAddIngestParameters(TableFunction &function) {
 }
 
 static unique_ptr<FunctionData> RawRecordsBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<RawRecordsBindData>();
 	if (input.inputs[0].IsNull()) {
 		throw InvalidInputException("RawDuck: payload may not be NULL");
@@ -59,7 +59,7 @@ static unique_ptr<FunctionData> RawRecordsBind(ClientContext &context, TableFunc
 	}
 	for (auto &column : result->parsed->columns) {
 		return_types.push_back(column.type);
-		names.push_back(column.name);
+		names.push_back(Identifier(column.name));
 	}
 	return std::move(result);
 }
@@ -82,7 +82,7 @@ static void RawRecordsFunction(ClientContext &context, TableFunctionInput &data,
 		FillVector(state.extractor.ColumnValues(col), columns[col].type, output.data[col], 0);
 	}
 	state.next_row += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 TableFunction GetRawRecordsFunction() {

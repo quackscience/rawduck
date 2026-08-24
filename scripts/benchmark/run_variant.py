@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Compare DuckDB VARIANT (v1.5) against RawDuck shredded tables.
+"""Compare DuckDB VARIANT against RawDuck shredded tables.
 
 Same OTLP/JSON NDJSON envelopes as run_otel.sh. VARIANT is measured as it
-ships in DuckDB v1.5.5 (no v2.0 shredded execution / extraction pushdown).
+ships in whichever DuckDB the extension is pinned to: v1.5.5 on main (no
+shredded execution / extraction pushdown), or the v2.0-dev main tip on the
+v2.0.0 branch. The printed note and the `variant_note` field in the result
+JSON report which one was measured.
 
 Ingest grain is labeled explicitly: envelope rows are not span records.
 
@@ -733,6 +736,21 @@ def duckdb_version(binary: Path) -> str:
         return "unknown"
 
 
+def variant_note(version: str) -> str:
+    """What the measured VARIANT implementation actually is, per DuckDB pin."""
+    tag = version.strip().lower()
+    if "v2" in tag or "-dev" in tag:
+        return (
+            f"DuckDB {version} VARIANT (shredded execution / extract pushdown expected). "
+            "This is the v2.0-dev main tip, not the v1.5.5 pin."
+        )
+    return (
+        f"DuckDB VARIANT as of {version}. The v2.0 preview (shredded execution from "
+        "storage, extraction pushdown, Parquet shred, extra variant_* functions) "
+        "is not in this pin."
+    )
+
+
 def host_info() -> dict:
     info: dict = {
         "hostname": platform.node(),
@@ -844,11 +862,7 @@ def print_summary(doc: dict) -> None:
                 flag = "" if cell["ok"] else "!"
                 cells.append(f"{cell['ms']:.1f}{flag}" .rjust(16))
         print(f"{enc:<22}" + "".join(cells), file=sys.stderr)
-    print(
-        "\nVARIANT here is DuckDB v1.5.5 (persisted shredded VARIANT). "
-        "v2.0 extraction pushdown / shredded execution is not in this pin.",
-        file=sys.stderr,
-    )
+    print("\n" + doc["variant_note"], file=sys.stderr)
 
 
 def merge_best_ingest(acc: dict | None, row: dict) -> dict:
@@ -1010,11 +1024,7 @@ def main() -> int:
         "git_branch": branch,
         "duckdb_version": version,
         "host": host,
-        "variant_note": (
-            "DuckDB VARIANT as of v1.5.5. The v2.0 preview (shredded execution from "
-            "storage, extraction pushdown, Parquet shred, extra variant_* functions) "
-            "is not in this pin."
-        ),
+        "variant_note": variant_note(version),
         "records": args.records,
         "ingest_runs": args.runs,
         "query_runs": args.query_runs,

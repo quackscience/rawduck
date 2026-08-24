@@ -193,7 +193,7 @@ struct RawServeGrpcState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> RawServeGrpcBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<RawServeGrpcBindData>();
 	auto host = input.named_parameters.find("host");
 	if (host != input.named_parameters.end() && !host->second.IsNull()) {
@@ -224,7 +224,7 @@ static void RawServeGrpcFunction(ClientContext &context, TableFunctionInput &dat
 	auto &bind_data = data.bind_data->Cast<RawServeGrpcBindData>();
 	auto &state = data.global_state->Cast<RawServeGrpcState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -265,35 +265,35 @@ static void RawServeGrpcFunction(ClientContext &context, TableFunctionInput &dat
 	grpc_state.port = bound_port;
 	grpc_state.running = true;
 
-	output.SetValue(0, 0, Value(bind_data.host));
-	output.SetValue(1, 0, Value::INTEGER(bound_port));
-	output.SetValue(2, 0, Value::BOOLEAN(!bind_data.token.empty()));
-	output.SetCardinality(1);
+	output.data[0].Append(Value(bind_data.host));
+	output.data[1].Append(Value::INTEGER(bound_port));
+	output.data[2].Append(Value::BOOLEAN(!bind_data.token.empty()));
+	output.CheckCardinality(1);
 #endif
 }
 
 static void RawServeGrpcStopFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<RawServeGrpcState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
 #ifndef RAWDUCK_WITH_GRPC
-	output.SetValue(0, 0, Value::BOOLEAN(false));
-	output.SetCardinality(1);
+	output.data[0].Append(Value::BOOLEAN(false));
+	output.CheckCardinality(1);
 #else
 	auto &grpc_state = GetGrpcState();
 	lock_guard<mutex> guard(grpc_state.lock);
 	bool was_running = grpc_state.running;
 	grpc_state.Shutdown();
-	output.SetValue(0, 0, Value::BOOLEAN(was_running));
-	output.SetCardinality(1);
+	output.data[0].Append(Value::BOOLEAN(was_running));
+	output.CheckCardinality(1);
 #endif
 }
 
 static unique_ptr<FunctionData> RawServeGrpcStopBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::BOOLEAN};
 	names = {"stopped"};
 	return make_uniq<TableFunctionData>();

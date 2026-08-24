@@ -126,6 +126,31 @@ Spark GB10: 20 cores, 122 GiB, Linux aarch64.
 ./scripts/benchmark/run_variant.sh --records 1000000 --runs 3 --threads 8   # many-core ARM
 ```
 
+### Running the same comparison on DuckDB v2.0-dev
+
+The numbers above are the v1.5.5 pin, where VARIANT has no shredded execution and
+no extraction pushdown. Branch `v2.0.0` builds RawDuck against the DuckDB **main
+tip (v2.0-dev)** so the same harness measures v2's VARIANT instead. Nothing about
+the RawDuck path changes — only the DuckDB it links against — so the two result
+files are directly comparable.
+
+`run_variant.py` detects the pin from `pragma_version()` and labels the run
+accordingly (`variant_note` in the result JSON, plus the printed summary line),
+so a v2 run is never mistaken for a v1.5.5 one.
+
+```sh
+git checkout v2.0.0 && git submodule update --init --recursive
+GEN=ninja make release
+./build/release/test/unittest --test-dir . "test/sql/*"
+
+./scripts/benchmark/run_variant.sh --quick
+./scripts/benchmark/run_variant.sh --records 1000000 --runs 3
+```
+
+VARIANT columns still require `STORAGE_VERSION 'v1.5.0'`, so database files written
+by a v2.0-dev run are not interchangeable with the v1.5.5 ones — measure storage per
+branch, never by copying a database across pins.
+
 ## Appendix: GH Archive (wide-schema stress test)
 
 One hour of [GH Archive](https://www.gharchive.org/) data — 247,199 events / 956 MB NDJSON /

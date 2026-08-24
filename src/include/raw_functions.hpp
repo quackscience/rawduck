@@ -122,6 +122,8 @@ string RawOtlpStatusBytes(const string &message);
 // shared SQL generation helpers
 string RawQuoteIdentifier(const string &name);
 string RawQualifiedTarget(const string &target);
+// resolves a target into a fully qualified [catalog, schema, name] path
+QualifiedName RawResolveQualifiedName(ClientContext &context, const string &target);
 
 // shared ingest parameter handling (transform / explode / ignore_errors)
 string RawNamedStringParameter(const named_parameter_map_t &parameters, const string &name);

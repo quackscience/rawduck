@@ -18,6 +18,17 @@ must stay in sync. Build with `GEN=ninja make release`; test with
 `./build/release/test/unittest --test-dir . "test/sql/*"`; format with
 `make format-fix` (CI enforces it).
 
+> **Branch `v2.0.0`**: this branch tracks the DuckDB **main tip (v2.0-dev preview)**
+> instead of v1.5.5 — both submodules point at `main`. It exists to keep the port
+> against the v2 API (`Identifier`, `QualifiedName` accessors, `FlatVector`
+> mutability, `ProjectionIndex`/`TableIndex`, `DataChunk::CheckCardinality`,
+> `ScalarFunction::SetFallible`) building and passing tests, and to benchmark
+> RawDuck against v2's shredded VARIANT. The workflow pins above deliberately stay
+> at `v1.5.5` here (there is no v2 tag to pin to), so the distribution pipeline does
+> not build this branch — verify with a local `GEN=ninja make release` plus the
+> unittest suite. Do not merge it into `main` while `main` is pinned to a stable
+> release.
+
 ## Source map (src/)
 
 | File | Responsibility |

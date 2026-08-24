@@ -5,12 +5,14 @@
 #include <atomic>
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/enums/database_modification_type.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
@@ -20,7 +22,6 @@
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/qualified_name.hpp"
@@ -322,24 +323,46 @@ static LogicalType JoinColumnTypes(const LogicalType &existing, const LogicalTyp
 //===--------------------------------------------------------------------===//
 
 string RawQuoteIdentifier(const string &name) {
-	return KeywordHelper::WriteQuoted(name, '"');
+	return SQLQuotedIdentifier::ToString(name);
 }
 
 static string QuoteLiteral(const string &value) {
-	return KeywordHelper::WriteQuoted(value, '\'');
+	return SQLString::ToString(value);
 }
 
 string RawQualifiedTarget(const string &target) {
 	auto qualified = QualifiedName::Parse(target);
 	string result;
-	if (!qualified.catalog.empty()) {
-		result += RawQuoteIdentifier(qualified.catalog) + ".";
+	if (!qualified.Catalog().empty()) {
+		result += SQLQuotedIdentifier::ToString(qualified.Catalog()) + ".";
 	}
-	if (!qualified.schema.empty()) {
-		result += RawQuoteIdentifier(qualified.schema) + ".";
+	if (!qualified.Schema().empty()) {
+		result += SQLQuotedIdentifier::ToString(qualified.Schema()) + ".";
 	}
-	result += RawQuoteIdentifier(qualified.name);
+	result += SQLQuotedIdentifier::ToString(qualified.Name());
 	return result;
+}
+
+// Parses a user-supplied target into a fully qualified [catalog, schema, name]
+// path: the QualifiedName accessors only report a catalog for a three-part path.
+QualifiedName RawResolveQualifiedName(ClientContext &context, const string &target) {
+	auto parsed_name = QualifiedName::Parse(target);
+	auto catalog_name = parsed_name.Catalog();
+	auto schema_name = parsed_name.Schema();
+	if (catalog_name.empty() && !schema_name.empty()) {
+		// two-part names: the first part may be a catalog (raw.events)
+		if (DatabaseManager::Get(context).GetDatabase(context, schema_name)) {
+			catalog_name = schema_name;
+			schema_name = Identifier();
+		}
+	}
+	if (catalog_name.empty()) {
+		catalog_name = DatabaseManager::GetDefaultDatabase(context);
+	}
+	if (schema_name.empty()) {
+		schema_name = Identifier::DefaultSchema();
+	}
+	return QualifiedName(catalog_name, schema_name, parsed_name.Name());
 }
 
 static unique_ptr<MaterializedQueryResult> RunQuery(Connection &conn, const string &sql) {
@@ -373,7 +396,7 @@ public:
 		auto &storage = table.GetStorage();
 		idx_t physical_index = 0;
 		for (auto &column : table.GetColumns().Physical()) {
-			slots[column.Name()] = physical_index++;
+			slots[column.Name().GetIdentifierName()] = physical_index++;
 		}
 		workers = vector<Worker>(worker_count);
 		for (auto &worker : workers) {
@@ -430,6 +453,7 @@ public:
 	// ALTERs swap the table's storage object, so the merge target must be
 	// the CURRENT catalog entry, not the one captured at pool creation.
 	idx_t Drain(TableCatalogEntry &current_table) {
+		auto &duck_table = current_table.Cast<DuckTableEntry>();
 		auto &storage = current_table.GetStorage();
 		Stop();
 		if (error) {
@@ -485,14 +509,14 @@ public:
 			if (count < merge_threshold) {
 				// genuinely small remainders: append to local storage directly
 				LocalAppendState append_state;
-				storage.InitializeLocalAppend(append_state, current_table, context, no_constraints);
+				storage.InitializeLocalAppend(append_state, duck_table, context, no_constraints);
 				auto &transaction = DuckTransaction::Get(context, current_table.catalog);
 				for (auto &chunk : collection.Chunks(transaction)) {
-					storage.LocalAppend(append_state, context, chunk, false);
+					storage.LocalAppend(append_state, duck_table, context, chunk, false);
 				}
 				storage.FinalizeLocalAppend(append_state);
 			} else {
-				storage.LocalMerge(context, *worker.collection);
+				storage.LocalMerge(context, duck_table, *worker.collection);
 				if (flush_now) {
 					storage.GetOptimisticWriter(context).Merge(*worker.writer);
 				}
@@ -601,7 +625,7 @@ private:
 	void ExtendWorker(Worker &worker, const vector<pair<string, LogicalType>> &new_columns, DataTable &flush_storage) {
 		worker.collection->collection->FinalizeAppend(TransactionData(0, 0), *worker.append_state);
 		for (auto &new_column : new_columns) {
-			ColumnDefinition definition(new_column.first, new_column.second);
+			ColumnDefinition definition(Identifier(new_column.first), new_column.second);
 			BoundConstantExpression null_default(Value(new_column.second));
 			ExpressionExecutor default_executor(context, null_default);
 			worker.collection->collection =
@@ -672,14 +696,14 @@ private:
 					ConstantVector::SetNull(chunk.data[slot], true);
 				}
 			}
-			chunk.SetCardinality(count);
+			chunk.SetChildCardinality(count);
 			// flush completed row groups to disk as we go, overlapping parse +
 			// compression + I/O instead of deferring every byte to drain. The
 			// writer targets the current storage layout; schema evolution
 			// rebuilds it (ExtendWorker) so AddColumn stays safe across flushes.
-			bool row_group_complete = collection_of(worker).Append(chunk, *worker.append_state);
-			if (row_group_complete && allow_flush) {
-				worker.writer->WriteNewRowGroup(*worker.collection);
+			auto flushed_row_group_idx = collection_of(worker).Append(chunk, *worker.append_state);
+			if (flushed_row_group_idx.IsValid() && allow_flush) {
+				worker.writer->WriteNewRowGroup(*worker.collection, flushed_row_group_idx.GetIndex());
 			}
 		}
 	}
@@ -725,21 +749,8 @@ class RawIngestor {
 public:
 	RawIngestor(ClientContext &context, string target_p, RawParseOptions options_p)
 	    : context(context), target(std::move(target_p)), options(std::move(options_p)) {
-		qname = QualifiedName::Parse(target);
-		if (qname.catalog.empty() && !qname.schema.empty()) {
-			// two-part names: the first part may be a catalog (raw.events)
-			if (DatabaseManager::Get(context).GetDatabase(context, qname.schema)) {
-				qname.catalog = qname.schema;
-				qname.schema = string();
-			}
-		}
-		if (qname.catalog.empty()) {
-			qname.catalog = DatabaseManager::GetDefaultDatabase(context);
-		}
-		if (qname.schema.empty()) {
-			qname.schema = DEFAULT_SCHEMA;
-		}
-		auto &catalog = Catalog::GetCatalog(context, qname.catalog);
+		qname = RawResolveQualifiedName(context, target);
+		auto &catalog = Catalog::GetCatalog(context, qname.Catalog());
 		native = catalog.IsDuckCatalog();
 		write_settings = RawWriteSettings::Get(context);
 	}
@@ -778,7 +789,7 @@ public:
 		if (!table || parsed.columns.empty()) {
 			return false;
 		}
-		auto cache_key = qname.catalog + "." + qname.schema + "." + qname.name;
+		auto cache_key = qname.Catalog() + "." + qname.Schema() + "." + qname.Name();
 		auto shape = HashPayloadShape(parsed.columns);
 		auto &cache = *ObjectCache::GetObjectCache(context).GetOrCreate<RawSchemaCache>(RawSchemaCache::ObjectType());
 		bool absorbed = false;
@@ -790,7 +801,7 @@ public:
 		}
 		last_batch_shape_absorbed = absorbed;
 		if (!absorbed) {
-			auto &catalog = Catalog::GetCatalog(context, qname.catalog);
+			auto &catalog = Catalog::GetCatalog(context, qname.Catalog());
 			MetaTransaction::Get(context).ModifyDatabase(
 			    catalog.GetAttached(), DatabaseModificationType::ALTER_TABLE | DatabaseModificationType::INSERT_DATA);
 			vector<pair<string, LogicalType>> adds;
@@ -821,7 +832,7 @@ public:
 		if (parsed.payload.rows.empty()) {
 			return false;
 		}
-		MetaTransaction::Get(context).ModifyDatabase(Catalog::GetCatalog(context, qname.catalog).GetAttached(),
+		MetaTransaction::Get(context).ModifyDatabase(Catalog::GetCatalog(context, qname.Catalog()).GetAttached(),
 		                                             DatabaseModificationType::INSERT_DATA);
 		EnsurePool(*table, parsed, last_batch_shape_absorbed);
 		return pool != nullptr;
@@ -861,8 +872,8 @@ private:
 	optional_ptr<TableCatalogEntry> LookupTable() {
 		// non-template lookup: the template ODR-uses CatalogEntry::Name
 		// statics, which duplicate-define against core on some toolchains
-		EntryLookupInfo lookup_info(CatalogType::TABLE_ENTRY, qname.name);
-		auto entry = Catalog::GetEntry(context, qname.catalog, qname.schema, lookup_info, OnEntryNotFound::RETURN_NULL);
+		EntryLookupInfo lookup_info(CatalogType::TABLE_ENTRY, qname);
+		auto entry = Catalog::GetEntry(context, lookup_info, OnEntryNotFound::RETURN_NULL);
 		if (!entry) {
 			return nullptr;
 		}
@@ -910,7 +921,7 @@ private:
 		case_insensitive_map_t<idx_t> table_index;
 		idx_t physical_index = 0;
 		for (auto &column : columns_list.Physical()) {
-			table_index[column.Name()] = physical_index++;
+			table_index[column.Name().GetIdentifierName()] = physical_index++;
 		}
 		layout.types = table.GetTypes();
 		layout.slot_of.resize(parsed.columns.size());
@@ -935,11 +946,12 @@ private:
 	                  bool &widens) {
 		auto &existing_columns = table.GetColumns();
 		for (auto &column : parsed.columns) {
-			if (!existing_columns.ColumnExists(column.name)) {
+			Identifier column_name(column.name);
+			if (!existing_columns.ColumnExists(column_name)) {
 				adds.emplace_back(column.name, column.type);
 				continue;
 			}
-			auto &existing = existing_columns.GetColumn(column.name);
+			auto &existing = existing_columns.GetColumn(column_name);
 			if (JoinColumnTypes(existing.Type(), column.type) != existing.Type()) {
 				widens = true;
 			}
@@ -978,7 +990,7 @@ private:
 			LegacyIngestNative(std::move(parsed_ptr), table);
 			return;
 		}
-		auto cache_key = qname.catalog + "." + qname.schema + "." + qname.name;
+		auto cache_key = qname.Catalog() + "." + qname.Schema() + "." + qname.Name();
 		auto shape = HashPayloadShape(parsed.columns);
 		auto &cache = *ObjectCache::GetObjectCache(context).GetOrCreate<RawSchemaCache>(RawSchemaCache::ObjectType());
 		bool absorbed;
@@ -991,7 +1003,7 @@ private:
 		bool shape_absorbed = absorbed;
 		if (!absorbed) {
 			// schema-delta slow path, then absorb the shape
-			auto &catalog = Catalog::GetCatalog(context, qname.catalog);
+			auto &catalog = Catalog::GetCatalog(context, qname.Catalog());
 			MetaTransaction::Get(context).ModifyDatabase(
 			    catalog.GetAttached(), DatabaseModificationType::ALTER_TABLE | DatabaseModificationType::INSERT_DATA);
 			vector<pair<string, LogicalType>> adds;
@@ -1022,7 +1034,7 @@ private:
 		if (parsed.payload.rows.empty()) {
 			return;
 		}
-		MetaTransaction::Get(context).ModifyDatabase(Catalog::GetCatalog(context, qname.catalog).GetAttached(),
+		MetaTransaction::Get(context).ModifyDatabase(Catalog::GetCatalog(context, qname.Catalog()).GetAttached(),
 		                                             DatabaseModificationType::INSERT_DATA);
 		EnsurePool(*table, parsed, shape_absorbed);
 		if (pool) {
@@ -1040,7 +1052,7 @@ private:
 		if (parsed.columns.empty()) {
 			return;
 		}
-		auto &catalog = Catalog::GetCatalog(context, qname.catalog);
+		auto &catalog = Catalog::GetCatalog(context, qname.Catalog());
 		// the binder marks modified databases for write statements; we write
 		// from within a table function, so mark the target ourselves
 		MetaTransaction::Get(context).ModifyDatabase(
@@ -1090,11 +1102,11 @@ private:
 	}
 
 	void CreateNative(Catalog &catalog, RawParsedPayload &parsed) {
-		auto info = make_uniq<CreateTableInfo>(qname.catalog, qname.schema, qname.name);
+		auto info = make_uniq<CreateTableInfo>(qname);
 		for (auto &column : parsed.columns) {
-			info->columns.AddColumn(ColumnDefinition(column.name, column.type));
+			info->columns.AddColumn(ColumnDefinition(Identifier(column.name), column.type));
 		}
-		auto &schema_entry = catalog.GetSchema(context, qname.schema);
+		auto &schema_entry = catalog.GetSchema(context, qname.Schema());
 		auto binder = Binder::CreateBinder(context);
 		auto bound_info = binder->BindCreateTableInfo(std::move(info), schema_entry);
 		catalog.CreateTable(context, *bound_info);
@@ -1103,19 +1115,20 @@ private:
 	void EvolveNative(Catalog &catalog, TableCatalogEntry &table, RawParsedPayload &parsed) {
 		auto &existing_columns = table.GetColumns();
 		for (auto &column : parsed.columns) {
-			AlterEntryData data(qname.catalog, qname.schema, qname.name, OnEntryNotFound::THROW_EXCEPTION);
-			if (!existing_columns.ColumnExists(column.name)) {
-				AddColumnInfo add_column(std::move(data), ColumnDefinition(column.name, column.type), false);
+			AlterEntryData data(qname, OnEntryNotFound::THROW_EXCEPTION);
+			Identifier column_name(column.name);
+			if (!existing_columns.ColumnExists(column_name)) {
+				AddColumnInfo add_column(data, ColumnDefinition(column_name, column.type), false);
 				catalog.Alter(context, add_column);
 				columns_added++;
 				continue;
 			}
-			auto &existing = existing_columns.GetColumn(column.name);
+			auto &existing = existing_columns.GetColumn(column_name);
 			auto target_type = JoinColumnTypes(existing.Type(), column.type);
 			if (target_type == existing.Type()) {
 				continue;
 			}
-			auto column_ref = make_uniq<ColumnRefExpression>(column.name);
+			auto column_ref = make_uniq<ColumnRefExpression>(Identifier(column.name));
 			unique_ptr<ParsedExpression> expression;
 			if (IsRawJSONType(target_type) && !IsRawJSONType(existing.Type())) {
 				// a plain cast to JSON would reject bare strings
@@ -1125,7 +1138,7 @@ private:
 			} else {
 				expression = make_uniq<CastExpression>(target_type, std::move(column_ref));
 			}
-			ChangeColumnTypeInfo change_type(std::move(data), column.name, target_type, std::move(expression));
+			ChangeColumnTypeInfo change_type(data, column_name, target_type, std::move(expression));
 			catalog.Alter(context, change_type);
 			columns_widened++;
 		}
@@ -1171,8 +1184,8 @@ private:
 					ConstantVector::SetNull(chunk.data[slot], true);
 				}
 			}
-			chunk.SetCardinality(count);
-			storage.LocalAppend(table, context, chunk, bound_constraints);
+			chunk.SetChildCardinality(count);
+			storage.LocalAppend(table.Cast<DuckTableEntry>(), context, chunk, bound_constraints);
 			rows += count;
 		}
 	}
@@ -1197,7 +1210,7 @@ private:
 			return;
 		}
 		for (idx_t col = 0; col < probe->ColumnCount(); col++) {
-			fallback_types[probe->names[col]] = probe->types[col];
+			fallback_types[probe->GetNames()[col].GetIdentifierName()] = probe->GetTypes()[col];
 		}
 	}
 
@@ -1610,14 +1623,14 @@ struct RawIngestState : public GlobalTableFunctionState {
 	bool done = false;
 };
 
-static void SetIngestSchema(vector<LogicalType> &return_types, vector<string> &names) {
+static void SetIngestSchema(vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BIGINT,
 	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT};
 	names = {"table", "created", "columns_added", "columns_widened", "rows", "errors"};
 }
 
 static unique_ptr<FunctionData> RawIngestBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<RawIngestBindData>();
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
 		throw InvalidInputException("RawDuck: raw_ingest(table, payload) arguments may not be NULL");
@@ -1633,31 +1646,33 @@ static unique_ptr<GlobalTableFunctionState> RawIngestInit(ClientContext &context
 	return make_uniq<RawIngestState>();
 }
 
-static void EmitIngestRow(DataChunk &output, const string &target, const RawIngestor &ingestor) {
-	output.SetValue(0, 0, Value(target));
-	output.SetValue(1, 0, Value::BOOLEAN(ingestor.created));
-	output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.columns_added)));
-	output.SetValue(3, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.columns_widened)));
-	output.SetValue(4, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.rows)));
-	output.SetValue(5, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.errors)));
-	output.SetCardinality(1);
+// Emits the six shared result columns. Callers own the cardinality: raw_ingest_file
+// appends its extra `batches` column afterwards, so the chunk is only complete
+// (and only verifiable) once every column has been written.
+static void EmitIngestRow(DataChunk &output, const string &target, const RawIngestStats &stats) {
+	output.data[0].Append(Value(target));
+	output.data[1].Append(Value::BOOLEAN(stats.created));
+	output.data[2].Append(Value::BIGINT(NumericCast<int64_t>(stats.columns_added)));
+	output.data[3].Append(Value::BIGINT(NumericCast<int64_t>(stats.columns_widened)));
+	output.data[4].Append(Value::BIGINT(NumericCast<int64_t>(stats.rows)));
+	output.data[5].Append(Value::BIGINT(NumericCast<int64_t>(stats.errors)));
 }
 
-static void EmitIngestRow(DataChunk &output, const string &target, const RawIngestStats &stats) {
-	output.SetValue(0, 0, Value(target));
-	output.SetValue(1, 0, Value::BOOLEAN(stats.created));
-	output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(stats.columns_added)));
-	output.SetValue(3, 0, Value::BIGINT(NumericCast<int64_t>(stats.columns_widened)));
-	output.SetValue(4, 0, Value::BIGINT(NumericCast<int64_t>(stats.rows)));
-	output.SetValue(5, 0, Value::BIGINT(NumericCast<int64_t>(stats.errors)));
-	output.SetCardinality(1);
+static void EmitIngestRow(DataChunk &output, const string &target, const RawIngestor &ingestor) {
+	RawIngestStats stats;
+	stats.created = ingestor.created;
+	stats.columns_added = ingestor.columns_added;
+	stats.columns_widened = ingestor.columns_widened;
+	stats.rows = ingestor.rows;
+	stats.errors = ingestor.errors;
+	EmitIngestRow(output, target, stats);
 }
 
 static void RawIngestFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<RawIngestBindData>();
 	auto &state = data.global_state->Cast<RawIngestState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -1665,19 +1680,15 @@ static void RawIngestFunction(ClientContext &context, TableFunctionInput &data, 
 	if (RawAsyncEnabled(context)) {
 		// fire-and-forget: enqueue and return; the background flusher ingests
 		RawAsyncEnqueue(context, bind_data.target, bind_data.payload, bind_data.options);
-		output.SetValue(0, 0, Value(bind_data.target));
-		output.SetValue(1, 0, Value::BOOLEAN(false));
-		output.SetValue(2, 0, Value::BIGINT(0));
-		output.SetValue(3, 0, Value::BIGINT(0));
-		output.SetValue(4, 0, Value::BIGINT(0));
-		output.SetValue(5, 0, Value::BIGINT(0));
-		output.SetCardinality(1);
+		EmitIngestRow(output, bind_data.target, RawIngestStats());
+		output.CheckCardinality(1);
 		return;
 	}
 	RawIngestor ingestor(context, bind_data.target, bind_data.options);
 	ingestor.Ingest(bind_data.payload);
 	ingestor.Finish();
 	EmitIngestRow(output, bind_data.target, ingestor);
+	output.CheckCardinality(1);
 }
 
 TableFunction GetRawIngestFunction() {
@@ -1703,7 +1714,7 @@ static constexpr idx_t RAW_READ_BUFFER_SIZE = 16ULL * 1024ULL * 1024ULL;
 static constexpr idx_t RAW_BATCH_BYTE_TARGET = 8ULL * 1024ULL * 1024ULL;
 
 static unique_ptr<FunctionData> RawIngestFileBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<RawIngestBindData>();
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
 		throw InvalidInputException("RawDuck: raw_ingest_file(table, path) arguments may not be NULL");
@@ -1825,7 +1836,7 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 	auto &bind_data = data.bind_data->Cast<RawIngestBindData>();
 	auto &state = data.global_state->Cast<RawIngestState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -2005,7 +2016,7 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 			}
 			ingestor.Finish();
 			EmitIngestRow(output, bind_data.target, ingestor);
-			output.SetValue(6, 0, Value::BIGINT(NumericCast<int64_t>(batches_result)));
+			output.data[6].Append(Value::BIGINT(NumericCast<int64_t>(batches_result)));
 		}
 	} catch (...) {
 		pipeline.Abort();
@@ -2017,8 +2028,9 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 		std::rethrow_exception(pipeline.error);
 	}
 	if (consumer_count > 1) {
-		output.SetValue(6, 0, Value::BIGINT(NumericCast<int64_t>(batches_result)));
+		output.data[6].Append(Value::BIGINT(NumericCast<int64_t>(batches_result)));
 	}
+	output.CheckCardinality(1);
 	return;
 }
 

@@ -89,7 +89,9 @@ static void RawTransformDefineFunction(DataChunk &args, ExpressionState &state, 
 ScalarFunction GetRawTransformDefineFunction() {
 	ScalarFunction function("raw_transform_define", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
 	                        RawTransformDefineFunction);
-	function.stability = FunctionStability::VOLATILE;
+	function.SetStability(FunctionStability::VOLATILE);
+	// rejects empty names/paths and redefinitions of built-in transforms
+	function.SetFallible();
 	return function;
 }
 
@@ -103,7 +105,7 @@ struct RawTransformsState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> RawTransformsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN};
 	names = {"name", "explode", "builtin"};
 	return make_uniq<TableFunctionData>();
@@ -127,12 +129,12 @@ static void RawTransformsFunction(ClientContext &context, TableFunctionInput &da
 	idx_t count = 0;
 	while (state.next < state.entries.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &entry = state.entries[state.next++];
-		output.SetValue(0, count, Value(std::get<0>(entry)));
-		output.SetValue(1, count, Value(std::get<1>(entry)));
-		output.SetValue(2, count, Value::BOOLEAN(std::get<2>(entry)));
+		output.data[0].Append(Value(std::get<0>(entry)));
+		output.data[1].Append(Value(std::get<1>(entry)));
+		output.data[2].Append(Value::BOOLEAN(std::get<2>(entry)));
 		count++;
 	}
-	output.SetCardinality(count);
+	output.CheckCardinality(count);
 }
 
 TableFunction GetRawTransformsFunction() {

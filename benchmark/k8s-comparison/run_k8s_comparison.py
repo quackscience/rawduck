@@ -91,18 +91,18 @@ QUERIES = {
         "openobserve": "SELECT http_path, avg(http_latency_ms) as avg_ms FROM k8s_logs GROUP BY http_path",
         "clickhouse": "SELECT http_path, avg(http_latency_ms) as avg_ms FROM k8s_logs GROUP BY http_path",
     },
-    # Row fetch queries
+    # Row fetch queries (specific columns to avoid JSON serialization overhead skewing results)
     "recent_errors": {
         "desc": "Fetch recent errors",
-        "rawduck": "SELECT * FROM k8s_logs WHERE level = 'ERROR' ORDER BY _timestamp DESC LIMIT 100",
-        "openobserve": "SELECT * FROM k8s_logs WHERE level = 'ERROR' ORDER BY _timestamp DESC LIMIT 100",
-        "clickhouse": "SELECT * FROM k8s_logs WHERE level = 'ERROR' ORDER BY _timestamp DESC LIMIT 100",
+        "rawduck": "SELECT _timestamp, level, service_name, message, error_message FROM k8s_logs WHERE level = 'ERROR' ORDER BY _timestamp DESC LIMIT 100",
+        "openobserve": "SELECT _timestamp, level, service_name, message, error_message FROM k8s_logs WHERE level = 'ERROR' ORDER BY _timestamp DESC LIMIT 100",
+        "clickhouse": "SELECT _timestamp, level, service_name, message, error_message FROM k8s_logs WHERE level = 'ERROR' ORDER BY _timestamp DESC LIMIT 100",
     },
     "service_sample": {
         "desc": "Sample rows for a specific service",
-        "rawduck": "SELECT * FROM k8s_logs WHERE service_name = 'api-gateway' LIMIT 100",
-        "openobserve": "SELECT * FROM k8s_logs WHERE service_name = 'api-gateway' LIMIT 100",
-        "clickhouse": "SELECT * FROM k8s_logs WHERE service_name = 'api-gateway' LIMIT 100",
+        "rawduck": "SELECT _timestamp, level, message, http_status, http_latency_ms FROM k8s_logs WHERE service_name = 'api-gateway' LIMIT 100",
+        "openobserve": "SELECT _timestamp, level, message, http_status, http_latency_ms FROM k8s_logs WHERE service_name = 'api-gateway' LIMIT 100",
+        "clickhouse": "SELECT _timestamp, level, message, http_status, http_latency_ms FROM k8s_logs WHERE service_name = 'api-gateway' LIMIT 100",
     },
     "high_latency": {
         "desc": "Find high latency requests",

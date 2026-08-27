@@ -82,6 +82,40 @@ Kubernetes-style log records with 25 columns:
 - **Storage size**: On-disk footprint after ingest
 - **Query latency**: Cold and hot (cached) execution times
 
+## Results
+
+Measured with `./run_full_benchmark.sh` (full 10M-record run, `--systems` defaults, 3 query runs
+each) on an NVIDIA GB10 Spark aarch64 host (20-core Cortex-X925/A725, 121 GiB RAM). Absolute numbers
+are hardware-dependent -- re-run `./run_full_benchmark.sh` on your own machine for numbers that
+matter for your deployment; this is one data point, not a universal claim.
+
+### Ingest (10,000,000 records, ~6.4 GB NDJSON)
+
+| System | Time (s) | Records/s | Storage (MB) |
+|---|---:|---:|---:|
+| RawDuck | 27.7 | 361,573 | 581.0 |
+| ClickHouse | 29.5 | 339,156 | 2,951.4 |
+| OpenObserve | 140.0 | 71,422 | n/a (not reported by the API) |
+
+### Query latency, hot (ms, best of 3 runs)
+
+| Query | RawDuck | ClickHouse | OpenObserve |
+|---|---:|---:|---:|
+| count_by_service | 2.7 | 6.8 | 13.6 |
+| filter_trace | 14.5 | 16.7 | 44.7 |
+| filter_error | 3.6 | 7.0 | 30.0 |
+| histogram_minute | 11.2 | 11.3 | 19.6 |
+| status_distribution | 2.9 | 6.0 | 17.1 |
+| avg_latency_by_path | 4.5 | 8.9 | 28.6 |
+| recent_errors | 4.3 | 4.1 | 13.4 |
+| service_sample | 1.4 | 4.4 | 18.2 |
+| high_latency | 3.7 | 8.9 | 35.1 |
+
+RawDuck matches or beats ClickHouse on ingest throughput while using roughly a fifth of its storage
+footprint, and wins or ties nearly every query -- often by 2-3x -- against both ClickHouse and
+OpenObserve. Full per-query cold/hot/all-runs numbers are in `results/k8s_comparison_10m.json` after
+any run (gitignored; not checked in, since it's regenerated data, not source).
+
 ## Usage
 
 ```bash

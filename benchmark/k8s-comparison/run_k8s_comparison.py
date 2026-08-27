@@ -750,32 +750,48 @@ def main() -> int:
         output_path = RESULTS_DIR / f"k8s_comparison_{records // 1_000_000}m.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    new_result_blocks = [
+        {
+            "system": r.system,
+            "ingest_time_s": r.ingest_time_s,
+            "storage_mb": r.storage_mb,
+            "records": r.records,
+            "error": r.error,
+            "queries": [
+                {
+                    "name": q.name,
+                    "cold_ms": q.cold_ms,
+                    "hot_ms": q.hot_ms,
+                    "all_runs_ms": q.runs,
+                    "error": q.error,
+                }
+                for q in r.queries
+            ],
+        }
+        for r in results
+    ]
+    # run_full_benchmark.sh invokes this script once per system (--systems
+    # rawduck, then --systems openobserve, then --systems clickhouse) against
+    # the same default output path -- a plain overwrite here would leave only
+    # the last phase's system in the file. Merge with whatever's already on
+    # disk instead, keeping results for systems this run didn't touch and
+    # replacing results for systems it did (so a single-system re-run, e.g.
+    # --systems rawduck to redo a bad measurement, still updates in place).
+    new_systems = {r.system for r in results}
+    existing_blocks = []
+    if output_path.exists():
+        try:
+            existing = json.loads(output_path.read_text())
+            existing_blocks = [b for b in existing.get("results", []) if b.get("system") not in new_systems]
+        except (json.JSONDecodeError, OSError):
+            existing_blocks = []
     output = {
         "records": records,
         "query_runs": runs,
         "data_file": str(data_path),
         "data_size_mb": data_path.stat().st_size / (1024 * 1024),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "results": [
-            {
-                "system": r.system,
-                "ingest_time_s": r.ingest_time_s,
-                "storage_mb": r.storage_mb,
-                "records": r.records,
-                "error": r.error,
-                "queries": [
-                    {
-                        "name": q.name,
-                        "cold_ms": q.cold_ms,
-                        "hot_ms": q.hot_ms,
-                        "all_runs_ms": q.runs,
-                        "error": q.error,
-                    }
-                    for q in r.queries
-                ],
-            }
-            for r in results
-        ],
+        "results": existing_blocks + new_result_blocks,
     }
     with output_path.open("w") as f:
         json.dump(output, f, indent=2)

@@ -461,17 +461,36 @@ ORDER BY (_timestamp)"""
         result.error = f"Failed to create table: {e}"
         return result
 
-    # Ingest data (with async_insert=0 to ensure fair sync comparison)
+    # Ingest data in chunks (large files can't be sent in one request)
+    # Use 100k lines per chunk like RawDuck's batch approach for fair comparison
+    chunk_size = 100000
     start = time.perf_counter()
     try:
         with data_path.open("rb") as f:
-            req = urllib.request.Request(
-                "http://127.0.0.1:8123/?query=INSERT%20INTO%20k8s_logs%20FORMAT%20JSONEachRow&async_insert=0&wait_end_of_query=1",
-                data=f.read(),
-                method="POST",
-            )
-            req.add_header("Content-Type", "application/octet-stream")
-            urllib.request.urlopen(req, timeout=600)
+            lines = []
+            for line in f:
+                lines.append(line)
+                if len(lines) >= chunk_size:
+                    payload = b"".join(lines)
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:8123/?query=INSERT%20INTO%20k8s_logs%20FORMAT%20JSONEachRow&async_insert=0&wait_end_of_query=1",
+                        data=payload,
+                        method="POST",
+                    )
+                    req.add_header("Content-Type", "application/octet-stream")
+                    urllib.request.urlopen(req, timeout=300)
+                    lines = []
+
+            # Final chunk
+            if lines:
+                payload = b"".join(lines)
+                req = urllib.request.Request(
+                    "http://127.0.0.1:8123/?query=INSERT%20INTO%20k8s_logs%20FORMAT%20JSONEachRow&async_insert=0&wait_end_of_query=1",
+                    data=payload,
+                    method="POST",
+                )
+                req.add_header("Content-Type", "application/octet-stream")
+                urllib.request.urlopen(req, timeout=300)
 
         result.ingest_time_s = time.perf_counter() - start
 

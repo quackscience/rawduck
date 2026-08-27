@@ -18,6 +18,11 @@ from pathlib import Path
 
 random.seed(42)
 
+# Width of the generated timestamp window, in hours. Kept well inside OpenObserve's
+# 5h default ingest-lookback so that a long benchmark run cannot drift records out of
+# the accepted window between generation and ingest.
+SPAN_HOURS = 2
+
 # Realistic distributions
 SERVICES = ["api-gateway", "user-service", "order-service", "payment-service",
             "inventory-service", "notification-service", "search-service", "auth-service",
@@ -112,10 +117,20 @@ def main() -> int:
     out_path = Path(sys.argv[2]) if len(sys.argv) > 2 else default_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Base timestamp: recent data (OpenObserve only accepts last few hours by default)
+    # Timestamps must span a window that is entirely in the PAST at generation time and
+    # still entirely inside OpenObserve's accepted ingest window when ingest actually runs
+    # (which can be well after generation - RawDuck is benchmarked first).
+    #
+    # OpenObserve discards records outside [now - ZO_INGEST_ALLOWED_UPTO, now +
+    # ZO_INGEST_ALLOWED_IN_FUTURE] (src/core/src/logs/ingest.rs, handle_timestamp).
+    # Defaults are 5h past / 24h future. Future-dated records would ingest fine but then
+    # fall outside any query window ending at "now", so the newest record is pinned one
+    # minute in the past. See SPAN_HOURS note in run_k8s_comparison.py.
     import time as time_module
-    ts_base = int(time_module.time() * 1_000_000_000) - (3 * 60 * 60 * 1_000_000_000)  # 3 hours ago
-    ts_increment = (4 * 60 * 60 * 1_000_000_000) // total  # Spread over 4 hours
+    span_ns = SPAN_HOURS * 60 * 60 * 1_000_000_000
+    ts_end = int(time_module.time() * 1_000_000_000) - (60 * 1_000_000_000)  # 1 min ago
+    ts_base = ts_end - span_ns
+    ts_increment = max(1, span_ns // total)
 
     print(f"Generating {total:,} records to {out_path}...")
     start = time.perf_counter()

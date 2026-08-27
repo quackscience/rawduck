@@ -49,7 +49,7 @@ import gen_k8s_logs
 from pathlib import Path
 data_dir = Path('data')
 data_dir.mkdir(exist_ok=True)
-data_path = data_dir / 'k8s_logs_${RECORDS}.ndjson'
+data_path = data_dir / f'k8s_logs_{${RECORDS} // 1_000_000}m.ndjson'
 if not data_path.exists():
     sys.argv = ['gen', '$RECORDS', str(data_path)]
     gen_k8s_logs.main()
@@ -68,6 +68,12 @@ start_openobserve() {
     export ZO_ROOT_USER_PASSWORD="Complexpass#123"
     export ZO_DATA_DIR="$SETUP_DIR/openobserve_data"
     export ZO_HTTP_PORT="5080"
+    # Records are generated fresh at the start of the run, but RawDuck is benchmarked
+    # first, so by the time OpenObserve ingests them they are already some hours old.
+    # OpenObserve discards anything outside this window (handle_timestamp in
+    # src/core/src/logs/ingest.rs); the defaults are 5h past / 24h future.
+    export ZO_INGEST_ALLOWED_UPTO="48"
+    export ZO_INGEST_ALLOWED_IN_FUTURE="48"
 
     "$SETUP_DIR/openobserve/openobserve" > "$SETUP_DIR/openobserve.log" 2>&1 &
     echo $! > "$SETUP_DIR/openobserve.pid"

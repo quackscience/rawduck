@@ -13,13 +13,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SETUP_DIR="$SCRIPT_DIR/setup"
 PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
-# Parse args to extract records count for data generation
+# Parse args to extract records count for data generation. --records N (or
+# --records=N) must be honored here too, not just forwarded to the Python
+# side further down -- otherwise this pre-generation step always produces a
+# 10M-record file regardless of what was actually asked for, and Python's own
+# "generate if missing" fallback silently regenerates the right file anyway
+# (correct result, but the pre-generation step becomes pure wasted work for
+# any --records value other than the 10M default or --quick's 1M).
 RECORDS=10000000
 RUNS=3
+prev_was_records_flag=0
 for arg in "$@"; do
-    if [[ "$arg" == "--quick" ]]; then
-        RECORDS=1000000
+    if [[ "$prev_was_records_flag" == "1" ]]; then
+        RECORDS="$arg"
+        prev_was_records_flag=0
+        continue
     fi
+    case "$arg" in
+        --quick) RECORDS=1000000 ;;
+        --records) prev_was_records_flag=1 ;;
+        --records=*) RECORDS="${arg#--records=}" ;;
+    esac
 done
 
 # Check binaries

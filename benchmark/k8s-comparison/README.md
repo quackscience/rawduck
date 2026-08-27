@@ -84,37 +84,56 @@ Kubernetes-style log records with 25 columns:
 
 ## Results
 
-Measured with `./run_full_benchmark.sh` (full 10M-record run, `--systems` defaults, 3 query runs
-each) on an NVIDIA GB10 Spark aarch64 host (20-core Cortex-X925/A725, 121 GiB RAM). Absolute numbers
-are hardware-dependent -- re-run `./run_full_benchmark.sh` on your own machine for numbers that
-matter for your deployment; this is one data point, not a universal claim.
+Best of 3 complete `./run_full_benchmark.sh` runs (full 10M-record ingest + 3 query runs each,
+repeated 3 times end-to-end) on an NVIDIA GB10 Spark aarch64 host (20-core Cortex-X925/A725, 121 GiB
+RAM). Every one of the 9 system-runs verified its own row count after ingest (all `10,000,000`, no
+short-ingests or empty-result queries silently scored as fast -- see the "measurement defects" fix
+below); the best of 3 full runs is reported, with the run-to-run spread shown so it doesn't read as
+more precise than it is. Absolute numbers are hardware-dependent -- re-run `./run_full_benchmark.sh`
+on your own machine for numbers that matter for your deployment; this is one data point, not a
+universal claim, and CI now runs it on GitHub-hosted workers too (see below).
 
 ### Ingest (10,000,000 records, ~6.4 GB NDJSON)
 
-| System | Time (s) | Records/s | Storage (MB) |
+| System | Best of 3 (s) | Records/s | Storage (MB) |
 |---|---:|---:|---:|
-| RawDuck | 27.7 | 361,573 | 581.0 |
-| ClickHouse | 29.5 | 339,156 | 2,951.4 |
-| OpenObserve | 140.0 | 71,422 | n/a (not reported by the API) |
+| RawDuck | 21.3 | 469,080 | ~581 |
+| ClickHouse | 22.2 | 450,957 | 2,975.8 |
+| OpenObserve | 123.8 | 80,792 | 855.4 (5,594 uncompressed, 6.5x) |
 
-### Query latency, hot (ms, best of 3 runs)
+### Query latency, hot (ms, best of 3 full runs; +spread shows the worst-vs-best run delta)
 
 | Query | RawDuck | ClickHouse | OpenObserve |
 |---|---:|---:|---:|
-| count_by_service | 2.7 | 6.8 | 13.6 |
-| filter_trace | 14.5 | 16.7 | 44.7 |
-| filter_error | 3.6 | 7.0 | 30.0 |
-| histogram_minute | 11.2 | 11.3 | 19.6 |
-| status_distribution | 2.9 | 6.0 | 17.1 |
-| avg_latency_by_path | 4.5 | 8.9 | 28.6 |
-| recent_errors | 4.3 | 4.1 | 13.4 |
-| service_sample | 1.4 | 4.4 | 18.2 |
-| high_latency | 3.7 | 8.9 | 35.1 |
+| count_by_service | 2.5 (+1.4) | 5.1 (+2.0) | 18.1 (+11.5) |
+| filter_trace | 11.9 (+0.7) | 16.0 (+0.5) | 45.9 (+10.6) |
+| filter_error | 3.5 (+0.7) | 6.8 (+0.6) | 28.4 (+8.3) |
+| histogram_minute | 10.6 (+0.7) | 11.3 (+0.6) | 24.7 (+5.0) |
+| status_distribution | 2.3 (+0.6) | 5.6 (+0.3) | 18.7 (+2.8) |
+| avg_latency_by_path | 3.4 (+1.8) | 6.5 (+1.9) | 36.2 (+2.6) |
+| recent_errors | 3.5 (+0.9) | 3.4 (+1.6) | 6.2 (+4.4) |
+| service_sample | 0.9 (+0.4) | 4.0 (+0.7) | 7.4 (+4.5) |
+| high_latency | 3.1 (+0.6) | 7.9 (+1.0) | 29.7 (+13.0) |
 
-RawDuck matches or beats ClickHouse on ingest throughput while using roughly a fifth of its storage
-footprint, and wins or ties nearly every query -- often by 2-3x -- against both ClickHouse and
-OpenObserve. Full per-query cold/hot/all-runs numbers are in `results/k8s_comparison_10m.json` after
-any run (gitignored; not checked in, since it's regenerated data, not source).
+RawDuck ingests fastest, uses roughly a fifth of ClickHouse's storage footprint, and averages **2.1x**
+faster than ClickHouse and **6.7x** faster than OpenObserve across these 9 queries. Run-to-run spread
+is tight for RawDuck/ClickHouse (sub-millisecond to ~2ms) and wider for OpenObserve, consistent with
+background compaction still settling during the sweep. Full per-query cold/hot/all-runs numbers are
+in `results/k8s_comparison_10m.json` after any run (gitignored; not checked in, since it's
+regenerated data, not source).
+
+### Measurement defects fixed since the first pass
+
+The harness could previously report fast query times against a store holding no matching rows or a
+partially-discarded ingest, which would silently invert the comparison rather than just add noise.
+Fixed (see PR #14): a future-dated query window that fell partly outside OpenObserve's default
+ingest-acceptance range, empty query results being timed instead of flagged, discarded-record ingest
+responses being read as successful, uncontrolled time-since-ingest during the query sweep, and
+OpenObserve's storage size never being read from its streams API (always printed `0.0`). Separately,
+`histogram_minute` was collapsing OpenObserve's result to a single bucket instead of ~120 -- its
+`_timestamp` is normalized to microseconds on ingest while the query divided by a
+nanoseconds-per-minute constant, so it was measuring a cheaper query than RawDuck/ClickHouse were
+running. All three systems now group into the same 121 buckets.
 
 ## Usage
 

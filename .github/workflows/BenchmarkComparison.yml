@@ -1,0 +1,113 @@
+# On-demand cross-system benchmark: RawDuck vs ClickHouse vs OpenObserve on
+# K8s-style log data (benchmark/k8s-comparison/). Manual dispatch only -- this
+# builds RawDuck from source and downloads/runs ClickHouse and OpenObserve
+# binaries directly on the runner (no Docker), so a run takes real minutes and
+# is meant to be triggered when someone actually wants fresh numbers, not on
+# every push.
+#
+# GitHub-hosted runners are a different (usually smaller, shared/virtualized)
+# machine than whatever produced the numbers in
+# benchmark/k8s-comparison/README.md -- this exists to see how the comparison
+# holds up there, not to reproduce that README's exact figures.
+name: K8s Comparison Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      records:
+        description: 'Number of log records to generate/ingest (1000000 = quick, 10000000 = full; full run is heavier on hosted-runner disk/RAM/time)'
+        required: false
+        default: '1000000'
+      runs:
+        description: 'Query repetitions per system (1 = cold only, 3+ = cold + hot)'
+        required: false
+        default: '3'
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: Run k8s-comparison benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake
+
+      - name: Build RawDuck (release)
+        run: GEN=ninja make release
+
+      - name: Install OpenObserve
+        run: |
+          cd benchmark/k8s-comparison/setup
+          ./install_openobserve.sh
+
+      - name: Install ClickHouse
+        run: |
+          cd benchmark/k8s-comparison/setup
+          ./install_clickhouse.sh
+          chmod +x clickhouse/clickhouse
+
+      - name: Run benchmark
+        working-directory: benchmark/k8s-comparison
+        run: ./run_full_benchmark.sh --records "${{ inputs.records }}" --runs "${{ inputs.runs }}"
+
+      - name: Summarize results
+        if: always()
+        working-directory: benchmark/k8s-comparison
+        run: |
+          python3 - "${{ inputs.records }}" <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import sys
+          from pathlib import Path
+
+          records = int(sys.argv[1])
+          results_path = Path("results") / f"k8s_comparison_{records // 1_000_000}m.json"
+          if not results_path.exists():
+              print(f"No results file at {results_path} (run may have failed before saving).")
+              sys.exit(0)
+
+          data = json.loads(results_path.read_text())
+          systems = [r["system"] for r in data["results"]]
+
+          print(f"# K8s Comparison Benchmark: {data['records']:,} records\n")
+          print(f"Data file: `{data['data_file']}` ({data['data_size_mb']:.1f} MB), {data['timestamp']}\n")
+
+          print("## Ingest\n")
+          print("| System | Time (s) | Records/s | Storage (MB) | Verified | Error |")
+          print("|---|---:|---:|---:|---:|---|")
+          for r in data["results"]:
+              rate = r["records"] / r["ingest_time_s"] if r.get("ingest_time_s") else 0
+              print(f"| {r['system']} | {r.get('ingest_time_s', 0):.1f} | {rate:,.0f} | "
+                    f"{r.get('storage_mb', 0):.1f} | {r.get('verified_records', 'n/a')} | {r.get('error') or ''} |")
+
+          print("\n## Hot query latency (ms, best of subsequent runs)\n")
+          query_names = [q["name"] for q in data["results"][0]["queries"]] if data["results"] else []
+          print("| Query | " + " | ".join(systems) + " |")
+          print("|---|" + "---:|" * len(systems))
+          for qname in query_names:
+              row = [qname]
+              for sysname in systems:
+                  r = next((r for r in data["results"] if r["system"] == sysname), None)
+                  q = next((q for q in r["queries"] if q["name"] == qname), None) if r else None
+                  row.append(f"{q['hot_ms']:.1f}" if q and not q.get("error") else "error")
+              print("| " + " | ".join(row) + " |")
+          EOF
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-comparison-results
+          path: |
+            benchmark/k8s-comparison/results/*.json
+            benchmark/k8s-comparison/setup/*.log
+          retention-days: 30
+          if-no-files-found: warn

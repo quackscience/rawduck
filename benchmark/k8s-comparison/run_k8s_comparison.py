@@ -98,7 +98,13 @@ QUERIES = {
     "histogram_minute": {
         "desc": "Records per minute histogram",
         "rawduck": "SELECT (_timestamp / 60000000000)::BIGINT as minute, count(*) FROM k8s_logs GROUP BY minute ORDER BY minute",
-        "openobserve": "SELECT (_timestamp / 60000000000) as minute, count(*) FROM k8s_logs GROUP BY minute ORDER BY minute",
+        # OpenObserve normalises the nanosecond _timestamp we send at ingest down to
+        # microseconds on write (parse_i64_to_timestamp_micros, src/config/src/utils/time.rs
+        # - same normalisation the query-window code below already accounts for), so the
+        # stored column is 1000x smaller than what RawDuck/ClickHouse hold. Dividing by the
+        # nanosecond-per-minute constant here collapsed the whole span into a single bucket
+        # (rows=1 instead of ~120) - not a slow query, a wrong one.
+        "openobserve": "SELECT (_timestamp / 60000000) as minute, count(*) FROM k8s_logs GROUP BY minute ORDER BY minute",
         "clickhouse": "SELECT intDiv(_timestamp, 60000000000) as minute, count(*) FROM k8s_logs GROUP BY minute ORDER BY minute",
     },
     "status_distribution": {

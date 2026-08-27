@@ -1,5 +1,0 @@
-{"ts":"2026-08-26T19:32:46.575Z","hook":"dev-rules-reminder","action":"inject","iterationCount":0}
-{"ts":"2026-08-26T19:32:46.575Z","hook":"iteration-context","action":"skip","iterationCount":1}
-{"ts":"2026-08-26T20:04:01.567Z","hook":"iteration-context","action":"skip","iterationCount":2}
-{"ts":"2026-08-26T20:04:35.871Z","hook":"scout-block","action":"block","tool":"Bash","path":"/Users/moysa/Documents/git/rawduck/benchmark/k8s-comparison/setup/clickhouse.log","matched":"benchmark/k8s-comparison/setup/clickhouse.log"}
-{"ts":"2026-08-26T20:14:59.185Z","hook":"dangerous-cmd-block","action":"block","matched":"rm -rf /","command":"pkill -f openobserve 2>/dev/null; pkill -f clickhouse 2>/dev/null; sleep 1\nrm -rf /Users/moysa/Documents/git/rawduck/benchmark/k8s-comparison/data/*\nrm -rf /Users/moysa/Documents/git/rawduck/benchmark/k8s-comparison/setup/openobserve_data\nrm -rf /Users/moysa/Documents/git/rawduck/benchmark/k8s-comparison/setup/store\nrm -rf /Users/moysa/Documents/git/rawduck/benchmark/k8s-comparison/setup/metadata\nrm -rf /Users/moysa/Documents/git/rawduck/benchmark/k8s-comparison/setup/access\necho \"Cleaned up\""}

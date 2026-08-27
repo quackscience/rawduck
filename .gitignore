@@ -8,6 +8,8 @@ test/python/__pycache__/
 **/__pycache__/
 .Rhistory
 .cache/
+# Claude Code local session state (hook logs, etc.) - never committed, anywhere in the tree
+**/.claude/hooks/.logs/
 benchmark/data
 benchmark/work
 # Local/ephemeral benchmark outputs; keep the committed CI baseline only.

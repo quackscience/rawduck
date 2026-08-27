@@ -1,0 +1,12 @@
+# Downloaded binaries and runtime data
+setup/openobserve/
+setup/openobserve_data/
+setup/clickhouse/
+setup/clickhouse_data/
+setup/*.log
+setup/*.pid
+setup/*.xml
+
+# Generated data and results
+data/
+results/

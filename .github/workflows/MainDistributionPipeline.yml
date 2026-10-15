@@ -6,6 +6,7 @@ on:
   push:
     branches:
       - main
+      - v2.0.0
     paths-ignore:
       - '**.md'
       - '**.yml'
@@ -24,21 +25,20 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5.5
+      # Freeze line until tag v2.0.0 exists. Submodule duckdb/ must track the same ref.
+      duckdb_version: v2.0-cyanoptera
+      ci_tools_version: main
       extension_name: rawduck
-      # Windows is excluded until the VS2026 runner image is compatible with
-      # duckdb v1.5's vendored fmt (stdext::checked_array_iterator was
-      # removed from the MSVC STL).
+      # Revisit Windows once the official v2.0.0 tag is out (v1.5 fmt/MSVC STL clash).
       exclude_archs: 'windows_amd64;windows_arm64;windows_amd64_mingw;windows_amd64_rtools'
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.5
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5.5
+      duckdb_version: v2.0-cyanoptera
+      ci_tools_version: main
       extension_name: rawduck
       format_checks: 'format;tidy'

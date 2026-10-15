@@ -1,6 +1,7 @@
 #include "raw_functions.hpp"
 #include "raw_json.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/execution/physical_operator.hpp"
@@ -30,7 +31,10 @@ namespace duckdb {
 class RawIngestTableEntry : public TableCatalogEntry {
 public:
 	RawIngestTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
-	    : TableCatalogEntry(catalog, schema, info) {
+	    : TableCatalogEntry(catalog, schema, info), columns(std::move(info.columns)) {
+	}
+	const ColumnList &GetColumns() const override {
+		return columns;
 	}
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override {
 		return nullptr;
@@ -41,6 +45,9 @@ public:
 	TableStorageInfo GetStorageInfo(ClientContext &context) override {
 		return TableStorageInfo();
 	}
+
+private:
+	ColumnList columns;
 };
 
 class RawIngestSchemaEntry : public SchemaCatalogEntry {

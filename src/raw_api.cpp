@@ -120,7 +120,7 @@ static pair<idx_t, idx_t> ApiTableStats(Connection &conn, const string &table) {
 	idx_t total_rows = 0;
 	auto count = conn.Query("SELECT COUNT(*)::UBIGINT FROM " + RawQualifiedTarget(table));
 	if (count && !count->HasError() && count->RowCount() > 0) {
-		total_rows = count->GetValue(0, 0).GetValue<idx_t>();
+		total_rows = RawResultValue(*count, 0, 0).GetValue<idx_t>();
 	}
 	// hosted APIs expose byte counts; we approximate from row count.
 	return {total_rows, total_rows * 64};
@@ -512,7 +512,22 @@ void RegisterRoutes(duckdb_httplib::Server &server) {
 	server.set_payload_max_length(256ULL * 1024ULL * 1024ULL);
 	server.Options(R"(/.*)", [](const duckdb_httplib::Request &, duckdb_httplib::Response &res) { res.status = 204; });
 	server.Get("/health", [](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
-		res.set_content("{\"status\":\"ok\"}", "application/json");
+		JsonDoc json;
+		auto root = duckdb_yyjson::yyjson_mut_obj(json.doc);
+		duckdb_yyjson::yyjson_mut_obj_add_str(json.doc, root, "status", "ok");
+		// DuckDB v2 metrics catalog is queryable as duckdb_available_metrics();
+		// counters themselves stay on the /v1/query SQL plane.
+		idx_t metric_count = 0;
+		auto db = GetApiServer().db.lock();
+		if (db) {
+			Connection conn(*db);
+			auto result = conn.Query("SELECT count(*) FROM duckdb_available_metrics()");
+			if (result && !result->HasError() && result->RowCount() > 0) {
+				metric_count = NumericCast<idx_t>(RawResultValue(*result, 0, 0).GetValue<int64_t>());
+			}
+		}
+		duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, root, "available_metrics", metric_count);
+		Respond(res, 200, json, root);
 	});
 	server.Post("/v1/query", [](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
 		if (Authorized(req, res)) {
@@ -585,19 +600,19 @@ struct RawServeState : public GlobalTableFunctionState {
 static unique_ptr<FunctionData> RawServeBind(ClientContext &context, TableFunctionBindInput &input,
                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<RawServeBindData>();
-	auto host = input.named_parameters.find("host");
+	auto host = input.named_parameters.find(Identifier("host"));
 	if (host != input.named_parameters.end() && !host->second.IsNull()) {
 		result->host = host->second.GetValue<string>();
 	}
-	auto port = input.named_parameters.find("port");
+	auto port = input.named_parameters.find(Identifier("port"));
 	if (port != input.named_parameters.end() && !port->second.IsNull()) {
 		result->port = port->second.GetValue<int32_t>();
 	}
-	auto token = input.named_parameters.find("token");
+	auto token = input.named_parameters.find(Identifier("token"));
 	if (token != input.named_parameters.end() && !token->second.IsNull()) {
 		result->token = token->second.GetValue<string>();
 	}
-	auto async = input.named_parameters.find("async");
+	auto async = input.named_parameters.find(Identifier("async"));
 	if (async != input.named_parameters.end() && !async->second.IsNull()) {
 		result->async = async->second.GetValue<bool>();
 	}
@@ -676,10 +691,12 @@ static unique_ptr<FunctionData> RawServeStopBind(ClientContext &context, TableFu
 
 TableFunction GetRawServeFunction() {
 	TableFunction function("raw_serve", {}, RawServeFunction, RawServeBind, RawServeInit);
-	function.named_parameters["host"] = LogicalType::VARCHAR;
-	function.named_parameters["port"] = LogicalType::INTEGER;
-	function.named_parameters["token"] = LogicalType::VARCHAR;
-	function.named_parameters["async"] = LogicalType::BOOLEAN;
+	RawAddNamedKwargs(function, [](TypedKwargs &options) {
+		options.Add("host", LogicalType::VARCHAR)
+		    .Add("port", LogicalType::INTEGER)
+		    .Add("token", LogicalType::VARCHAR)
+		    .Add("async", LogicalType::BOOLEAN);
+	});
 	return function;
 }
 

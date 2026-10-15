@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
-# VARIANT (DuckDB v1.5) vs RawDuck shredded tables.
+# VARIANT / JSON controls vs RawDuck shredded tables.
 #
 # Same OTLP/JSON traces envelopes as run_otel.sh. Reports ingest, query, and
-# on-disk size. VARIANT is measured as it exists in the pinned DuckDB (v1.5.5),
-# not the v2.0 shredded-execution preview.
+# on-disk size. pragma_version() labels the pin. Product path:
+#   --paths rawduck --query-runs 7
+# See AGENTS.md Performance contract — do not mix v1.5.5 query ms with v2.
 #
-# Remote / new machine (post-build), from this branch:
-#
-#   git clone --recurse-submodules … && git checkout feat/variant-benchmark
 #   GEN=ninja make release
-#   ./scripts/benchmark/run_variant.sh --quick
+#   ./scripts/benchmark/run_variant.sh --paths rawduck --records 1000000 --query-runs 7
 #   ./scripts/benchmark/run_variant.sh --records 1000000 --runs 3
 #
 # Send back the JSON under benchmark/results/variant_*.json (host, git, and

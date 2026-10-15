@@ -1,0 +1,31 @@
+# PR payload for duckdb/community-extensions: copy to extensions/rawduck/description.yml
+# once this branch's v2-capable commit is on origin. `ref` is the v2 product line;
+# do not set ref_next (that hook is for a v1.5 ref building against v2).
+extension:
+  name: rawduck
+  description: Schema-less JSON ingest that shreds into typed DuckDB columns
+  version: 2.0.0
+  language: C++
+  build: cmake
+  license: MIT
+  excluded_platforms: "windows_amd64;windows_arm64;windows_amd64_mingw;windows_amd64_rtools;wasm_mvp;wasm_eh;wasm_threads"
+  maintainers:
+    - quackscience
+
+repo:
+  github: quackscience/rawduck
+  ref: v2.0.0
+
+docs:
+  hello_world: |
+    ATTACH 'rawduck:store.db' AS raw;
+    INSERT INTO raw.ingest.events VALUES ('{"id": 1, "action": "click"}');
+    SELECT * FROM raw.events;
+  extended_description: |
+    RawDuck implements RawMergeTree-style ingest for DuckDB: JSON/NDJSON/OTLP
+    land as real typed columns instead of opaque JSON strings. Branch v2.0.0
+    builds against DuckDB v2.0-cyanoptera (switch `repo.ref` to the `v2.0.0`
+    tag the day it exists). Unsigned GitHub Pages remains an install channel:
+
+      SET allow_unsigned_extensions = true;
+      INSTALL rawduck FROM 'https://quackscience.github.io/rawduck';

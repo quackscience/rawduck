@@ -143,6 +143,9 @@ bool IsRawOverflowType(const LogicalType &type);
 class RawExtractor {
 public:
 	RawExtractor(const RawNode &root, const vector<RawColumn> &columns);
+	// `projected` are indexes into `columns`. Empty means extract nothing
+	// (count(*)). Ingest uses the two-argument constructor (every column).
+	RawExtractor(const RawNode &root, const vector<RawColumn> &columns, const vector<column_t> &projected);
 
 	// Routes one row's values into per-column slots at `row_idx`. Slots for
 	// absent paths keep their nullptr from Reset().
@@ -154,11 +157,16 @@ public:
 	}
 
 private:
+	void Init(const vector<RawColumn> &columns, optional_ptr<const vector<column_t>> projected);
 	void Traverse(duckdb_yyjson::yyjson_val *val, const RawNode &node, idx_t row_idx);
 
 	const RawNode &root;
 	// schema-tree leaf -> column slot
 	unordered_map<const RawNode *, idx_t> column_of;
+	// ancestors + leaves of projected columns; unused when project_all
+	unordered_set<const RawNode *> needed;
+	vector<idx_t> projected_slots;
+	bool project_all = true;
 	bool root_is_column = false;
 	vector<vector<duckdb_yyjson::yyjson_val *>> values;
 };

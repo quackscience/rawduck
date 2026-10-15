@@ -10,8 +10,10 @@
 #
 # One-time setup: repo Settings -> Pages -> Build and deployment -> Source: GitHub Actions.
 #
-# Layout after deploy:
-#   https://quackscience.github.io/rawduck/v1.5.5/linux_amd64/rawduck.duckdb_extension.gz
+# Layout after deploy (until tag v2.0.0 exists, binaries are built from
+# v2.0-cyanoptera and published under both the freeze-line folder and v2.0.0):
+#   https://quackscience.github.io/rawduck/v2.0.0/linux_amd64/rawduck.duckdb_extension.gz
+#   https://quackscience.github.io/rawduck/v2.0-cyanoptera/linux_amd64/rawduck.duckdb_extension.gz
 #
 # Users:
 #   SET allow_unsigned_extensions = true;
@@ -47,16 +49,19 @@ concurrency:
 
 env:
   EXT_NAME: rawduck
-  DUCKDB_VERSION: v1.5.5
+  # Artifact / CLI pin: freeze line until GitHub publishes tag v2.0.0.
+  DUCKDB_VERSION: v2.0-cyanoptera
+  # Product Pages folder (INSTALL FROM). Switch CLI downloads to this when tagged.
+  PAGES_VERSION: v2.0.0
   PAGES_BASE_URL: https://quackscience.github.io/rawduck
 
 jobs:
   build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5.5
+      duckdb_version: v2.0-cyanoptera
+      ci_tools_version: main
       extension_name: rawduck
       # build exactly the four published platforms: linux/osx x amd64/arm64.
       # windows stays excluded for the VS2026/fmt incompatibility (see
@@ -92,13 +97,18 @@ jobs:
               echo "::warning::no ${EXT_NAME}.duckdb_extension in ${dir}, skipping ${arch}"
               continue
             fi
-            out="_site/${DUCKDB_VERSION}/${arch}"
-            mkdir -p "$out"
+            gz="${EXT_NAME}.duckdb_extension.gz"
             cp "$src" work.bin
             truncate -s -256 work.bin
             dd if=/dev/zero bs=256 count=1 status=none >> work.bin
-            gzip -n < work.bin > "${out}/${EXT_NAME}.duckdb_extension.gz"
+            gzip -n < work.bin > work.gz
             rm -f work.bin
+            for ver in "${DUCKDB_VERSION}" "${PAGES_VERSION}"; do
+              out="_site/${ver}/${arch}"
+              mkdir -p "$out"
+              cp work.gz "${out}/${gz}"
+            done
+            rm -f work.gz
             echo "packaged ${arch}"
             found=$((found + 1))
           done

@@ -15,6 +15,12 @@ SELECT type FROM duckdb_databases() WHERE database_name = 'raw';
 ----
 rawduck
 
+# product DBs default to DuckDB v2 storage (not a pinned v1.5.0 layout)
+query I
+SELECT starts_with(tags.storage_version, 'v2') FROM duckdb_databases() WHERE database_name = 'raw';
+----
+true
+
 # schema-less ingestion straight into the store
 query IIIIII
 SELECT * FROM raw_ingest('raw.events', '[{"id":1,"name":"a","ts":"2024-01-15T10:30:00"}]');

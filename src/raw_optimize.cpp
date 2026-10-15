@@ -314,8 +314,8 @@ static bool TryRewriteToProjection(ClientContext &context, LogicalOperator &pare
 		scan_types.push_back(column.Type());
 		scan_names.push_back(column.Name());
 	}
-	auto new_get = make_uniq<LogicalGet>(get.table_index, scan_function, std::move(bind_data), std::move(scan_types),
-	                                     std::move(scan_names));
+	auto new_get = make_uniq<LogicalGet>(get.table_index, BoundTableFunction(scan_function), std::move(bind_data),
+	                                     std::move(scan_types), std::move(scan_names));
 	new_get->GetMutableColumnIds() = std::move(new_column_ids);
 
 	// retarget the groups and turn count(*) into CAST(sum(count) AS BIGINT)
@@ -554,8 +554,8 @@ static void RawOptimizeFunction(ClientContext &context, TableFunctionInput &data
 		}
 	}
 	auto shape = run("SELECT count(*), coalesce(max(rowid) + 1, 0) FROM " + qualified);
-	auto current_count = NumericCast<idx_t>(shape->GetValue(0, 0).GetValue<int64_t>());
-	auto rowid_end = NumericCast<idx_t>(shape->GetValue(1, 0).GetValue<int64_t>());
+	auto current_count = NumericCast<idx_t>(RawResultValue(*shape, 0, 0).GetValue<int64_t>());
+	auto rowid_end = NumericCast<idx_t>(RawResultValue(*shape, 1, 0).GetValue<int64_t>());
 	// rowid continuity proves the table is append-only since the last rewrite
 	bool append_only = current_count == rowid_end;
 
@@ -573,7 +573,7 @@ static void RawOptimizeFunction(ClientContext &context, TableFunctionInput &data
 			run("DELETE FROM " + qualified + " WHERE rowid >= " + tail);
 			auto inserted =
 			    run("INSERT INTO " + qualified + " SELECT * FROM __rawduck_optimize_tail ORDER BY " + order_by);
-			rows = inserted->GetValue(0, 0).GetValue<int64_t>();
+			rows = RawResultValue(*inserted, 0, 0).GetValue<int64_t>();
 			run("DROP TABLE __rawduck_optimize_tail");
 			run("COMMIT");
 		} catch (...) {
@@ -586,7 +586,7 @@ static void RawOptimizeFunction(ClientContext &context, TableFunctionInput &data
 		try {
 			auto created =
 			    run("CREATE TABLE " + tmp_qualified + " AS SELECT * FROM " + qualified + " ORDER BY " + order_by);
-			rows = created->GetValue(0, 0).GetValue<int64_t>();
+			rows = RawResultValue(*created, 0, 0).GetValue<int64_t>();
 			run("DROP TABLE " + qualified);
 			run("ALTER TABLE " + tmp_qualified + " RENAME TO " + RawQuoteIdentifier(table_name));
 			run("COMMIT");
@@ -733,7 +733,7 @@ static void RawProjectFunction(ClientContext &context, TableFunctionInput &data,
 		result->ThrowError("RawDuck: ");
 	}
 	auto probe = conn.Query("SELECT count(*) FROM " + projection_qualified);
-	auto projection_rows = probe->HasError() ? 0 : probe->GetValue(0, 0).GetValue<int64_t>();
+	auto projection_rows = probe->HasError() ? 0 : RawResultValue(*probe, 0, 0).GetValue<int64_t>();
 
 	{
 		auto &stats = GetStatsCache(context);
@@ -852,11 +852,11 @@ static void RawStatsLoadFunction(ClientContext &context, TableFunctionInput &dat
 		auto &stats = GetStatsCache(context);
 		lock_guard<mutex> guard(stats.lock);
 		for (idx_t row = 0; row < result->RowCount(); row++) {
-			auto kind = result->GetValue(0, row).ToString();
-			auto table = result->GetValue(1, row).ToString();
-			auto item = result->GetValue(2, row).ToString();
-			auto filters = NumericCast<idx_t>(result->GetValue(3, row).GetValue<int64_t>());
-			auto groups = NumericCast<idx_t>(result->GetValue(4, row).GetValue<int64_t>());
+			auto kind = RawResultValue(*result, 0, row).ToString();
+			auto table = RawResultValue(*result, 1, row).ToString();
+			auto item = RawResultValue(*result, 2, row).ToString();
+			auto filters = NumericCast<idx_t>(RawResultValue(*result, 3, row).GetValue<int64_t>());
+			auto groups = NumericCast<idx_t>(RawResultValue(*result, 4, row).GetValue<int64_t>());
 			if (kind == "column") {
 				stats.usage[table][item].filters += filters;
 				stats.usage[table][item].groups += groups;

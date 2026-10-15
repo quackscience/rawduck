@@ -118,6 +118,7 @@ RawDuck is compatible with the [RawTree MCP](https://github.com/rawtreedb/rawtre
 | `INSERT INTO <store>.ingest.<table> ...` | SQL | The primary lane: any VALUES or SELECT source streams through a parallel zero-copy sink into `<table>`, auto-creation and evolution included. |
 | `raw_ingest(table, payload)` | table | Schema-less ingest: auto-creates the table, adds new columns, widens conflicting types, appends — natively, inside your transaction. Accepts a JSON array, a single object, scalars, or NDJSON. Returns `(table, created, columns_added, columns_widened, rows, errors)`. |
 | `raw_ingest_file(table, path, batch_size := 30000)` | table | Streaming ingest of NDJSON files (gzip auto-detected, any DuckDB filesystem) in bounded-memory batches, evolving the schema between batches. The whole file is one atomic operation. |
+| `INGEST 'file' INTO tbl` | SQL | Opt-in PEG sugar for `raw_ingest_file`. Enable with `SET active_grammar_extensions = ['rawduck']`. |
 | `raw_records(payload)` | table | Parse + infer + flatten a JSON payload into typed rows without touching any table. |
 | `raw_stats()` | table | Observed usage statistics per column: pushed-down filters and GROUP BY keys, collected automatically by an optimizer hook. |
 | `raw_optimize(table)` | table | RawMergeTree adaptive layout: physically reorders the table by its hottest columns. Incremental: append-only growth since the last optimize sorts only the new tail into a fresh sorted run (`mode` = `full` / `incremental` / `noop`). |
@@ -180,7 +181,8 @@ Semantics to know before enabling it:
 
 ## HTTP API
 
-RawDuck can serve an in-process HTTP API for ingestion and querying
+Same process, two listeners: **quack `CONNECT`** is the SQL plane (`rawduck:quack:`
+attach + `raw_ingest`); **`raw_serve`** is the OTLP/REST plane. The HTTP API:
 
 ```sql
 CALL raw_serve(host := '127.0.0.1', port := 9999, token := 'rt_secret');

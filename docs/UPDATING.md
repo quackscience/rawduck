@@ -1,28 +1,41 @@
-# Extension updating 
-When cloning this template, the target version of DuckDB should be the latest stable release of DuckDB. However, there 
-will inevitably come a time when a new DuckDB is released and the extension repository needs updating. This process goes
-as follows:
+# Extension updating
 
-- Bump submodules
-  - `./duckdb` should be set to latest tagged release (currently `v1.5.5`)
-  - `./extension-ci-tools` should be set to the matching branch tip. Prefer the
-    exact patch branch (`v1.5.5`) when it exists; otherwise the line branch
-    (`v1.5-variegata`). Keep the submodule SHA in sync with that tip.
-- Bump versions in `./github/workflows`
-  - `duckdb_version` / `ci_tools_version` in `MainDistributionPipeline.yml`,
-    `Release.yml`, and `QuackIntegration.yml` should be the latest tagged release
-  - the reusable workflow refs
-    (`duckdb/extension-ci-tools/.github/workflows/_extension_*.yml@…`) should use
-    the same tag/branch (e.g. `@v1.5.5`), not a moving alias unless intentional
-  - `DUCKDB_VERSION` in `Release.yml` must match (GitHub Pages path + CLI download)
+This repository tracks two DuckDB lines. Keep submodule SHAs, workflow pins, and
+Pages `DUCKDB_VERSION` in lockstep on the branch you are releasing.
+
+## `main` — DuckDB v1.5.5 (query-speed product)
+
+- `./duckdb` → tag `v1.5.5`
+- `./extension-ci-tools` → matching `v1.5.5` tip (or `v1.5-variegata` if no patch branch)
+- Workflows `duckdb_version` / `ci_tools_version` / reusable workflow `@` → `v1.5.5`
+- `Release.yml` `DUCKDB_VERSION` → `v1.5.5` (Pages path + CLI download)
+
+Do not merge `v2.0.0` into `main` while cyanoptera queries are slower than this pin.
+
+## `v2.0.0` — DuckDB Cyanoptera / v2.0.0 product
+
+- `./duckdb` → `origin/v2.0-cyanoptera` until tag `v2.0.0` exists, then that tag
+- `./extension-ci-tools` → `main` until a cyanoptera / v2.0.0 branch exists
+- `MainDistributionPipeline.yml`, `Release.yml`, `QuackIntegration.yml`:
+  `duckdb_version: v2.0-cyanoptera`, `ci_tools_version: main`, reusable workflows `@main`
+- Quack: `duckdb-httpfs` / `duckdb-quack` `GIT_TAG` must be cyanoptera-compatible
+- `Release.yml` `DUCKDB_VERSION` stays the freeze-line ref (artifact names / CLI URL).
+  `PAGES_VERSION` is `v2.0.0` so unsigned INSTALL also lives under the product folder.
+  The day GitHub publishes `v2.0.0`, point both at that tag.
+- Community-extensions: PR `extensions/rawduck/description.yml` from
+  `community-extensions/rawduck/description.yml` in this repo. `repo.ref` is this
+  branch (v2-capable). Do not set `ref_next`.
+
+Build with `GEN=ninja make release`. Test with
+`./build/release/test/unittest --test-dir . "test/sql/*"`. Format with `make format-fix`.
 
 # API changes
-DuckDB extensions built with this extension template are built against the internal C++ API of DuckDB. This API is not guaranteed to be stable.
-What this means for extension development is that when updating your extensions DuckDB target version using the above steps, you may run into the fact that your extension no longer builds properly.
 
-Currently, DuckDB does not (yet) provide a specific change log for these API changes, but it is generally not too hard to figure out what has changed.
+DuckDB extensions built with this template use DuckDB's internal C++ API, which
+is not stable. A pin bump may fail to compile.
 
-For figuring out how and why the C++ API changed, we recommend using the following resources:
-- DuckDB's [Release Notes](https://github.com/duckdb/duckdb/releases)
-- DuckDB's history of [Core extension patches](https://github.com/duckdb/duckdb/commits/main/.github/patches/extensions)
-- The git history of the relevant C++ Header file of the API that has changed
+Useful references:
+
+- DuckDB [Release Notes](https://github.com/duckdb/duckdb/releases)
+- DuckDB [core extension patches](https://github.com/duckdb/duckdb/commits/main/.github/patches/extensions)
+- Git history of the C++ header whose API changed

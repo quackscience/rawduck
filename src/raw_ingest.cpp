@@ -366,7 +366,7 @@ QualifiedName RawResolveQualifiedName(ClientContext &context, const string &targ
 	return QualifiedName(catalog_name, schema_name, parsed_name.Name());
 }
 
-static unique_ptr<MaterializedQueryResult> RunQuery(Connection &conn, const string &sql) {
+static unique_ptr<QueryResult> RunQuery(Connection &conn, const string &sql) {
 	auto result = conn.Query(sql);
 	if (result->HasError()) {
 		result->ThrowError("RawDuck: ");
@@ -488,7 +488,7 @@ public:
 			// rather than dropping that state on the floor.
 			flushers.emplace_back([&worker, merge_threshold, flush_now] {
 				auto &collection = *worker.collection->collection;
-				collection.FinalizeAppend(TransactionData(0, 0), *worker.append_state);
+				collection.FinalizeAppend(TransactionData::Unversioned(), *worker.append_state);
 				if (flush_now && collection.GetTotalRows() >= merge_threshold) {
 					worker.writer->WriteUnflushedRowGroups(*worker.collection);
 					worker.writer->FinalFlush();
@@ -624,7 +624,7 @@ private:
 	// WriteNewRowGroup calls see the evolved column/compression layout, while
 	// the partial blocks written so far are carried forward via Merge.
 	void ExtendWorker(Worker &worker, const vector<pair<string, LogicalType>> &new_columns, DataTable &flush_storage) {
-		worker.collection->collection->FinalizeAppend(TransactionData(0, 0), *worker.append_state);
+		worker.collection->collection->FinalizeAppend(TransactionData::Unversioned(), *worker.append_state);
 		for (auto &new_column : new_columns) {
 			ColumnDefinition definition(Identifier(new_column.first), new_column.second);
 			BoundConstantExpression null_default(Value(new_column.second));
@@ -1119,7 +1119,8 @@ private:
 			AlterEntryData data(qname, OnEntryNotFound::THROW_EXCEPTION);
 			Identifier column_name(column.name);
 			if (!existing_columns.ColumnExists(column_name)) {
-				AddColumnInfo add_column(data, ColumnDefinition(column_name, column.type), false);
+				AddColumnInfo add_column(data, ColumnDefinition(column_name, column.type), false,
+				                         AddColumnConstraints {});
 				catalog.Alter(context, add_column);
 				columns_added++;
 				continue;
@@ -1150,7 +1151,7 @@ private:
 			} else {
 				expression = make_uniq<CastExpression>(target_type, std::move(column_ref));
 			}
-			ChangeColumnTypeInfo change_type(data, column_name, target_type, std::move(expression));
+			ChangeColumnTypeInfo change_type(data, {column_name}, target_type, std::move(expression));
 			catalog.Alter(context, change_type);
 			columns_widened++;
 		}
@@ -1340,7 +1341,7 @@ private:
 				}
 				insert += ") SELECT " + select_list + " FROM raw_records(" + QuoteLiteral(payload_str) + ")";
 				auto result = RunQuery(conn, insert);
-				batch_rows = NumericCast<idx_t>(result->GetValue(0, 0).GetValue<int64_t>());
+				batch_rows = NumericCast<idx_t>(RawResultValue(*result, 0, 0).GetValue<int64_t>());
 			}
 			RunQuery(conn, "COMMIT");
 		} catch (...) {
@@ -1747,7 +1748,7 @@ static unique_ptr<FunctionData> RawIngestFileBind(ClientContext &context, TableF
 	result->path = input.inputs[1].GetValue<string>();
 	result->options = RawBindParseOptions(context, input.named_parameters);
 	result->batch_size = RAW_DEFAULT_BATCH_SIZE;
-	auto batch_entry = input.named_parameters.find("batch_size");
+	auto batch_entry = input.named_parameters.find(Identifier("batch_size"));
 	if (batch_entry != input.named_parameters.end() && !batch_entry->second.IsNull()) {
 		auto batch_size = batch_entry->second.GetValue<int64_t>();
 		if (batch_size <= 0) {
@@ -2061,7 +2062,7 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 TableFunction GetRawIngestFileFunction() {
 	TableFunction function("raw_ingest_file", {LogicalType::VARCHAR, LogicalType::VARCHAR}, RawIngestFileFunction,
 	                       RawIngestFileBind, RawIngestInit);
-	function.named_parameters["batch_size"] = LogicalType::BIGINT;
+	RawAddNamedKwargs(function, [](TypedKwargs &options) { options.Add("batch_size", LogicalType::BIGINT); });
 	RawAddIngestParameters(function);
 	return function;
 }

@@ -3,10 +3,13 @@
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
 
+#include <functional>
+
 namespace duckdb {
 
 class OptimizerExtension;
 class StorageExtension;
+class GrammarExtension;
 struct StorageExtensionInfo;
 class TransactionManager;
 struct RawParseOptions;
@@ -27,6 +30,7 @@ ScalarFunction GetRawInferFunction();
 ScalarFunction GetRawTransformDefineFunction();
 OptimizerExtension GetRawDuckOptimizerExtension();
 shared_ptr<StorageExtension> GetRawDuckStorageExtension();
+shared_ptr<GrammarExtension> GetRawDuckGrammarExtension();
 
 // programmatic ingest (HTTP API)
 struct RawIngestStats {
@@ -126,9 +130,11 @@ string RawQualifiedTarget(const string &target);
 QualifiedName RawResolveQualifiedName(ClientContext &context, const string &target);
 
 // shared ingest parameter handling (transform / explode / ignore_errors)
-string RawNamedStringParameter(const named_parameter_map_t &parameters, const string &name);
-RawParseOptions RawBindParseOptions(ClientContext &context, const named_parameter_map_t &parameters);
+string RawNamedStringParameter(const named_argument_map_t &parameters, const string &name);
+RawParseOptions RawBindParseOptions(ClientContext &context, const named_argument_map_t &parameters);
 RawParseOptions ResolveTransform(ClientContext &context, const string &transform, const string &explode);
+void RawAddNamedKwargs(TableFunction &function, const std::function<void(TypedKwargs &)> &configure);
 void RawAddIngestParameters(TableFunction &function);
+Value RawResultValue(QueryResult &result, idx_t col, idx_t row);
 
 } // namespace duckdb

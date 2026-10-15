@@ -24,6 +24,17 @@ SELECT id, action FROM t_file ORDER BY id;
 1	click
 2	view
 
+# function-predicate / IN filters stay correct with optimizer observation hooks
+query I
+SELECT count(*) FROM t_file WHERE contains(action, 'cli');
+----
+1
+
+query I
+SELECT count(*) FROM t_file WHERE action IN ('click', 'missing');
+----
+1
+
 # small batches: schema evolution across batch boundaries
 statement ok
 COPY (SELECT range AS n FROM range(10)) TO '__TEST_DIR__/r.ndjson' (FORMAT json);

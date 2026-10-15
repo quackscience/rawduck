@@ -5,11 +5,33 @@
 #include "raw_write_settings.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/common/enums/optimizer_type.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/profiler/metric_info.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/parser/grammar_extension.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 
 namespace duckdb {
+
+// DICT_FSST scans emit DictionaryVectors; HASH GROUP BY can aggregate by dict
+// offset. Compressed materialization rewrites VARCHAR group keys through
+// __internal_compress_string_uhugeint, which flattens that dictionary and is
+// slower on the OTEL lock queries (low-NDV strings). Default: keep dictionaries.
+static void ApplyDictionaryGroupBy(DBConfig &config, bool keep_dictionaries) {
+	auto disabled = config.GetDisabledOptimizers();
+	if (keep_dictionaries) {
+		disabled.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+	} else {
+		disabled.erase(OptimizerType::COMPRESSED_MATERIALIZATION);
+	}
+	config.SetDisabledOptimizers(std::move(disabled));
+}
+
+static void SetRawDuckDictionaryGroupBy(ClientContext &context, SetScope, Value &parameter) {
+	ApplyDictionaryGroupBy(DBConfig::GetConfig(context), parameter.GetValue<bool>());
+}
 
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetRawRecordsFunction());
@@ -30,10 +52,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetRawServeGrpcStopFunction());
 	loader.RegisterFunction(GetRawFlushFunction());
 	loader.RegisterFunction(GetRawTransformDefineFunction());
+	loader.RegisterMetric(MetricInfo {"rawduck_ingest_rows", "uint64",
+	                                  "Rows accepted by raw_ingest / raw_ingest_file / raw_serve", "rows"});
+	loader.RegisterMetric(MetricInfo {"rawduck_ingest_errors", "uint64",
+	                                  "Parse or ingest errors from raw_ingest / raw_ingest_file / raw_serve", "rows"});
 
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	// observe pushed-down predicates to drive raw_optimize()
 	OptimizerExtension::Register(config, GetRawDuckOptimizerExtension());
+	ApplyDictionaryGroupBy(config, true);
+	config.AddExtensionOption("rawduck_dictionary_groupby",
+	                          "Keep storage dictionaries for GROUP BY (disables compressed_materialization, which "
+	                          "unpacks DICT_FSST VARCHAR keys into uhugeint). On by default for OTEL-style "
+	                          "low-cardinality group keys; SET false to restore DuckDB's compressor",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), SetRawDuckDictionaryGroupBy);
 	config.AddExtensionOption("rawduck_insert_transform",
 	                          "Transform name or explode path applied by INSERTs into ingest tables",
 	                          LogicalType::VARCHAR, Value(""));
@@ -78,6 +110,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	// ATTACH 'rawduck:store.db' AS raw
 	StorageExtension::Register(config, "rawduck", GetRawDuckStorageExtension());
+	GrammarExtension::Register(loader.GetDatabaseInstance(), GetRawDuckGrammarExtension());
 }
 
 void RawduckExtension::Load(ExtensionLoader &loader) {

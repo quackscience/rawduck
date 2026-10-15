@@ -37,6 +37,26 @@ SELECT rows FROM raw_ingest_file('t_fast', '__TEST_DIR__/fast_pool.ndjson', batc
 ----
 1000
 
+# overlap_flush stays drain-free on churn: new columns defer mid-append flush
+statement ok
+SET rawduck_overlap_flush = true;
+
+statement ok
+COPY (SELECT range AS n, 'v' || (range % 7) AS v, range AS extra FROM range(1000)) TO '__TEST_DIR__/fast_pool_extra.ndjson' (FORMAT json);
+
+query I
+SELECT rows FROM raw_ingest_file('t_fast', '__TEST_DIR__/fast_pool_extra.ndjson', batch_size := 600);
+----
+1000
+
+query I
+SELECT count(extra) FROM t_fast;
+----
+1000
+
+statement ok
+RESET rawduck_overlap_flush;
+
 # parallel ingest consumers are opt-in (default serial schema evolution)
 statement ok
 SET rawduck_overlap_flush_auto = false;

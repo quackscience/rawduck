@@ -21,21 +21,21 @@ concurrency:
 jobs:
   quack-integration:
     name: rawduck:quack (linux_amd64)
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5.5
+      duckdb_version: v2.0-cyanoptera
+      ci_tools_version: main
       extension_name: rawduck
       opt_in_archs: 'linux_amd64'
       use_merged_vcpkg_manifest: '1'
-      # Same Windows exclusion as MainDistributionPipeline: duckdb v1.5 fmt vs MSVC STL.
+      # Same Windows exclusion as MainDistributionPipeline.
       exclude_archs: 'windows_amd64;windows_arm64;windows_amd64_mingw;windows_amd64_rtools'
       extra_extension_config: |
         duckdb_extension_load(httpfs
             GIT_URL https://github.com/duckdb/duckdb-httpfs
-            GIT_TAG 13e18b3c9f3810334f5972b76a3acc247b28e537
+            GIT_TAG abdd053708ff3ef9359a5b3da680b128d95e4f84
         )
         duckdb_extension_load(quack
             GIT_URL https://github.com/duckdb/duckdb-quack
-            GIT_TAG 1693647c152b438aa2a6a9ad71764f99c5a561e0
+            GIT_TAG 974927a394b188755284682b73398ed50e86316c
         )

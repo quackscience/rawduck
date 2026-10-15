@@ -40,6 +40,21 @@ FROM quack_query('quack:127.0.0.1:19920', 'SELECT action, user FROM events ORDER
 click	alice
 view	bob
 
+# SQL plane: CONNECT + raw_ingest (same process as raw_serve's OTLP/REST plane)
+statement ok client
+CONNECT 'quack:127.0.0.1:19920' (TOKEN 'rt_secret');
+
+statement ok client
+FROM raw_ingest('events', '[{"action":"connect","user":"dave","value":7}]');
+
+query III client
+SELECT action, user, value FROM events WHERE action = 'connect';
+----
+connect	dave	7
+
+statement ok client
+DISCONNECT;
+
 # --- client: plain quack attach ---
 
 statement ok client

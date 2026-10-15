@@ -3,7 +3,7 @@
 
 Same OTLP/JSON NDJSON envelopes as run_otel.sh. VARIANT is measured as it
 ships in whichever DuckDB the extension is pinned to: v1.5.5 on main (no
-shredded execution / extraction pushdown), or the v2.0-dev main tip on the
+shredded execution / extraction pushdown), or v2.0-cyanoptera on the
 v2.0.0 branch. The printed note and the `variant_note` field in the result
 JSON report which one was measured.
 
@@ -18,7 +18,9 @@ Query encodings:
   variant_flat       VARIANT of the shredded RawDuck row (query/storage only)
   json_flat          JSON of the shredded RawDuck row (existing ->> baseline)
 
-VARIANT columns require storage v1.5.0; every path uses that so sizes are comparable.
+VARIANT columns require storage v1.5.0. The RawDuck product path uses DuckDB's
+default storage unless --storage-version v1.5.0 is set (needed only so VARIANT
+comparison tables can live in the same file layout).
 """
 from __future__ import annotations
 
@@ -84,13 +86,22 @@ def _duckdb_argv(binary: Path, db_path: Path | None = None) -> list[str]:
     return argv
 
 
-def create_v15_database(binary: Path, db_path: Path) -> None:
-    """Create an empty storage-v1.5.0 file in a one-shot process (no interactive ATTACH)."""
+# Product DBs use DuckDB's default storage. VARIANT comparison tables need v1.5.0.
+STORAGE_VERSION = "v1.5.0"
+
+
+def create_database(binary: Path, db_path: Path, storage_version: str | None = None) -> None:
+    """Create an empty DB file. v1.5.0 is a one-shot ATTACH (no interactive ATTACH)."""
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     for p in (db_path, Path(str(db_path) + ".wal")):
         if p.exists():
             p.unlink()
+    version = STORAGE_VERSION if storage_version is None else storage_version
+    if version == "default":
+        return
+    if version != "v1.5.0":
+        raise ValueError(f"unsupported storage version {version!r}")
     sql = f"ATTACH '{escape_sql(str(db_path))}' AS bench (STORAGE_VERSION 'v1.5.0');"
     # Prefer -c over interactive stdin: avoids the v1.5 piped-script stall path.
     subprocess.run(
@@ -296,8 +307,8 @@ class DuckSession:
     """Interactive DuckDB CLI session (cold→warm needs one process).
 
     Hardening for Linux/arm64 (DuckDB v1.5 CLI):
-    - Always open an existing v1.5.0 file (pre-created via create_v15_database);
-      never ATTACH STORAGE_VERSION over an interactive pipe.
+    - Create the file in a one-shot process (create_database); never ATTACH
+      STORAGE_VERSION over an interactive pipe.
     - Pass -dark-mode + DUCKDB_NO_HIGHLIGHT=1 so color probing cannot stall.
     - Unbuffered pipes + a stdout reader thread (no select on BufferedReader).
     """
@@ -310,7 +321,7 @@ class DuckSession:
         self._last_sql = ""
 
         if create:
-            create_v15_database(binary, self.db_path)
+            create_database(binary, self.db_path)
 
         argv = _duckdb_argv(binary, self.db_path)
         self.proc = subprocess.Popen(
@@ -733,6 +744,44 @@ def run_queries(
     return out
 
 
+def inspect_rawduck(binary: Path, ext: Path, db_path: Path) -> dict:
+    """Column types + EXPLAIN for the three product queries. Not timed."""
+    sess = DuckSession(binary, ext, db_path, create=False)
+    try:
+        col_lines = sess.exec(
+            "SELECT column_index, column_name, data_type FROM duckdb_columns() "
+            "WHERE table_name = 'traces' ORDER BY column_index;"
+        )
+        columns = []
+        overflow = []
+        for line in col_lines:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 3:
+                continue
+            entry = {"index": parts[0], "name": parts[1], "type": ",".join(parts[2:]).strip()}
+            columns.append(entry)
+            type_u = entry["type"].upper()
+            if "VARIANT" in type_u or type_u == "JSON" or type_u.endswith("JSON"):
+                overflow.append(entry)
+        explains: dict[str, list[str]] = {}
+        for qname, variants in QUERY_SQL.items():
+            sql = variants.get("rawduck")
+            if not sql:
+                continue
+            explains[qname] = sess.exec(f"EXPLAIN {sql}")
+        result = {
+            "column_count": len(columns),
+            "columns": columns,
+            "overflow": overflow,
+            "explain": explains,
+        }
+    except Exception as exc:
+        sess.fail(f"rawduck inspect failed: {exc}")
+        raise
+    sess.close()
+    return result
+
+
 def git_info() -> tuple[str, str]:
     def _run(args: list[str]) -> str:
         try:
@@ -760,7 +809,7 @@ def variant_note(version: str) -> str:
     if "v2" in tag or "-dev" in tag:
         return (
             f"DuckDB {version} VARIANT (shredded execution / extract pushdown expected). "
-            "This is the development main tip (v2.0-dev preview), not the v1.5.5 pin."
+            "This is the v2.0-cyanoptera pin, not the v1.5.5 pin."
         )
     return (
         f"DuckDB VARIANT as of {version}. The v2.0 preview (shredded execution from "
@@ -881,6 +930,7 @@ def print_summary(doc: dict) -> None:
                 cells.append(f"{cell['ms']:.1f}{flag}" .rjust(16))
         print(f"{enc:<22}" + "".join(cells), file=sys.stderr)
     print("\n" + doc["variant_note"], file=sys.stderr)
+    print(f"storage_version={doc.get('storage_version')}", file=sys.stderr)
 
 
 def merge_best_ingest(acc: dict | None, row: dict) -> dict:
@@ -911,6 +961,7 @@ def merge_best_ingest(acc: dict | None, row: dict) -> dict:
 
 
 def main() -> int:
+    global STORAGE_VERSION
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--records", type=int, default=1_000_000)
     parser.add_argument("--runs", type=int, default=3)
@@ -928,6 +979,13 @@ def main() -> int:
         "--paths",
         type=str,
         default="rawduck,variant_otlp,json_otlp,variant_flat,json_flat",
+    )
+    parser.add_argument(
+        "--storage-version",
+        choices=("v1.5.0", "default"),
+        default=None,
+        help="Product RawDuck DBs use DuckDB default storage. VARIANT tables need v1.5.0. "
+        "Omitted: 'default' for --paths rawduck only, else v1.5.0.",
     )
     args = parser.parse_args()
     if args.quick:
@@ -954,6 +1012,17 @@ def main() -> int:
     ingest_paths = [p.strip() for p in args.paths.split(",") if p.strip()]
     encode_paths = [p for p in ingest_paths if p in ("variant_flat", "json_flat")]
     timed_ingest = [p for p in ingest_paths if p not in ("variant_flat", "json_flat")]
+    needs_variant_storage = any(p.startswith("variant") for p in ingest_paths)
+    if args.storage_version is None:
+        STORAGE_VERSION = "v1.5.0" if needs_variant_storage else "default"
+    else:
+        STORAGE_VERSION = args.storage_version
+    if STORAGE_VERSION == "default" and needs_variant_storage:
+        print(
+            "VARIANT paths require --storage-version v1.5.0; omit them or keep v1.5.0",
+            file=sys.stderr,
+        )
+        return 1
 
     commit, branch = git_info()
     version = duckdb_version(binary)
@@ -1010,6 +1079,12 @@ def main() -> int:
             )
         queries[encoding] = q
 
+    inspect = None
+    raw_query_db = last_dbs.get("rawduck")
+    if raw_query_db is not None and any(enc == "rawduck" for enc, _ in query_encodings):
+        print("inspect rawduck schema/EXPLAIN...", file=sys.stderr)
+        inspect = inspect_rawduck(binary, ext, raw_query_db)
+
     ingest_out = {}
     for name, row in ingest_best.items():
         recs = args.records if row["grain"] == "span" else row["cold_rows"]
@@ -1049,9 +1124,10 @@ def main() -> int:
         "threads": int(os.environ["DUCKDB_THREADS"]) if os.environ.get("DUCKDB_THREADS") else None,
         "source": str(cold_file),
         "source_bytes": src_bytes,
-        "storage_version": "v1.5.0",
+        "storage_version": STORAGE_VERSION,
         "ingest": ingest_out,
         "queries": queries,
+        "inspect": inspect,
     }
 
     out_path = (

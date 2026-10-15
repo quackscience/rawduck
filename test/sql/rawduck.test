@@ -137,6 +137,24 @@ SELECT a, b FROM raw_records('[{"a":1,"b":"x"},{"a":2}]');
 1	x
 2	NULL
 
+# projection pushdown: output slot 0 is schema column 1 ("b"), not "a"
+query I
+SELECT b FROM raw_records('[{"a":1,"b":"x"},{"a":2,"b":"y"}]');
+----
+x
+y
+
+# nested projection: only the user.name subtree is walked
+query I
+SELECT "user.name" FROM raw_records('[{"user":{"name":"alice","address":{"city":"Rome"}},"n":1}]');
+----
+alice
+
+query I
+SELECT count(*) FROM raw_records('[{"a":1,"b":"x"},{"a":2}]');
+----
+2
+
 query II
 SELECT typeof(a), typeof(b) FROM raw_records('[{"a":1,"b":"x"}]');
 ----
@@ -259,3 +277,46 @@ statement error
 SELECT * FROM raw_records(NULL);
 ----
 <REGEX>:.*payload may not be NULL.*
+
+# DuckDB v2 metrics catalog: RawDuck descriptors are queryable via SQL
+query I
+SELECT count(*) >= 2 FROM duckdb_available_metrics() WHERE metric_name LIKE 'rawduck%';
+----
+true
+
+# dictionary GROUP BY: LOAD disables compressed_materialization so VARCHAR
+# group keys stay as storage dictionaries instead of __internal_compress_string
+query I
+SELECT current_setting('disabled_optimizers') ILIKE '%compressed_materialization%';
+----
+true
+
+statement ok
+CREATE TABLE t_dict_gb AS SELECT 'svc_' || (i % 8) AS k FROM range(1000) t(i);
+
+query I
+SELECT count(*) FROM (SELECT k, count(*) FROM t_dict_gb GROUP BY 1);
+----
+8
+
+statement ok
+PRAGMA explain_output = 'optimized_only';
+
+query II
+EXPLAIN (FORMAT yaml) SELECT k, count(*) FROM t_dict_gb GROUP BY 1
+----
+logical_opt	<!REGEX>:.*__internal_compress_string.*
+
+statement ok
+SET rawduck_dictionary_groupby = false;
+
+query II
+EXPLAIN (FORMAT yaml) SELECT k, count(*) FROM t_dict_gb GROUP BY 1
+----
+logical_opt	<REGEX>:.*__internal_compress_string.*
+
+statement ok
+SET rawduck_dictionary_groupby = true;
+
+statement ok
+PRAGMA explain_output = 'physical_only';

@@ -3,9 +3,15 @@
 Reproducible OTEL ingest timings. Data lands in `benchmark/data/` (gitignored);
 JSON results in `benchmark/results/` (gitignored except the committed baseline).
 
-**Policy:** only merge ingest changes that improve or match baseline on every
-metric (cold and warm, all signals). Features that regress any default path are
-removed, not shipped as opt-in toggles.
+**Policy:** only merge changes that improve or match baseline on **every**
+default-path metric they touch. Ingest: cold and warm, all signals, ≥ 98% of
+`benchmark/results/baseline-otel.json` (`compare.sh`). Queries: same
+`run_variant.py` SQL as the Performance contract in `AGENTS.md` — `main` must
+stay at the v1.5.5 lock (1.1 / 2.6 / 2.4 ms on 1M traces); `v2.0.0` must not
+lose to its freeze-line row (`60c58d1` 1.4 / 3.4 / 2.4 vs older cyanoptera
+4.5 / 5.8 / 4.4).
+Features that regress any default path are removed, not shipped as opt-in
+toggles. Do not merge `v2.0.0` into `main` while queries are slower.
 
 ## Session model (cold then warm)
 
@@ -159,20 +165,22 @@ same ~4-6ms baseline as before any of this (measured directly, sequential
 uncontended requests). Regression-tested in `test/http/raw_api_compat.sh`'s
 "concurrent create" section (fires 8 concurrent requests at a brand-new table).
 
-## VARIANT vs RawDuck (branch `feat/variant-benchmark`)
+## VARIANT vs RawDuck (`run_variant.sh`)
 
-Compares DuckDB **VARIANT as of v1.5.5** (not the v2.0 shredded-execution preview)
-against RawDuck typed columns on the same OTLP/JSON traces envelopes.
+Compares encodings on the same OTLP/JSON traces. **RawDuck typed columns are the
+product path.** VARIANT/JSON rows are controls, not targets. See `AGENTS.md`
+Performance contract and `BENCHMARK.md` Query speed — do not mix v1.5.5 1.1 ms
+with this tip’s 1.4 ms.
 
-For the same comparison against v2's VARIANT, build on branch `v2.0.0` (both
-submodules track DuckDB main / v2.0-dev) and run the identical commands — the
-harness reads `pragma_version()` and labels the run, so a v2 result file is never
-confused with a v1.5.5 one. See "Running the same comparison on DuckDB v2.0-dev"
-in `BENCHMARK.md`.
+`--paths rawduck` uses DuckDB **default storage** (product DBs). Any `variant*`
+path forces `--storage-version v1.5.0`. Storage version does not change RawDuck
+query ms; it is required only so VARIANT tables can be created.
 
 ```sh
-# after: git clone --recurse-submodules … && git checkout feat/variant-benchmark
-#        GEN=ninja make release
+# product query lock (no VARIANT tables)
+./scripts/benchmark/run_variant.sh --records 1000000 --runs 1 --query-runs 7 --paths rawduck
+
+# after: git clone --recurse-submodules … && GEN=ninja make release
 ./scripts/benchmark/run_variant.sh --quick
 ./scripts/benchmark/run_variant.sh --records 1000000 --runs 3 \
   --output "benchmark/results/variant_1m_$(hostname -s)_$(date -u +%Y%m%dT%H%M%SZ).json"

@@ -13,29 +13,35 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(src/include)
 # DuckDB's vendored yyjson (namespaced as duckdb_yyjson)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/yyjson/include)
+include_directories(
+  ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/yyjson/include)
 # DuckDB's vendored cpp-httplib (namespace duckdb_httplib) for the API server
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/httplib)
 
-# zlib enables cpp-httplib's native gzip handling for the HTTP API
-# (request decompression and response compression)
+# zlib enables cpp-httplib's native gzip handling for the HTTP API (request
+# decompression and response compression)
 if(NOT EMSCRIPTEN)
   find_package(ZLIB QUIET)
   if(ZLIB_FOUND)
-    set_source_files_properties(src/raw_api.cpp PROPERTIES COMPILE_DEFINITIONS CPPHTTPLIB_ZLIB_SUPPORT=1)
+    set_source_files_properties(
+      src/raw_api.cpp PROPERTIES COMPILE_DEFINITIONS CPPHTTPLIB_ZLIB_SUPPORT=1)
   endif()
 endif()
 
 # OTLP/protobuf request bodies on the HTTP API: enabled by default whenever
 # protobuf is available (the vcpkg manifest's default "protobuf" feature, or a
 # system package). Never built for wasm; skipped gracefully when missing.
-option(RAWDUCK_ENABLE_OTLP_PROTOBUF "Decode OTLP/protobuf HTTP request bodies (requires protobuf)" ON)
+option(RAWDUCK_ENABLE_OTLP_PROTOBUF
+       "Decode OTLP/protobuf HTTP request bodies (requires protobuf)" ON)
 # Optional OTLP/gRPC ingestion server: opt-in, requires the full gRPC stack.
-option(RAWDUCK_ENABLE_GRPC "Build the OTLP/gRPC ingestion server (requires gRPC + protobuf)" OFF)
+option(RAWDUCK_ENABLE_GRPC
+       "Build the OTLP/gRPC ingestion server (requires gRPC + protobuf)" OFF)
 
 set(RAWDUCK_PROTOBUF_ENABLED FALSE)
 set(RAWDUCK_GRPC_ENABLED FALSE)
-if((RAWDUCK_ENABLE_OTLP_PROTOBUF OR RAWDUCK_ENABLE_GRPC) AND NOT EMSCRIPTEN AND NOT MINGW)
+if((RAWDUCK_ENABLE_OTLP_PROTOBUF OR RAWDUCK_ENABLE_GRPC)
+   AND NOT EMSCRIPTEN
+   AND NOT MINGW)
   find_package(Protobuf CONFIG QUIET)
   if(NOT TARGET protobuf::libprotobuf)
     find_package(Protobuf QUIET)
@@ -70,14 +76,18 @@ if(RAWDUCK_PROTOBUF_ENABLED)
       ${RAWDUCK_SERVICE_PROTOS})
   foreach(proto ${RAWDUCK_ALL_PROTOS})
     add_custom_command(
-      OUTPUT ${RAWDUCK_PROTO_GEN}/${proto}.pb.cc ${RAWDUCK_PROTO_GEN}/${proto}.pb.h
+      OUTPUT ${RAWDUCK_PROTO_GEN}/${proto}.pb.cc
+             ${RAWDUCK_PROTO_GEN}/${proto}.pb.h
       COMMAND $<TARGET_FILE:protobuf::protoc> --proto_path=${RAWDUCK_PROTO_DIR}
               --cpp_out=${RAWDUCK_PROTO_GEN} ${RAWDUCK_PROTO_DIR}/${proto}.proto
       DEPENDS ${RAWDUCK_PROTO_DIR}/${proto}.proto)
     list(APPEND RAWDUCK_PROTO_SOURCES ${RAWDUCK_PROTO_GEN}/${proto}.pb.cc)
   endforeach()
   include_directories(${RAWDUCK_PROTO_GEN})
-  set_property(SOURCE src/raw_otlp_pb.cpp APPEND PROPERTY COMPILE_DEFINITIONS RAWDUCK_WITH_OTLP_PROTOBUF=1)
+  set_property(
+    SOURCE src/raw_otlp_pb.cpp
+    APPEND
+    PROPERTY COMPILE_DEFINITIONS RAWDUCK_WITH_OTLP_PROTOBUF=1)
 else()
   message(STATUS "RawDuck: building without OTLP/protobuf support")
 endif()
@@ -86,15 +96,18 @@ if(RAWDUCK_GRPC_ENABLED)
   message(STATUS "RawDuck: building with OTLP/gRPC support")
   foreach(proto ${RAWDUCK_SERVICE_PROTOS})
     add_custom_command(
-      OUTPUT ${RAWDUCK_PROTO_GEN}/${proto}.grpc.pb.cc ${RAWDUCK_PROTO_GEN}/${proto}.grpc.pb.h
-      COMMAND $<TARGET_FILE:protobuf::protoc> --proto_path=${RAWDUCK_PROTO_DIR}
-              --grpc_out=${RAWDUCK_PROTO_GEN}
-              --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
-              ${RAWDUCK_PROTO_DIR}/${proto}.proto
+      OUTPUT ${RAWDUCK_PROTO_GEN}/${proto}.grpc.pb.cc
+             ${RAWDUCK_PROTO_GEN}/${proto}.grpc.pb.h
+      COMMAND
+        $<TARGET_FILE:protobuf::protoc> --proto_path=${RAWDUCK_PROTO_DIR}
+        --grpc_out=${RAWDUCK_PROTO_GEN}
+        --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
+        ${RAWDUCK_PROTO_DIR}/${proto}.proto
       DEPENDS ${RAWDUCK_PROTO_DIR}/${proto}.proto)
     list(APPEND RAWDUCK_PROTO_SOURCES ${RAWDUCK_PROTO_GEN}/${proto}.grpc.pb.cc)
   endforeach()
-  set_source_files_properties(src/raw_grpc.cpp PROPERTIES COMPILE_DEFINITIONS RAWDUCK_WITH_GRPC=1)
+  set_source_files_properties(src/raw_grpc.cpp PROPERTIES COMPILE_DEFINITIONS
+                                                          RAWDUCK_WITH_GRPC=1)
 else()
   message(STATUS "RawDuck: building without OTLP/gRPC support")
 endif()
@@ -115,7 +128,8 @@ set(EXTENSION_SOURCES
     ${RAWDUCK_PROTO_SOURCES}
     src/raw_transforms.cpp
     src/raw_optimize.cpp
-    src/raw_scalars.cpp)
+    src/raw_scalars.cpp
+    src/raw_grammar.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

@@ -195,19 +195,19 @@ struct RawServeGrpcState : public GlobalTableFunctionState {
 static unique_ptr<FunctionData> RawServeGrpcBind(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<RawServeGrpcBindData>();
-	auto host = input.named_parameters.find("host");
+	auto host = input.named_parameters.find(Identifier("host"));
 	if (host != input.named_parameters.end() && !host->second.IsNull()) {
 		result->host = host->second.GetValue<string>();
 	}
-	auto port = input.named_parameters.find("port");
+	auto port = input.named_parameters.find(Identifier("port"));
 	if (port != input.named_parameters.end() && !port->second.IsNull()) {
 		result->port = port->second.GetValue<int32_t>();
 	}
-	auto token = input.named_parameters.find("token");
+	auto token = input.named_parameters.find(Identifier("token"));
 	if (token != input.named_parameters.end() && !token->second.IsNull()) {
 		result->token = token->second.GetValue<string>();
 	}
-	auto async = input.named_parameters.find("async");
+	auto async = input.named_parameters.find(Identifier("async"));
 	if (async != input.named_parameters.end() && !async->second.IsNull()) {
 		result->async = async->second.GetValue<bool>();
 	}
@@ -301,10 +301,12 @@ static unique_ptr<FunctionData> RawServeGrpcStopBind(ClientContext &context, Tab
 
 TableFunction GetRawServeGrpcFunction() {
 	TableFunction function("raw_serve_grpc", {}, RawServeGrpcFunction, RawServeGrpcBind, RawServeGrpcInit);
-	function.named_parameters["host"] = LogicalType::VARCHAR;
-	function.named_parameters["port"] = LogicalType::INTEGER;
-	function.named_parameters["token"] = LogicalType::VARCHAR;
-	function.named_parameters["async"] = LogicalType::BOOLEAN;
+	RawAddNamedKwargs(function, [](TypedKwargs &options) {
+		options.Add("host", LogicalType::VARCHAR)
+		    .Add("port", LogicalType::INTEGER)
+		    .Add("token", LogicalType::VARCHAR)
+		    .Add("async", LogicalType::BOOLEAN);
+	});
 	return function;
 }
 

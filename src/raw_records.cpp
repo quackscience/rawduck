@@ -10,15 +10,19 @@ struct RawRecordsBindData : public TableFunctionData {
 };
 
 struct RawRecordsState : public GlobalTableFunctionState {
-	explicit RawRecordsState(const RawRecordsBindData &bind_data)
-	    : extractor(*bind_data.parsed->root, bind_data.parsed->columns) {
+	RawRecordsState(const RawRecordsBindData &bind_data, vector<column_t> column_ids_p)
+	    : extractor(*bind_data.parsed->root, bind_data.parsed->columns, column_ids_p),
+	      column_ids(std::move(column_ids_p)) {
 	}
 
 	idx_t next_row = 0;
 	RawExtractor extractor;
+	// projected physical indexes into bind_data.parsed->columns (DuckDB v2
+	// projection pushdown: output.data[i] is column_ids[i], not schema order)
+	vector<column_t> column_ids;
 };
 
-string RawNamedStringParameter(const named_parameter_map_t &parameters, const string &name) {
+string RawNamedStringParameter(const named_argument_map_t &parameters, const string &name) {
 	auto entry = parameters.find(Identifier(name));
 	if (entry == parameters.end() || entry->second.IsNull()) {
 		return string();
@@ -26,20 +30,35 @@ string RawNamedStringParameter(const named_parameter_map_t &parameters, const st
 	return entry->second.GetValue<string>();
 }
 
-RawParseOptions RawBindParseOptions(ClientContext &context, const named_parameter_map_t &parameters) {
+RawParseOptions RawBindParseOptions(ClientContext &context, const named_argument_map_t &parameters) {
 	auto options = ResolveTransform(context, RawNamedStringParameter(parameters, "transform"),
 	                                RawNamedStringParameter(parameters, "explode"));
-	auto ignore_entry = parameters.find("ignore_errors");
+	auto ignore_entry = parameters.find(Identifier("ignore_errors"));
 	if (ignore_entry != parameters.end() && !ignore_entry->second.IsNull()) {
 		options.ignore_errors = ignore_entry->second.GetValue<bool>();
 	}
 	return options;
 }
 
+void RawAddNamedKwargs(TableFunction &function, const std::function<void(TypedKwargs &)> &configure) {
+	auto &signature = function.GetSignature();
+	if (signature.GetTypedKwargs()) {
+		signature.ExtendTypedKwargs(configure);
+	} else {
+		signature.WithTypedKwargs("options", configure);
+	}
+}
+
 void RawAddIngestParameters(TableFunction &function) {
-	function.named_parameters["transform"] = LogicalType::VARCHAR;
-	function.named_parameters["explode"] = LogicalType::VARCHAR;
-	function.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
+	RawAddNamedKwargs(function, [](TypedKwargs &options) {
+		options.Add("transform", LogicalType::VARCHAR)
+		    .Add("explode", LogicalType::VARCHAR)
+		    .Add("ignore_errors", LogicalType::BOOLEAN);
+	});
+}
+
+Value RawResultValue(QueryResult &result, idx_t col, idx_t row) {
+	return result.Collection().GetValue(col, row);
 }
 
 static unique_ptr<FunctionData> RawRecordsBind(ClientContext &context, TableFunctionBindInput &input,
@@ -65,7 +84,7 @@ static unique_ptr<FunctionData> RawRecordsBind(ClientContext &context, TableFunc
 }
 
 static unique_ptr<GlobalTableFunctionState> RawRecordsInit(ClientContext &context, TableFunctionInitInput &input) {
-	return make_uniq<RawRecordsState>(input.bind_data->Cast<RawRecordsBindData>());
+	return make_uniq<RawRecordsState>(input.bind_data->Cast<RawRecordsBindData>(), input.column_ids);
 }
 
 static void RawRecordsFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
@@ -78,8 +97,12 @@ static void RawRecordsFunction(ClientContext &context, TableFunctionInput &data,
 	for (idx_t i = 0; i < count; i++) {
 		state.extractor.AssignRow(rows[state.next_row + i], i);
 	}
-	for (idx_t col = 0; col < columns.size(); col++) {
-		FillVector(state.extractor.ColumnValues(col), columns[col].type, output.data[col], 0);
+	for (idx_t out_col = 0; out_col < state.column_ids.size(); out_col++) {
+		auto col = state.column_ids[out_col];
+		if (col >= columns.size()) {
+			continue;
+		}
+		FillVector(state.extractor.ColumnValues(col), columns[col].type, output.data[out_col], 0);
 	}
 	state.next_row += count;
 	output.SetChildCardinality(count);
@@ -88,6 +111,7 @@ static void RawRecordsFunction(ClientContext &context, TableFunctionInput &data,
 TableFunction GetRawRecordsFunction() {
 	TableFunction function("raw_records", {LogicalType::VARCHAR}, RawRecordsFunction, RawRecordsBind, RawRecordsInit);
 	RawAddIngestParameters(function);
+	function.projection_pushdown = true;
 	return function;
 }
 

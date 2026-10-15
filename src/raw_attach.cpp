@@ -54,6 +54,11 @@ static unique_ptr<Catalog> RawDuckAttach(optional_ptr<StorageExtensionInfo> stor
 	if (RawDuckIsQuackAttach(info.path)) {
 		return RawDuckAttachQuack(storage_info, context, db, name, info, options);
 	}
+	// Product stores use DuckDB's default (v2) layout: lazy column metadata,
+	// DICT_FSST. Callers can still pin an older layout with STORAGE_VERSION.
+	if (options.options.find("storage_version") == options.options.end()) {
+		options.options["storage_version"] = Value("latest");
+	}
 	return make_uniq_base<Catalog, RawDuckCatalog>(db);
 }
 

@@ -5,6 +5,7 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 
@@ -1002,19 +1003,77 @@ bool RawFillSupported(const LogicalType &type) {
 }
 
 RawExtractor::RawExtractor(const RawNode &root_p, const vector<RawColumn> &columns) : root(root_p) {
+	Init(columns, nullptr);
+}
+
+RawExtractor::RawExtractor(const RawNode &root_p, const vector<RawColumn> &columns, const vector<column_t> &projected)
+    : root(root_p) {
+	Init(columns, projected);
+}
+
+void RawExtractor::Init(const vector<RawColumn> &columns, optional_ptr<const vector<column_t>> projected) {
 	values.resize(columns.size());
-	for (idx_t col = 0; col < columns.size(); col++) {
+	project_all = true;
+	if (projected) {
+		idx_t covered = 0;
+		vector<bool> seen(columns.size(), false);
+		for (auto col : *projected) {
+			if (col < columns.size() && !seen[col]) {
+				seen[col] = true;
+				covered++;
+			}
+		}
+		project_all = covered == columns.size() && !columns.empty();
+		if (projected->empty()) {
+			project_all = false;
+		}
+	}
+	auto add_column = [&](idx_t col) {
+		if (col >= columns.size()) {
+			return;
+		}
 		if (columns[col].path.empty()) {
-			// "value" column: the row itself is the value
 			root_is_column = true;
 		}
 		column_of[columns[col].node] = col;
+		projected_slots.push_back(col);
+		if (project_all) {
+			return;
+		}
+		needed.insert(&root);
+		const RawNode *cur = &root;
+		for (auto &segment : columns[col].path) {
+			needed.insert(cur);
+			cur = cur->FindChild(segment.c_str(), segment.size());
+			if (!cur) {
+				return;
+			}
+		}
+		needed.insert(columns[col].node);
+	};
+	if (project_all) {
+		for (idx_t col = 0; col < columns.size(); col++) {
+			add_column(col);
+		}
+		return;
+	}
+	if (!projected) {
+		return;
+	}
+	for (auto col : *projected) {
+		add_column(col);
 	}
 }
 
 void RawExtractor::Reset(idx_t row_count) {
-	for (auto &column_values : values) {
-		column_values.assign(row_count, nullptr);
+	if (project_all) {
+		for (auto &column_values : values) {
+			column_values.assign(row_count, nullptr);
+		}
+		return;
+	}
+	for (auto col : projected_slots) {
+		values[col].assign(row_count, nullptr);
 	}
 }
 
@@ -1029,6 +1088,22 @@ void RawExtractor::Traverse(yyjson_val *val, const RawNode &node, idx_t row_idx)
 		// (e.g. a structural mismatch): nothing to route
 		return;
 	}
+	if (!project_all) {
+		// only descend into subtrees that feed a projected column: one tree
+		// walk, but O(needed keys) lookups instead of visiting every JSON key.
+		// Ingest (project_all) keeps the sparse-friendly JSON-key iteration
+		// below — per-column path walks were the v0.1 hotspot.
+		for (auto &entry : node.children) {
+			if (!needed.count(entry.second.get())) {
+				continue;
+			}
+			auto child_val = duckdb_yyjson::yyjson_obj_getn(val, entry.first.c_str(), entry.first.size());
+			if (child_val) {
+				Traverse(child_val, *entry.second, row_idx);
+			}
+		}
+		return;
+	}
 	yyjson_obj_iter iter;
 	duckdb_yyjson::yyjson_obj_iter_init(val, &iter);
 	while (auto key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
@@ -1041,6 +1116,9 @@ void RawExtractor::Traverse(yyjson_val *val, const RawNode &node, idx_t row_idx)
 }
 
 void RawExtractor::AssignRow(yyjson_val *row, idx_t row_idx) {
+	if (!project_all && projected_slots.empty()) {
+		return;
+	}
 	if (root_is_column) {
 		values[column_of.at(&root)][row_idx] = row;
 		return;
@@ -1048,37 +1126,30 @@ void RawExtractor::AssignRow(yyjson_val *row, idx_t row_idx) {
 	Traverse(row, root, row_idx);
 }
 
-static string_t WriteJSONString(yyjson_val *val, Vector &result) {
+static void WriteJSONString(yyjson_val *val, VectorWriter<string_t> &writer) {
 	size_t len = 0;
 	auto data = duckdb_yyjson::yyjson_val_write(val, 0, &len);
 	if (!data) {
 		throw InternalException("RawDuck: failed to serialize JSON value");
 	}
-	auto str = StringVector::AddString(result, data, len);
+	writer.WriteValue(string_t(data, UnsafeNumericCast<uint32_t>(len)));
 	free(data);
-	return str;
 }
 
 // Writes a batch of resolved JSON values into `result` starting at `offset`.
 // Inference guarantees values fit the column type; anything that does not
-// (or is null/missing) becomes NULL.
+// (or is null/missing) becomes NULL. Uses FlatVector::Writer so the vector's
+// size is declared by the write itself (DuckDB v2).
 void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vector &result, idx_t offset) {
-	// vectors carry their own size in DuckDB v2: writing through the raw data
-	// pointer does not grow them, so declare the rows we are about to write
-	FlatVector::SetSize(result, offset + vals.size());
-	auto &validity = FlatVector::ValidityMutable(result);
-	auto set_null = [&](idx_t i) {
-		validity.SetInvalid(offset + i);
-	};
 	if (IsRawJSONType(type)) {
-		auto data = FlatVector::GetDataMutable<string_t>(result);
+		auto writer = FlatVector::Writer<string_t>(result, vals.size(), offset);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (!val || duckdb_yyjson::yyjson_is_null(val)) {
-				set_null(i);
+				writer.WriteNull();
 				continue;
 			}
-			data[offset + i] = WriteJSONString(val, result);
+			WriteJSONString(val, writer);
 		}
 		return;
 	}
@@ -1086,16 +1157,14 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 		// DuckDB's idiomatic path is JSON text → VARIANT (json_cast.test /
 		// VARIANT storage tests). Serialize yyjson → JSON, then cast.
 		Vector json_source(LogicalType::JSON(), vals.size());
-		FlatVector::SetSize(json_source, vals.size());
-		auto json_data = FlatVector::GetDataMutable<string_t>(json_source);
-		auto &json_validity = FlatVector::ValidityMutable(json_source);
+		auto json_writer = FlatVector::Writer<string_t>(json_source, vals.size());
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (!val || duckdb_yyjson::yyjson_is_null(val)) {
-				json_validity.SetInvalid(i);
+				json_writer.WriteNull();
 				continue;
 			}
-			json_data[i] = WriteJSONString(val, json_source);
+			WriteJSONString(val, json_writer);
 		}
 		if (offset == 0) {
 			VectorOperations::DefaultCast(json_source, result, vals.size());
@@ -1103,50 +1172,51 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 		}
 		Vector variant_tmp(LogicalType::VARIANT(), vals.size());
 		VectorOperations::DefaultCast(json_source, variant_tmp, vals.size());
+		FlatVector::SetSize(result, offset + vals.size());
 		VectorOperations::Copy(variant_tmp, result, vals.size(), 0, offset);
 		return;
 	}
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN: {
-		auto data = FlatVector::GetDataMutable<bool>(result);
+		auto writer = FlatVector::Writer<bool>(result, vals.size(), offset);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (val && duckdb_yyjson::yyjson_is_bool(val)) {
-				data[offset + i] = duckdb_yyjson::yyjson_get_bool(val);
+				writer.WriteValue(duckdb_yyjson::yyjson_get_bool(val));
 			} else {
-				set_null(i);
+				writer.WriteNull();
 			}
 		}
 		break;
 	}
 	case LogicalTypeId::BIGINT: {
-		auto data = FlatVector::GetDataMutable<int64_t>(result);
+		auto writer = FlatVector::Writer<int64_t>(result, vals.size(), offset);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (val && duckdb_yyjson::yyjson_is_sint(val)) {
-				data[offset + i] = duckdb_yyjson::yyjson_get_sint(val);
+				writer.WriteValue(duckdb_yyjson::yyjson_get_sint(val));
 			} else if (val && duckdb_yyjson::yyjson_is_uint(val)) {
-				data[offset + i] = static_cast<int64_t>(duckdb_yyjson::yyjson_get_uint(val));
+				writer.WriteValue(static_cast<int64_t>(duckdb_yyjson::yyjson_get_uint(val)));
 			} else {
-				set_null(i);
+				writer.WriteNull();
 			}
 		}
 		break;
 	}
 	case LogicalTypeId::DOUBLE: {
-		auto data = FlatVector::GetDataMutable<double>(result);
+		auto writer = FlatVector::Writer<double>(result, vals.size(), offset);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (val && duckdb_yyjson::yyjson_is_num(val)) {
-				data[offset + i] = duckdb_yyjson::yyjson_get_num(val);
+				writer.WriteValue(duckdb_yyjson::yyjson_get_num(val));
 			} else {
-				set_null(i);
+				writer.WriteNull();
 			}
 		}
 		break;
 	}
 	case LogicalTypeId::DATE: {
-		auto data = FlatVector::GetDataMutable<date_t>(result);
+		auto writer = FlatVector::Writer<date_t>(result, vals.size(), offset);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			idx_t pos = 0;
@@ -1155,57 +1225,56 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 			if (!val || !duckdb_yyjson::yyjson_is_str(val) ||
 			    Date::TryConvertDate(duckdb_yyjson::yyjson_get_str(val), duckdb_yyjson::yyjson_get_len(val), pos,
 			                         converted, special, true) != DateCastResult::SUCCESS) {
-				set_null(i);
+				writer.WriteNull();
 			} else {
-				data[offset + i] = converted;
+				writer.WriteValue(converted);
 			}
 		}
 		break;
 	}
 	case LogicalTypeId::TIMESTAMP: {
-		auto data = FlatVector::GetDataMutable<timestamp_t>(result);
+		auto writer = FlatVector::Writer<timestamp_t>(result, vals.size(), offset);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			timestamp_t converted;
 			if (!val || !duckdb_yyjson::yyjson_is_str(val) ||
 			    Timestamp::TryConvertTimestamp(duckdb_yyjson::yyjson_get_str(val), duckdb_yyjson::yyjson_get_len(val),
 			                                   converted, true) != TimestampCastResult::SUCCESS) {
-				set_null(i);
+				writer.WriteNull();
 			} else {
-				data[offset + i] = converted;
+				writer.WriteValue(converted);
 			}
 		}
 		break;
 	}
 	case LogicalTypeId::VARCHAR: {
-		auto data = FlatVector::GetDataMutable<string_t>(result);
+		auto writer = FlatVector::Writer<string_t>(result, vals.size(), offset);
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (!val || duckdb_yyjson::yyjson_is_null(val)) {
-				set_null(i);
+				writer.WriteNull();
 			} else if (duckdb_yyjson::yyjson_is_str(val)) {
-				data[offset + i] = StringVector::AddString(result, duckdb_yyjson::yyjson_get_str(val),
-				                                           duckdb_yyjson::yyjson_get_len(val));
+				writer.WriteValue(string_t(duckdb_yyjson::yyjson_get_str(val),
+				                           UnsafeNumericCast<uint32_t>(duckdb_yyjson::yyjson_get_len(val))));
 			} else {
 				// mixed-type column: render non-strings as their JSON literal
-				data[offset + i] = WriteJSONString(val, result);
+				WriteJSONString(val, writer);
 			}
 		}
 		break;
 	}
 	case LogicalTypeId::LIST: {
-		auto entries = FlatVector::GetDataMutable<list_entry_t>(result);
+		auto writer = FlatVector::Writer<list_entry_t>(result, vals.size(), offset);
 		auto child_offset = ListVector::GetListSize(result);
 		vector<yyjson_val *> child_vals;
 		for (idx_t i = 0; i < vals.size(); i++) {
 			auto val = vals[i];
 			if (!val || !duckdb_yyjson::yyjson_is_arr(val)) {
-				set_null(i);
-				entries[offset + i] = list_entry_t {child_offset + child_vals.size(), 0};
+				writer.WriteNull(list_entry_t {child_offset + child_vals.size(), 0});
 				continue;
 			}
 			auto length = duckdb_yyjson::yyjson_arr_size(val);
-			entries[offset + i] = list_entry_t {child_offset + child_vals.size(), length};
+			writer.WriteValue(list_entry_t {child_offset + child_vals.size(), length});
 			yyjson_arr_iter iter;
 			duckdb_yyjson::yyjson_arr_iter_init(val, &iter);
 			while (auto element = duckdb_yyjson::yyjson_arr_iter_next(&iter)) {
@@ -1217,11 +1286,14 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 		FillVector(child_vals, ListType::GetChildType(type), ListVector::GetChildMutable(result), child_offset);
 		break;
 	}
-	default:
+	default: {
+		FlatVector::SetSize(result, offset + vals.size());
+		auto &validity = FlatVector::ValidityMutable(result);
 		for (idx_t i = 0; i < vals.size(); i++) {
-			set_null(i);
+			validity.SetInvalid(offset + i);
 		}
 		break;
+	}
 	}
 }
 

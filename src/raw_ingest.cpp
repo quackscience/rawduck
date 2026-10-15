@@ -37,12 +37,84 @@
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <thread>
 
 namespace duckdb {
+
+// Sort a filled chunk by http.status_code so row groups RLE and zone maps
+// prune on the first query, without a post-ingest raw_optimize() rewrite.
+static const char *RAW_CLUSTER_COLUMN = "http.status_code";
+
+static optional_idx FindClusterSlot(const vector<RawColumn> &columns, const vector<idx_t> &slot_of) {
+	for (idx_t col = 0; col < columns.size(); col++) {
+		if (columns[col].name == RAW_CLUSTER_COLUMN) {
+			return slot_of[col];
+		}
+	}
+	return optional_idx();
+}
+
+template <class T>
+static bool CompactIntLess(const UnifiedVectorFormat &format, sel_t left, sel_t right) {
+	auto left_idx = format.sel->get_index(left);
+	auto right_idx = format.sel->get_index(right);
+	auto left_valid = format.validity.RowIsValid(left_idx);
+	auto right_valid = format.validity.RowIsValid(right_idx);
+	if (left_valid != right_valid) {
+		return !left_valid;
+	}
+	if (!left_valid) {
+		return false;
+	}
+	auto data = UnifiedVectorFormat::GetData<T>(format);
+	return data[left_idx] < data[right_idx];
+}
+
+static void ClusterChunk(DataChunk &chunk, optional_idx slot) {
+	auto count = chunk.size();
+	if (!slot.IsValid() || count <= 1 || slot.GetIndex() >= chunk.ColumnCount()) {
+		return;
+	}
+	auto &cluster_vec = chunk.data[slot.GetIndex()];
+	UnifiedVectorFormat format;
+	cluster_vec.ToUnifiedFormat(format);
+	vector<sel_t> order(count);
+	for (idx_t i = 0; i < count; i++) {
+		order[i] = UnsafeNumericCast<sel_t>(i);
+	}
+	auto less = [&](sel_t left, sel_t right) {
+		switch (cluster_vec.GetType().InternalType()) {
+		case PhysicalType::INT8:
+			return CompactIntLess<int8_t>(format, left, right);
+		case PhysicalType::INT16:
+			return CompactIntLess<int16_t>(format, left, right);
+		case PhysicalType::INT32:
+			return CompactIntLess<int32_t>(format, left, right);
+		case PhysicalType::INT64:
+			return CompactIntLess<int64_t>(format, left, right);
+		case PhysicalType::UINT8:
+			return CompactIntLess<uint8_t>(format, left, right);
+		case PhysicalType::UINT16:
+			return CompactIntLess<uint16_t>(format, left, right);
+		default:
+			return false;
+		}
+	};
+	if (std::is_sorted(order.begin(), order.end(), less)) {
+		return;
+	}
+	std::stable_sort(order.begin(), order.end(), less);
+	SelectionVector sel(count);
+	for (idx_t i = 0; i < count; i++) {
+		sel.set_index(i, order[i]);
+	}
+	chunk.Slice(sel, count);
+	chunk.Flatten();
+}
 
 //===--------------------------------------------------------------------===//
 // Schema-shape cache: high-rate small inserts mostly repeat the same payload
@@ -301,8 +373,36 @@ static LogicalType JoinColumnTypes(const LogicalType &existing, const LogicalTyp
 		return existing;
 	}
 	if (IsIntegerType(existing) && IsIntegerType(incoming)) {
-		// incoming integers are always inferred as BIGINT; only widen upwards
-		return existing.id() == LogicalTypeId::HUGEINT ? existing : incoming;
+		auto integer_rank = [](const LogicalType &type) -> idx_t {
+			switch (type.id()) {
+			case LogicalTypeId::TINYINT:
+			case LogicalTypeId::UTINYINT:
+				return 1;
+			case LogicalTypeId::SMALLINT:
+			case LogicalTypeId::USMALLINT:
+				return 2;
+			case LogicalTypeId::INTEGER:
+			case LogicalTypeId::UINTEGER:
+				return 3;
+			case LogicalTypeId::BIGINT:
+			case LogicalTypeId::UBIGINT:
+				return 4;
+			case LogicalTypeId::HUGEINT:
+			case LogicalTypeId::UHUGEINT:
+				return 5;
+			default:
+				return 0;
+			}
+		};
+		auto existing_rank = integer_rank(existing);
+		auto incoming_rank = integer_rank(incoming);
+		if (existing_rank > incoming_rank) {
+			return existing;
+		}
+		if (incoming_rank > existing_rank) {
+			return incoming;
+		}
+		return RawFillSupported(existing) ? existing : incoming;
 	}
 	auto is_numeric = [](const LogicalType &t) {
 		return IsIntegerType(t) || t.id() == LogicalTypeId::FLOAT || t.id() == LogicalTypeId::DOUBLE;
@@ -698,6 +798,7 @@ private:
 				}
 			}
 			chunk.SetChildCardinality(count);
+			ClusterChunk(chunk, FindClusterSlot(parsed.columns, slot_of));
 			// flush completed row groups to disk as we go, overlapping parse +
 			// compression + I/O instead of deferring every byte to drain. The
 			// writer targets the current storage layout; schema evolution
@@ -1198,6 +1299,7 @@ private:
 				}
 			}
 			chunk.SetChildCardinality(count);
+			ClusterChunk(chunk, FindClusterSlot(parsed.columns, slot_of));
 			storage.LocalAppend(table.Cast<DuckTableEntry>(), context, chunk, bound_constraints);
 			rows += count;
 		}

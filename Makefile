@@ -4,7 +4,7 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXT_NAME=rawduck
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
-# DuckDB v2.0-cyanoptera requires C++17+. A leftover build/ from the v1.5.5 pin
+# DuckDB v2.0-cyanoptera requires C++17+. A leftover build/ from an older pin
 # caches CMAKE_CXX_STANDARD=11 and cmake will keep that unless -D overrides it.
 EXT_FLAGS:=$(EXT_FLAGS) -DCMAKE_CXX_STANDARD=17
 

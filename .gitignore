@@ -1,5 +1,7 @@
 build
 .idea
+.serena/
+benchmark/k8s-comparison/
 cmake-build-debug
 duckdb_unittest_tempdir/
 .DS_Store

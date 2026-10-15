@@ -4,11 +4,12 @@ Primary workload: **OTEL telemetry** (OTLP/JSON logs, metrics, traces). GH Archi
 wide-schema stress test in the appendix.
 
 Published numbers are Apple **M3 Ultra** (32 cores, 512 GiB), default RawDuck
-settings. **Do not mix pins:** `main` is DuckDB **v1.5.5**; this branch’s product
-lock is DuckDB **v2.0-cyanoptera** `60c58d1` (v2.0.0-dev88475). Cold ingest =
+settings. Product lock is DuckDB **v2.0-cyanoptera** `60c58d1` (v2.0.0-dev88475)
+with duration shred, INTEGER lattice, and status-code clustering. Cold ingest =
 first `raw_ingest_file` in a fresh database; warm = second ingest in the same
 process after `DELETE` (`columns_added = 0`). Report the best of N sessions
-unless noted. See `scripts/benchmark/README.md` for metric definitions.
+unless noted. See
+`scripts/benchmark/README.md` for metric definitions.
 
 ### Harness
 
@@ -30,84 +31,47 @@ GEN=ninja make release
 
 ## OTEL bulk ingest
 
-1,000,000 records per signal, OTLP/JSON export envelopes (collector POST bodies), best of 5
-sessions. **`main` pin (DuckDB v1.5.5):**
-
-| signal | records | source NDJSON | cold ingest | records/s | throughput |
-|---|---:|---:|---:|---:|---:|
-| traces | 1,000,000 | 435 MB | 1.19 s | 841k | 366 MB/s |
-| logs | 1,000,000 | 294 MB | 0.87 s | 1.15M | 338 MB/s |
-| metrics | 1,000,000 | 353 MB | 1.13 s | 889k | 314 MB/s |
-
-3M telemetry records in **3.2 s** (~940k records/s average). Warm ingest matches cold within
-~2% on each signal.
-
-### Branch `v2.0.0` ingest (August pin `21447bd`, historical peak)
-
-Same machine and harness: VARIANT overflow sink + OTLP metrics shredded to
-data-point grain (typed columns, not a `dataPoints` blob). Historical ingest
-peak; the freeze-line lock is the `60c58d1` table below.
-
-| signal | cold ingest | records/s | throughput | vs v1.5.5 |
-|---|---:|---:|---:|---:|
-| traces | 0.80 s | 1.25M | 543 MB/s | 1.5× |
-| logs | 0.45 s | 2.20M | 646 MB/s | 1.9× |
-| metrics | 0.51 s | 1.96M | 690 MB/s | 2.2× |
-
-3M telemetry records in **~1.77 s** (~1.7M records/s average). Warm within a few percent of
-cold on every signal.
-
-### Branch `v2.0.0` freeze line (`60c58d1` / v2.0.0-dev88475)
-
-Default v2 storage, `run_otel.sh --records 1000000 --runs 1` (this tip’s lock):
+1,000,000 records per signal, OTLP/JSON export envelopes (collector POST bodies).
+Default v2 storage, `run_otel.sh --records 1000000`:
 
 | signal | cold ingest | records/s | warm records/s |
 |---|---:|---:|---:|
-| traces | 0.85 s | 1.17M | 1.20M |
+| traces | 0.84–0.85 s | 1.17–1.19M | 1.19–1.20M |
 | logs | 0.49 s | 2.04M | 2.10M |
 | metrics | 0.54 s | 1.85M | 1.75M |
 
-Keep ingest ≥ 98% of this table. Queries: see the `60c58d1` row under Query speed.
+Keep ingest ≥ 98% of this table. Queries: see Query speed. The traces table is
+16 typed columns (including shredded `duration`), **zero overflow**. Compact
+ints (`kind`, `http.status_code`, `status.code`, `duration` on this harness)
+are INTEGER; UnixNano timestamps stay BIGINT.
 
 ## Query speed (1,000,000 spans)
 
 Same `run_variant.py` SQL on this machine (M3 Ultra, 32 cores). New process after
-`CHECKPOINT`. Traces table is 15 typed columns, **zero overflow**. Storage version
-(`v1.5.0` vs DuckDB default) does not change the query numbers on either pin.
+`CHECKPOINT`. Traces table is 16 typed columns, **zero overflow**. p99 scans the
+shredded `duration` INTEGER column.
 
-**Do not mix these rows.** The old “1.5 ms RawDuck” figure is the v1.5.5 pin, not v2.
-
-| pin | harness | errors / p99 / status (ms) | traces ingest |
+| tip | harness | errors / p99 / status (ms) | traces ingest |
 |---|---|---|---|
-| `main` DuckDB v1.5.5 | best of 7, `--paths rawduck` | 1.1 / 2.6 / 2.4 | 0.84–1.01M rec/s |
-| `v2.0.0` @ `21447bd` (v1.5.6-dev11341) | best of 3 | 3.8 / 5.1 / 3.5 | 1.25M rec/s |
-| `v2.0.0` cyanoptera (v2.0.0-dev84550) | best of 7 | 4.5 / 5.8 / 4.4 | 1.20–1.23M rec/s |
-| `v2.0.0` cyanoptera `60c58d1` (v2.0.0-dev88475) | best of 7, dict GROUP BY | **1.2 / 3.2 / 2.4** | 1.17–1.20M rec/s |
+| cyanoptera `60c58d1`, dict GROUP BY | best of 7, `--paths rawduck` | 1.2 / 3.2 / 2.4 | 1.17–1.20M rec/s |
+| duration shred + INTEGER lattice | best of 7, `--paths rawduck` | 1.2 / 3.0 / 2.1 | 1.19M rec/s |
+| chunk cluster + INTEGER status GROUP BY | best of 7, `--paths rawduck` | **1.1 / 3.0 / 0.9** | **1.18M rec/s** |
 
-JSON-flat `->>` on the same shredded rows is ~36 / 88 / 32 ms on cyanoptera (~39 / 99 / 35
-on v1.5.5) — the JSON control did not regress; only the shredded scan did. Nested VARIANT
-OTLP stays 90–230× slower than typed columns (KeyValue lists were never shredded).
-VARIANT-flat (already-shredded rows stored as VARIANT) ties RawDuck on the v2 line; that
-is DuckDB scanning a flat shredded blob, not a reason to stop shredding at ingest.
+The latest row is the product lock. `status_dist` groups the INTEGER
+`"http.status_code"` column so v2 Perfect Hash Group By fires; ingest sorts
+each chunk by that column so the `>= 500` filter zone-maps on the first scan.
+JSON-flat `->>` on the same shredded rows is
+~36 / 88 / 32 ms — typed columns stay ~30× faster. Nested VARIANT OTLP stays
+90–230× slower (KeyValue lists were never shredded). VARIANT-flat (already-shredded
+rows stored as VARIANT) can tie RawDuck; that is DuckDB scanning a flat blob, not
+a reason to stop shredding at ingest.
 
-v2 query leverage on this tip: `rawduck_dictionary_groupby` (default on) keeps DICT_FSST
-VARCHAR group keys as dictionaries instead of `__internal_compress_string_uhugeint`
-(status **ties** the v1.5.5 lock; errors 1.2 vs 1.1). After `raw_optimize()` clusters by
-observed filters, integers RLE and zone maps prune — errors **0.87 ms**, status **0.90 ms**.
-The remaining p99 gap (3.2 vs 2.6) is `quantile_cont` over 1M BIGINT durations, not extract.
-
-v1.5.5 vs JSON `->>` (same queries; v1.5.5 pin):
-
-| query | JSON `->>` | RawDuck v1.5.5 | speedup |
-|---|---:|---:|---:|
-| error count by service (`status>=500`) | 39 ms | 1.1 ms | 35× |
-| p99 latency by route | 99 ms | 2.6 ms | 38× |
-| status-code distribution | 35 ms | 2.4 ms | 15× |
-| storage | 143 MB | 35–40 MB | ~3.6× smaller |
-
-Cyanoptera query knobs (threads 1/4/8/32, `ANALYZE`, in-memory `CTAS`) do not recover
-the v1.5.5 latency. Do not merge `v2.0.0` into `main` until that table’s cyanoptera
-row matches `main`.
+v2 query leverage: `rawduck_dictionary_groupby` (default on) keeps DICT_FSST
+VARCHAR group keys as dictionaries instead of `__internal_compress_string_uhugeint`.
+Compact INTEGER columns densify `kind` / `http.status_code` / `duration` bitpacking.
+After `raw_optimize()` clusters by observed filters, integers RLE and zone maps
+prune — errors **0.87 ms**, status **0.90 ms** on the freeze line. Remaining p99
+cost is `quantile_cont` over 1M durations.
 
 ### Reproduce
 
@@ -137,13 +101,9 @@ Real OTLP/HTTP **protobuf** traffic via the OpenTelemetry Python SDK into `raw_s
 
 First run creates `benchmark/work/otel-streaming-venv` (OpenTelemetry SDK dependency).
 
-## VARIANT vs RawDuck (DuckDB v1.5.5 pin)
+## VARIANT / JSON controls vs typed shred
 
-Same 1,000,000 OTLP/JSON trace spans. These VARIANT/JSON comparison rows are the
-v1.5.5 pin. RawDuck query lock for that pin is the table in **Query speed** above
-(1.1 / 2.6 / 2.4 ms, best of 7); the 1.5 / 3.2 / 2.5 ms row below is the earlier
-best-of-3 publish of the same SQL.
-
+Controls only — not the product path. Product lock is **Query speed** above.
 Same 1,000,000 OTLP/JSON trace spans. Paths:
 
 | path | definition |
@@ -190,20 +150,10 @@ Spark GB10: 20 cores, 122 GiB, Linux aarch64.
 ./scripts/benchmark/run_variant.sh --records 1000000 --runs 3 --threads 8   # many-core ARM
 ```
 
-### Same comparison on DuckDB v2.0-cyanoptera (`60c58d1` / v2.0.0-dev88475)
-
-This freeze-line tip is the `v2.0.0` product lock. Ingest: traces 1.17M cold /
-1.20M warm, logs 2.04M, metrics 1.85M (`run_otel.sh --records 1000000 --runs 1`).
-Queries on default v2 storage: **1.4 / 3.4 / 2.4 ms** (best of 3) — much closer
-to the v1.5.5 lock than the earlier cyanoptera 4.5 / 5.8 / 4.4 row, still not
-a merge into `main`. VARIANT-flat ties RawDuck because both are already shredded;
-nested VARIANT OTLP does not. The harness labels `pragma_version()` so result
-JSON is not mixed with v1.5.5.
-
 Product RawDuck queries use DuckDB default storage (`--paths rawduck` implies
 `--storage-version default`). VARIANT comparison tables still need
 `STORAGE_VERSION 'v1.5.0'`. That choice does not change RawDuck query ms. Do not
-copy databases across pins.
+copy databases across DuckDB pins.
 
 ```sh
 git checkout v2.0.0 && git submodule update --init --recursive
@@ -214,13 +164,14 @@ GEN=ninja make release
 ./scripts/benchmark/run_variant.sh --records 1000000 --runs 3
 ```
 
-Overflow columns on this branch are VARIANT (sink only). Keep `main` on the JSON
-sink. OTLP metrics fan out to data-point grain so `dataPoints` are typed columns.
+Overflow is VARIANT (sink only). OTLP metrics fan out to data-point grain so
+`dataPoints` are typed columns. VARIANT-flat can tie typed shred because both
+are already flat; nested VARIANT OTLP does not.
 
 ## Appendix: GH Archive (wide-schema stress test)
 
 One hour of [GH Archive](https://www.gharchive.org/) data — 247,199 events / 956 MB NDJSON /
-914 columns. Apple Silicon, 10 cores, DuckDB v1.5.5:
+914 columns. Apple Silicon, 10 cores:
 
 | | JSON column | RawDuck | |
 |---|---:|---:|---|
@@ -248,4 +199,4 @@ CHECKPOINT;
 
 - Split NDJSON on `\n` only (not `splitlines()` — `\u2028`/`\u2029` appear in strings).
 - Use `.timer on` via `duckdb -f script.sql` (not `duckdb -c`).
-- Shallow duckdb clones without tags report `v0.0.1`; fetch tag `v1.5.5`.
+- Shallow duckdb clones without tags report `v0.0.1`; fetch the pin’s tags.

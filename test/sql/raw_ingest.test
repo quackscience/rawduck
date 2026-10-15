@@ -18,7 +18,7 @@ events	true	3	0	2	0
 query II
 SELECT column_name, column_type FROM (DESCRIBE events);
 ----
-id	BIGINT
+id	INTEGER
 action	VARCHAR
 ts	TIMESTAMP
 
@@ -27,6 +27,28 @@ SELECT id, action, ts FROM events ORDER BY id;
 ----
 1	click	2024-01-15 10:30:00
 2	view	2024-01-15 10:31:00
+
+# ingested tables use DuckDB seq_scan late materialization (Top-N / LIMIT OFFSET)
+statement ok
+PRAGMA explain_output = 'optimized_only';
+
+query II
+EXPLAIN (FORMAT yaml) SELECT * FROM events ORDER BY id DESC LIMIT 1;
+----
+logical_opt	<REGEX>:.*COMPARISON_JOIN.*
+
+query III
+SELECT id, action, ts FROM events ORDER BY id DESC LIMIT 1;
+----
+2	view	2024-01-15 10:31:00
+
+query II
+EXPLAIN (FORMAT yaml) SELECT * FROM events LIMIT 1 OFFSET 1;
+----
+logical_opt	<REGEX>:.*COMPARISON_JOIN.*
+
+statement ok
+RESET explain_output;
 
 #===----------------------------------------------------------------------===#
 # evolution: new keys add columns, old rows read as NULL, types widen
@@ -197,9 +219,19 @@ CREATE TABLE manual (id INTEGER, name VARCHAR);
 query IIIIII
 SELECT * FROM raw_ingest('manual', '[{"id":1,"name":"a"},{"id":2,"name":"b"}]');
 ----
-manual	false	0	1	2	0
+manual	false	0	0	2	0
 
-# INTEGER was widened to the inferred BIGINT
+# small ints match INTEGER; a value outside int32 widens to BIGINT
+query I
+SELECT typeof(id) FROM manual LIMIT 1;
+----
+INTEGER
+
+query IIIIII
+SELECT * FROM raw_ingest('manual', '[{"id":3000000000,"name":"c"}]');
+----
+manual	false	0	1	1	0
+
 query I
 SELECT typeof(id) FROM manual LIMIT 1;
 ----

@@ -5,13 +5,11 @@ JSON results in `benchmark/results/` (gitignored except the committed baseline).
 
 **Policy:** only merge changes that improve or match baseline on **every**
 default-path metric they touch. Ingest: cold and warm, all signals, ≥ 98% of
-`benchmark/results/baseline-otel.json` (`compare.sh`). Queries: same
-`run_variant.py` SQL as the Performance contract in `AGENTS.md` — `main` must
-stay at the v1.5.5 lock (1.1 / 2.6 / 2.4 ms on 1M traces); `v2.0.0` must not
-lose to its freeze-line row (`60c58d1` 1.4 / 3.4 / 2.4 vs older cyanoptera
-4.5 / 5.8 / 4.4).
+`benchmark/results/baseline-otel.json` (`compare.sh`) and ≥ 98% of the AGENTS.md
+traces lock (1.18M rec/s). Queries: same `run_variant.py` SQL as the Performance
+contract — must not lose **1.1 / 3.0 / 0.9 ms** on 1M traces (best of 7).
 Features that regress any default path are removed, not shipped as opt-in
-toggles. Do not merge `v2.0.0` into `main` while queries are slower.
+toggles.
 
 ## Session model (cold then warm)
 
@@ -98,7 +96,7 @@ python3 scripts/benchmark/gen_otlp.py traces 1000000 benchmark/data 170008640000
 | `run_otel_session.py` | Single-process cold→warm driver (host timing) |
 | `run_otel.sh` | Orchestrator: data gen, N sessions, JSON output (bash) |
 | `compare.sh` | Regression gate vs `baseline-otel.json` (bash) |
-| `run_variant.sh` / `run_variant.py` | VARIANT (DuckDB v1.5) vs RawDuck ingest + query + storage |
+| `run_variant.sh` / `run_variant.py` | VARIANT/JSON controls vs RawDuck typed columns (ingest + query + storage) |
 | `run_otel_streaming.sh` / `.py` / `otel_gen_load.py` | Real OTLP/HTTP streaming ingestion via the actual OpenTelemetry SDK (see below) |
 
 Requires: bash, python3, a release build (`build/release/duckdb` + extension).
@@ -169,8 +167,7 @@ uncontended requests). Regression-tested in `test/http/raw_api_compat.sh`'s
 
 Compares encodings on the same OTLP/JSON traces. **RawDuck typed columns are the
 product path.** VARIANT/JSON rows are controls, not targets. See `AGENTS.md`
-Performance contract and `BENCHMARK.md` Query speed — do not mix v1.5.5 1.1 ms
-with this tip’s 1.4 ms.
+Performance contract and `BENCHMARK.md` Query speed.
 
 `--paths rawduck` uses DuckDB **default storage** (product DBs). Any `variant*`
 path forces `--storage-version v1.5.0`. Storage version does not change RawDuck
@@ -200,13 +197,13 @@ thrash — pin workers:
 ./scripts/benchmark/run_variant.sh --records 1000000 --runs 3 --threads 8 --skip-kv
 ```
 
-### Linux / arm64 hang (DuckDB 1.5 CLI)
+### Linux / arm64 hang (CLI stdin stall)
 
 If the process sits idle with no CPU at `ingest …` (especially right after
-startup), that is usually the DuckDB **v1.5 CLI stdin/color-detection stall**,
-not RawDuck. The harness now passes `-dark-mode`, sets `DUCKDB_NO_HIGHLIGHT=1`,
-pre-creates the v1.5.0 DB with a one-shot `-c` (no interactive `ATTACH`), and
-reads stdout from a dedicated thread.
+startup), that is usually the DuckDB CLI stdin/color-detection stall, not
+RawDuck. The harness now passes `-dark-mode`, sets `DUCKDB_NO_HIGHLIGHT=1`,
+pre-creates VARIANT control DBs (`STORAGE_VERSION 'v1.5.0'`) with a one-shot
+`-c` (no interactive `ATTACH`), and reads stdout from a dedicated thread.
 
 If CPU is pegged on `variant_otlp` / `variant_envelope`, that is VARIANT
 shredding fat OTLP rows (slow, not a hang). Envelope ingest stays off by

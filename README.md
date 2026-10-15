@@ -38,7 +38,7 @@ INSERT INTO raw.ingest.events VALUES
     ('{"id": 2, "action": "view",  "ts": "2024-01-15T10:31:00", "user": {"name": "bob"}}');
 
 DESCRIBE raw.events;
--- id BIGINT, action VARCHAR, ts TIMESTAMP, user.name VARCHAR, user.plan VARCHAR
+-- id INTEGER, action VARCHAR, ts TIMESTAMP, user.name VARCHAR, user.plan VARCHAR
 
 SELECT "user.name", count(*) FROM raw.events GROUP BY 1;
 
@@ -84,14 +84,14 @@ want to project or filter their result columns.
 ## Benchmark: OTEL at line speed
 
 Real OTLP/JSON export envelopes — logs, metrics, traces — shredded into typed columns on
-ingest. DuckDB v1.5.5, 1M records per signal:
+ingest. DuckDB v2.0-cyanoptera, 1M records per signal:
 | signal | records | columns | source NDJSON | ingest | records/s | throughput | on disk |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| traces  | 1,000,000 | 15 | 435 MB | 0.74 s | 1.35M | 586 MB/s | 50 MB |
-| logs    | 1,000,000 | 11 | 294 MB | 0.80 s | 1.26M | 369 MB/s | 9 MB |
-| metrics | 1,000,000 | 9  | 353 MB | 1.03 s | 970k | 342 MB/s | 88 MB |
+| traces  | 1,000,000 | 16 | 435 MB | 0.84 s | 1.19M | 506 MB/s | 43 MB |
+| logs    | 1,000,000 | 11 | 294 MB | 0.49 s | 2.04M | 600 MB/s | — |
+| metrics | 1,000,000 | 9  | 353 MB | 0.54 s | 1.85M | 654 MB/s | — |
 
-**3M telemetry records in 2.6 s (~1.2M records/s).** Queries on shredded spans run **27–63× faster**
+**3M telemetry records in ~1.9 s (~1.6M records/s).** Queries on shredded spans run **~30× faster**
 than a JSON column with identical results; storage is **6× smaller**. One call handles envelope
 explode, KeyValue attribute flattening, and byte-id normalization — no schema upfront:
 
@@ -131,7 +131,7 @@ RawDuck is compatible with the [RawTree MCP](https://github.com/rawtreedb/rawtre
 | `raw_serve_grpc(host, port, token)` / `raw_serve_grpc_stop()` | table | Start/stop the OTLP/gRPC collector (opt-in build, see Building). |
 | `raw_flush()` | table | Synchronously drain the async-insert buffers. |
 | `raw_type(json)` | scalar | Concrete type of a JSON value (RawMergeTree's `dynamicType()`): `Null`, `Bool`, `Int64`, `UInt64`, `Double`, `String`, `Array`, `Object`. |
-| `raw_infer(json)` | scalar | The DuckDB type RawDuck assigns to a value, e.g. `BIGINT`, `DOUBLE[]`, or the flattened layout for objects: `OBJECT(a BIGINT, b.c VARCHAR)`. |
+| `raw_infer(json)` | scalar | The DuckDB type RawDuck assigns to a value, e.g. `INTEGER`, `DOUBLE[]`, or the flattened layout for objects: `OBJECT(a INTEGER, b.c VARCHAR)`. |
 
 All ingest functions accept `transform := '...'`, `explode := '...'` and `ignore_errors := true`.
 
@@ -349,17 +349,18 @@ Per JSON path, RawDuck infers the narrowest type that holds everything seen, wid
 as data arrives (existing columns are `ALTER`ed in place, never rewritten destructively):
 
 ```
-            BOOLEAN   BIGINT ──> DOUBLE     DATE ──> TIMESTAMP
-                │        │          │          │          │
-                └────────┴────> VARCHAR <──────┴──────────┘      (scalar conflicts)
+            BOOLEAN   INTEGER ──> BIGINT ──> DOUBLE     DATE ──> TIMESTAMP
+                │         │          │          │          │          │
+                └─────────┴──────────┴────> VARCHAR <──────┴──────────┘  (scalar conflicts)
 
-            object vs scalar, mixed arrays, arrays of objects ──> JSON   (structural conflicts)
+            object vs scalar, mixed arrays, arrays of objects ──> VARIANT   (structural conflicts)
 ```
 
+- integers that fit int32 land as `INTEGER`; a later out-of-range value widens to `BIGINT`
 - integers out of `BIGINT` range degrade to `DOUBLE`
 - ISO `DATE` / `TIMESTAMP` strings are sniffed into temporal columns
-- homogeneous scalar arrays become typed `LIST`s (`BIGINT[]`, nested `BIGINT[][]`, …)
-- nothing is ever dropped: structurally conflicting values are preserved verbatim as `JSON`
+- homogeneous scalar arrays become typed `LIST`s (`INTEGER[]`, nested `INTEGER[][]`, …)
+- nothing is ever dropped: structurally conflicting values are preserved verbatim as `VARIANT`
 
 ## Adaptive layout from observed workloads
 

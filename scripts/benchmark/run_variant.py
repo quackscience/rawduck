@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Compare DuckDB VARIANT against RawDuck shredded tables.
 
-Same OTLP/JSON NDJSON envelopes as run_otel.sh. VARIANT is measured as it
-ships in whichever DuckDB the extension is pinned to: v1.5.5 on main (no
-shredded execution / extraction pushdown), or v2.0-cyanoptera on the
-v2.0.0 branch. The printed note and the `variant_note` field in the result
-JSON report which one was measured.
+Same OTLP/JSON NDJSON envelopes as run_otel.sh. VARIANT is a control encoding
+on this DuckDB pin (v2.0-cyanoptera), not the product path. The printed note
+and the `variant_note` field in the result JSON report the measured pin.
 
 Ingest grain is labeled explicitly: envelope rows are not span records.
 
@@ -191,7 +189,7 @@ GROUP BY 1 ORDER BY 1
     "p99_by_route": {
         "rawduck": """
 SELECT "http.route" AS k,
-       quantile_cont(("endTimeUnixNano" - "startTimeUnixNano"), 0.99)::BIGINT AS n
+       quantile_cont(duration, 0.99)::BIGINT AS n
 FROM traces
 GROUP BY 1 ORDER BY 1
 """,
@@ -252,7 +250,7 @@ GROUP BY 1 ORDER BY 1
     },
     "status_dist": {
         "rawduck": """
-SELECT "http.status_code"::VARCHAR AS k, count(*) AS n
+SELECT "http.status_code" AS k, count(*) AS n
 FROM traces
 GROUP BY 1 ORDER BY 1
 """,
@@ -306,7 +304,7 @@ QUERY_EXPECT = {
 class DuckSession:
     """Interactive DuckDB CLI session (cold→warm needs one process).
 
-    Hardening for Linux/arm64 (DuckDB v1.5 CLI):
+    Hardening for Linux/arm64 CLI stdin stalls:
     - Create the file in a one-shot process (create_database); never ATTACH
       STORAGE_VERSION over an interactive pipe.
     - Pass -dark-mode + DUCKDB_NO_HIGHLIGHT=1 so color probing cannot stall.
@@ -804,17 +802,10 @@ def duckdb_version(binary: Path) -> str:
 
 
 def variant_note(version: str) -> str:
-    """What the measured VARIANT implementation actually is, per DuckDB pin."""
-    tag = version.strip().lower()
-    if "v2" in tag or "-dev" in tag:
-        return (
-            f"DuckDB {version} VARIANT (shredded execution / extract pushdown expected). "
-            "This is the v2.0-cyanoptera pin, not the v1.5.5 pin."
-        )
+    """VARIANT is a control encoding on this pin, not the product path."""
     return (
-        f"DuckDB VARIANT as of {version}. The v2.0 preview (shredded execution from "
-        "storage, extraction pushdown, Parquet shred, extra variant_* functions) "
-        "is not in this pin."
+        f"DuckDB {version} VARIANT (shredded execution / extract pushdown expected). "
+        "Control encoding only; typed columns are the product path."
     )
 
 

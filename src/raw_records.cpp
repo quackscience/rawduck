@@ -1,12 +1,26 @@
 #include "raw_functions.hpp"
 #include "raw_json.hpp"
 
+#include "duckdb/common/constants.hpp"
+#include "duckdb/common/table_column.hpp"
 #include "duckdb/function/table_function.hpp"
 
 namespace duckdb {
 
 struct RawRecordsBindData : public TableFunctionData {
 	shared_ptr<RawParsedPayload> parsed;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto copy = make_uniq<RawRecordsBindData>();
+		copy->parsed = parsed;
+		copy->column_ids = column_ids;
+		return std::move(copy);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<RawRecordsBindData>();
+		return parsed.get() == other.parsed.get();
+	}
 };
 
 struct RawRecordsState : public GlobalTableFunctionState {
@@ -99,6 +113,13 @@ static void RawRecordsFunction(ClientContext &context, TableFunctionInput &data,
 	}
 	for (idx_t out_col = 0; out_col < state.column_ids.size(); out_col++) {
 		auto col = state.column_ids[out_col];
+		if (IsRowIdColumnId(col)) {
+			auto writer = FlatVector::Writer<int64_t>(output.data[out_col], count, 0);
+			for (idx_t i = 0; i < count; i++) {
+				writer.WriteValue(NumericCast<int64_t>(state.next_row + i));
+			}
+			continue;
+		}
 		if (col >= columns.size()) {
 			continue;
 		}
@@ -108,10 +129,23 @@ static void RawRecordsFunction(ClientContext &context, TableFunctionInput &data,
 	output.SetChildCardinality(count);
 }
 
+static virtual_column_map_t RawRecordsGetVirtualColumns(ClientContext &, optional_ptr<FunctionData>) {
+	virtual_column_map_t result;
+	result.insert(make_pair(COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", LogicalType::BIGINT)));
+	return result;
+}
+
+static vector<column_t> RawRecordsGetRowIdColumns(ClientContext &, optional_ptr<FunctionData>) {
+	return {COLUMN_IDENTIFIER_ROW_ID};
+}
+
 TableFunction GetRawRecordsFunction() {
 	TableFunction function("raw_records", {LogicalType::VARCHAR}, RawRecordsFunction, RawRecordsBind, RawRecordsInit);
 	RawAddIngestParameters(function);
 	function.projection_pushdown = true;
+	function.late_materialization = true;
+	function.get_virtual_columns = RawRecordsGetVirtualColumns;
+	function.get_row_id_columns = RawRecordsGetRowIdColumns;
 	return function;
 }
 

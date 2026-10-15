@@ -84,6 +84,11 @@ BOOLEAN
 query I
 SELECT raw_infer('42');
 ----
+INTEGER
+
+query I
+SELECT raw_infer('3000000000');
+----
 BIGINT
 
 query I
@@ -109,7 +114,7 @@ TIMESTAMP
 query I
 SELECT raw_infer('[1,2,3]');
 ----
-BIGINT[]
+INTEGER[]
 
 query I
 SELECT raw_infer('[1,2.5]');
@@ -119,7 +124,7 @@ DOUBLE[]
 query I
 SELECT raw_infer('{"a":1,"b":{"c":"x"},"tags":["a"]}');
 ----
-OBJECT(a BIGINT, b.c VARCHAR, tags VARCHAR[])
+OBJECT(a INTEGER, b.c VARCHAR, tags VARCHAR[])
 
 # arrays of objects are kept as VARIANT (overflow sink)
 query I
@@ -144,6 +149,41 @@ SELECT b FROM raw_records('[{"a":1,"b":"x"},{"a":2,"b":"y"}]');
 x
 y
 
+# v2 late materialization: Top-N / LIMIT OFFSET on a wide payload rewrites
+# to a row-id semi-join so only the sort key (plus rowid) is extracted first
+statement ok
+PRAGMA explain_output = 'optimized_only';
+
+query II
+EXPLAIN (FORMAT yaml) SELECT * FROM raw_records('[{"a":1,"b":"x","c":true},{"a":2,"b":"y","c":false},{"a":3,"b":"z","c":true}]') ORDER BY a DESC LIMIT 2;
+----
+logical_opt	<REGEX>:.*COMPARISON_JOIN.*
+
+query III
+SELECT a, b, c FROM raw_records('[{"a":1,"b":"x","c":true},{"a":2,"b":"y","c":false},{"a":3,"b":"z","c":true}]') ORDER BY a DESC LIMIT 2;
+----
+3	z	true
+2	y	false
+
+query II
+EXPLAIN (FORMAT yaml) SELECT * FROM raw_records('[{"a":1,"b":"x","c":true},{"a":2,"b":"y","c":false},{"a":3,"b":"z","c":true}]') LIMIT 1 OFFSET 1;
+----
+logical_opt	<REGEX>:.*COMPARISON_JOIN.*
+
+query III
+SELECT a, b, c FROM raw_records('[{"a":1,"b":"x","c":true},{"a":2,"b":"y","c":false},{"a":3,"b":"z","c":true}]') LIMIT 1 OFFSET 1;
+----
+2	y	false
+
+query II
+SELECT a, rowid FROM raw_records('[{"a":10,"b":"x"},{"a":20,"b":"y"}]') ORDER BY rowid;
+----
+10	0
+20	1
+
+statement ok
+RESET explain_output;
+
 # nested projection: only the user.name subtree is walked
 query I
 SELECT "user.name" FROM raw_records('[{"user":{"name":"alice","address":{"city":"Rome"}},"n":1}]');
@@ -158,7 +198,12 @@ SELECT count(*) FROM raw_records('[{"a":1,"b":"x"},{"a":2}]');
 query II
 SELECT typeof(a), typeof(b) FROM raw_records('[{"a":1,"b":"x"}]');
 ----
-BIGINT	VARCHAR
+INTEGER	VARCHAR
+
+query I
+SELECT typeof(v) FROM raw_records('[{"v":1},{"v":3000000000}]') LIMIT 1;
+----
+BIGINT
 
 # single object payload
 query I
@@ -251,7 +296,7 @@ TIMESTAMP	2024-01-15 00:00:00
 query II
 SELECT typeof(m), m FROM raw_records('[{"m":[[1,2],[3]]}]');
 ----
-BIGINT[][]	[[1, 2], [3]]
+INTEGER[][]	[[1, 2], [3]]
 
 # empty payload yields zero rows
 query I
@@ -318,5 +363,20 @@ logical_opt	<REGEX>:.*__internal_compress_string.*
 statement ok
 SET rawduck_dictionary_groupby = true;
 
+# compact INTEGER group keys use v2 Perfect Hash Group By (do not cast to VARCHAR)
+statement ok
+SELECT * FROM raw_ingest('t_ph', '[{"s":200},{"s":201},{"s":400},{"s":404},{"s":500}]');
+
+statement ok
+ANALYZE t_ph;
+
 statement ok
 PRAGMA explain_output = 'physical_only';
+
+query II
+EXPLAIN SELECT s, count(*) FROM t_ph GROUP BY 1
+----
+physical_plan	<REGEX>:.*Perfect Hash Group By.*
+
+statement ok
+RESET explain_output;

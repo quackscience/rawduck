@@ -1,18 +1,9 @@
 # Extension updating
 
-This repository tracks two DuckDB lines. Keep submodule SHAs, workflow pins, and
-Pages `DUCKDB_VERSION` in lockstep on the branch you are releasing.
+Keep submodule SHAs, workflow pins, and Pages `DUCKDB_VERSION` in lockstep on
+the branch you are releasing.
 
-## `main` — DuckDB v1.5.5 (query-speed product)
-
-- `./duckdb` → tag `v1.5.5`
-- `./extension-ci-tools` → matching `v1.5.5` tip (or `v1.5-variegata` if no patch branch)
-- Workflows `duckdb_version` / `ci_tools_version` / reusable workflow `@` → `v1.5.5`
-- `Release.yml` `DUCKDB_VERSION` → `v1.5.5` (Pages path + CLI download)
-
-Do not merge `v2.0.0` into `main` while cyanoptera queries are slower than this pin.
-
-## `v2.0.0` — DuckDB Cyanoptera / v2.0.0 product
+## `v2.0.0` — DuckDB Cyanoptera / v2.0.0 product line
 
 - `./duckdb` → `origin/v2.0-cyanoptera` until tag `v2.0.0` exists, then that tag
 - `./extension-ci-tools` → `main` until a cyanoptera / v2.0.0 branch exists

@@ -542,6 +542,35 @@ static duckdb_yyjson::yyjson_mut_val *OtlpNormalizeValue(duckdb_yyjson::yyjson_m
 	return value;
 }
 
+// Span grain: duration is what queries actually aggregate. Derive it once at
+// shred so scans don't subtract start/end on every p99. Existing `duration` wins.
+static void OtlpDeriveSpanDuration(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjson_mut_val *row) {
+	if (!duckdb_yyjson::yyjson_mut_is_obj(row) || duckdb_yyjson::yyjson_mut_obj_get(row, "duration")) {
+		return;
+	}
+	auto start = duckdb_yyjson::yyjson_mut_obj_get(row, "startTimeUnixNano");
+	auto end = duckdb_yyjson::yyjson_mut_obj_get(row, "endTimeUnixNano");
+	if (!start || !end) {
+		return;
+	}
+	auto as_i64 = [](duckdb_yyjson::yyjson_mut_val *value, int64_t &out) {
+		if (duckdb_yyjson::yyjson_mut_is_sint(value) || duckdb_yyjson::yyjson_mut_is_int(value)) {
+			out = duckdb_yyjson::yyjson_mut_get_sint(value);
+			return true;
+		}
+		if (duckdb_yyjson::yyjson_mut_is_uint(value)) {
+			out = static_cast<int64_t>(duckdb_yyjson::yyjson_mut_get_uint(value));
+			return true;
+		}
+		return false;
+	};
+	int64_t start_ns, end_ns;
+	if (!as_i64(start, start_ns) || !as_i64(end, end_ns)) {
+		return;
+	}
+	duckdb_yyjson::yyjson_mut_obj_add_sint(doc, row, "duration", end_ns - start_ns);
+}
+
 // OTLP metrics stop at the Metric message after the builtin path
 // (…metrics). The hot grain is NumberDataPoint / HistogramDataPoint — same
 // role spans play for traces. Without a second fan-out, sum/gauge/…dataPoints
@@ -610,6 +639,7 @@ void RawPayload::Explode(const vector<string> &path) {
 		duckdb_yyjson::yyjson_mut_arr_iter_init(out_rows, &normalized_rows);
 		while (auto row = duckdb_yyjson::yyjson_mut_arr_iter_next(&normalized_rows)) {
 			OtlpNormalizeValue(mut_doc, row, "", 0, 0);
+			OtlpDeriveSpanDuration(mut_doc, row);
 		}
 	}
 
@@ -739,12 +769,19 @@ RawScalarKind JoinScalarKinds(RawScalarKind a, RawScalarKind b) {
 	if (b == RawScalarKind::UNSET || a == b) {
 		return a;
 	}
-	auto is_numeric = [](RawScalarKind k) {
-		return k == RawScalarKind::BIGINT || k == RawScalarKind::DOUBLE;
+	auto is_integer = [](RawScalarKind k) {
+		return k == RawScalarKind::INTEGER || k == RawScalarKind::BIGINT;
+	};
+	auto is_numeric = [&](RawScalarKind k) {
+		return is_integer(k) || k == RawScalarKind::DOUBLE;
 	};
 	auto is_temporal = [](RawScalarKind k) {
 		return k == RawScalarKind::DATE || k == RawScalarKind::TIMESTAMP;
 	};
+	if (is_integer(a) && is_integer(b)) {
+		return (a == RawScalarKind::BIGINT || b == RawScalarKind::BIGINT) ? RawScalarKind::BIGINT
+		                                                                  : RawScalarKind::INTEGER;
+	}
 	if (is_numeric(a) && is_numeric(b)) {
 		return RawScalarKind::DOUBLE;
 	}
@@ -778,16 +815,27 @@ RawScalarKind SniffScalarKind(yyjson_val *val) {
 	switch (duckdb_yyjson::yyjson_get_type(val)) {
 	case YYJSON_TYPE_BOOL:
 		return RawScalarKind::BOOLEAN;
-	case YYJSON_TYPE_NUM:
+	case YYJSON_TYPE_NUM: {
 		if (duckdb_yyjson::yyjson_is_real(val)) {
 			return RawScalarKind::DOUBLE;
 		}
-		if (duckdb_yyjson::yyjson_is_uint(val) &&
-		    duckdb_yyjson::yyjson_get_uint(val) > static_cast<uint64_t>(NumericLimits<int64_t>::Maximum())) {
-			// out of BIGINT range: degrade to DOUBLE rather than fail
-			return RawScalarKind::DOUBLE;
+		if (duckdb_yyjson::yyjson_is_uint(val)) {
+			auto unsigned_value = duckdb_yyjson::yyjson_get_uint(val);
+			if (unsigned_value > static_cast<uint64_t>(NumericLimits<int64_t>::Maximum())) {
+				// out of BIGINT range: degrade to DOUBLE rather than fail
+				return RawScalarKind::DOUBLE;
+			}
+			if (unsigned_value > static_cast<uint64_t>(NumericLimits<int32_t>::Maximum())) {
+				return RawScalarKind::BIGINT;
+			}
+			return RawScalarKind::INTEGER;
 		}
-		return RawScalarKind::BIGINT;
+		auto value = duckdb_yyjson::yyjson_get_sint(val);
+		if (value < NumericLimits<int32_t>::Minimum() || value > NumericLimits<int32_t>::Maximum()) {
+			return RawScalarKind::BIGINT;
+		}
+		return RawScalarKind::INTEGER;
+	}
 	case YYJSON_TYPE_STR:
 		return SniffString(duckdb_yyjson::yyjson_get_str(val), duckdb_yyjson::yyjson_get_len(val));
 	default:
@@ -879,6 +927,8 @@ static LogicalType ScalarKindToType(RawScalarKind kind) {
 	switch (kind) {
 	case RawScalarKind::BOOLEAN:
 		return LogicalType::BOOLEAN;
+	case RawScalarKind::INTEGER:
+		return LogicalType::INTEGER;
 	case RawScalarKind::BIGINT:
 		return LogicalType::BIGINT;
 	case RawScalarKind::DOUBLE:
@@ -989,6 +1039,7 @@ bool RawFillSupported(const LogicalType &type) {
 	}
 	switch (type.id()) {
 	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::INTEGER:
 	case LogicalTypeId::BIGINT:
 	case LogicalTypeId::DOUBLE:
 	case LogicalTypeId::DATE:
@@ -1185,6 +1236,32 @@ void FillVector(const vector<yyjson_val *> &vals, const LogicalType &type, Vecto
 				writer.WriteValue(duckdb_yyjson::yyjson_get_bool(val));
 			} else {
 				writer.WriteNull();
+			}
+		}
+		break;
+	}
+	case LogicalTypeId::INTEGER: {
+		auto writer = FlatVector::Writer<int32_t>(result, vals.size(), offset);
+		for (idx_t i = 0; i < vals.size(); i++) {
+			auto val = vals[i];
+			int64_t parsed;
+			if (val && duckdb_yyjson::yyjson_is_sint(val)) {
+				parsed = duckdb_yyjson::yyjson_get_sint(val);
+			} else if (val && duckdb_yyjson::yyjson_is_uint(val)) {
+				auto unsigned_value = duckdb_yyjson::yyjson_get_uint(val);
+				if (unsigned_value > static_cast<uint64_t>(NumericLimits<int32_t>::Maximum())) {
+					writer.WriteNull();
+					continue;
+				}
+				parsed = static_cast<int64_t>(unsigned_value);
+			} else {
+				writer.WriteNull();
+				continue;
+			}
+			if (parsed < NumericLimits<int32_t>::Minimum() || parsed > NumericLimits<int32_t>::Maximum()) {
+				writer.WriteNull();
+			} else {
+				writer.WriteValue(static_cast<int32_t>(parsed));
 			}
 		}
 		break;

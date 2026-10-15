@@ -16,9 +16,9 @@ namespace duckdb {
 // columns instead of opaque overflow blobs.
 //===--------------------------------------------------------------------===//
 
-// Scalar widening lattice: UNSET < BOOLEAN | BIGINT < DOUBLE | DATE < TIMESTAMP,
+// Scalar widening lattice: UNSET < BOOLEAN | INTEGER < BIGINT < DOUBLE | DATE < TIMESTAMP,
 // any other combination joins to VARCHAR (the universal scalar sink).
-enum class RawScalarKind : uint8_t { UNSET = 0, BOOLEAN, BIGINT, DOUBLE, DATE, TIMESTAMP, VARCHAR };
+enum class RawScalarKind : uint8_t { UNSET = 0, BOOLEAN, INTEGER, BIGINT, DOUBLE, DATE, TIMESTAMP, VARCHAR };
 
 enum class RawNodeClass : uint8_t {
 	UNSET = 0, // only nulls seen so far

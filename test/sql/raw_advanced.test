@@ -203,6 +203,26 @@ SELECT name, "resource.service" FROM raw_records('{"resourceSpans":[{"resource":
 s1	api
 s2	api
 
+query I
+SELECT duration FROM raw_records('{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"op","startTimeUnixNano":"100","endTimeUnixNano":"250"}]}]}]}', transform := 'otlp-traces');
+----
+150
+
+query I
+SELECT typeof(duration) FROM raw_records('{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"op","startTimeUnixNano":"1","endTimeUnixNano":"2"}]}]}]}', transform := 'otlp-traces');
+----
+INTEGER
+
+query I
+SELECT typeof(duration) FROM raw_records('{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"op","startTimeUnixNano":"1","endTimeUnixNano":"3000000001"}]}]}]}', transform := 'otlp-traces');
+----
+BIGINT
+
+query I
+SELECT duration FROM raw_records('{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"op","startTimeUnixNano":"100","endTimeUnixNano":"250","duration":9}]}]}]}', transform := 'otlp-traces');
+----
+9
+
 # user-defined transforms compose with any source
 query I
 SELECT raw_transform_define('my-batch', 'data.items');

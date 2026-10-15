@@ -4,7 +4,7 @@
 # Same OTLP/JSON traces envelopes as run_otel.sh. Reports ingest, query, and
 # on-disk size. pragma_version() labels the pin. Product path:
 #   --paths rawduck --query-runs 7
-# See AGENTS.md Performance contract — do not mix v1.5.5 query ms with v2.
+# See AGENTS.md Performance contract. Product path: typed columns, no VARIANT.
 #
 #   GEN=ninja make release
 #   ./scripts/benchmark/run_variant.sh --paths rawduck --records 1000000 --query-runs 7

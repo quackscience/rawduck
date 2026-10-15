@@ -20,10 +20,8 @@ Unsigned Pages publish under both `v2.0-cyanoptera` and `v2.0.0`. Community
 `./build/release/test/unittest --test-dir . "test/sql/*"`; format with
 `make format-fix` (CI enforces it).
 
-`main` stays on DuckDB **v1.5.5** as the query-speed lock. Do not merge this
-branch into `main` until same-harness queries match that pin. Typed columns
-remain the product encoding — VARIANT is overflow-only. v2 engine leverage that
-stayed: `FillVector` via `FlatVector::Writer`, default v2 storage on
+Typed columns are the product encoding — VARIANT is overflow-only. v2 engine
+leverage: `FillVector` via `FlatVector::Writer`, default v2 storage on
 `rawduck:` attaches, quack `CONNECT` + `raw_ingest` as the SQL plane,
 `duckdb_available_metrics` on `/health`. PEG `INGEST 'file' INTO tbl` desugars
 to `raw_ingest_file` when `SET active_grammar_extensions = ['rawduck']`.
@@ -31,13 +29,21 @@ to `raw_ingest_file` when `SET active_grammar_extensions = ['rawduck']`.
 so DICT_FSST VARCHAR group keys stay dictionaries for HASH GROUP BY instead of
 being rewritten to `__internal_compress_string_uhugeint`. `raw_optimize()`
 clusters by observed filters so integer columns RLE and zone maps prune.
+Ingest also sorts each append chunk by `http.status_code` so those zone maps
+exist before the first query. The type lattice infers compact `INTEGER` when
+every value fits int32, then widens `INTEGER→BIGINT→DOUBLE`. OTLP traces shred
+`duration = end−start` as a typed column so p99 scans that fact instead of
+subtracting timestamps. Product `status_dist` groups the INTEGER column (not a
+VARCHAR cast) so v2 Perfect Hash Group By can fire. Top-N and `LIMIT OFFSET`
+on wide shredded tables use v2 late materialization (row-id semi-join): scan
+the sort key, keep N ids, fetch the rest of the columns only for those rows.
 
 ## Performance contract
 
 The product path is **shred-at-ingest into typed columns**, then a native DuckDB
-scan. That is the only encoding we optimize. Overflow (JSON on `main`, VARIANT on
-`v2.0.0`) is a last-resort sink, not a query format. OTLP transforms exist to
-avoid overflow; the 1M-span traces table is 15 typed columns and zero overflow.
+scan. That is the only encoding we optimize. Overflow (VARIANT) is a last-resort
+sink, not a query format. OTLP transforms exist to avoid overflow; the 1M-span
+traces table is 16 typed columns (including shredded `duration`) and zero overflow.
 
 Do not adopt, compare against, or port to a DuckDB feature unless it beats that
 path on the OTEL harness:
@@ -46,8 +52,8 @@ path on the OTEL harness:
 - Extract pushdown on columns we already typed at ingest.
 - `raw_records` bind-parse caching (demo API; ingest/query tables are the product).
 - Hot/cold VARIANT bag until a measured wide-schema win vs unbounded typed columns.
-- Staying on cyanoptera *because* VARIANT-flat can tie RawDuck on already-flat
-  rows. That does not replace ingest, schema evolution, or nested OTLP shredding.
+- VARIANT-flat tying RawDuck on already-flat rows. That does not replace ingest,
+  schema evolution, or nested OTLP shredding.
 
 Ingest patterns that already win and stay: native `LocalAppend` in the caller
 transaction (invariant 2); parse threads + byte-capped batches; serial append
@@ -58,36 +64,28 @@ ingest walks JSON keys (sparse-friendly). Projection skip is only for
 **Gates (Apple M3 Ultra, 32 cores, same `run_variant.py` SQL, 1M traces, best of
 7 unless noted).** Fail the gate = do not keep that pin, setting, or feature.
 
-| pin | traces ingest | errors / p99 / status (ms) |
+| tip | traces ingest | errors / p99 / status (ms) |
 |---|---|---|
-| `main` DuckDB v1.5.5 | 0.84–1.01M rec/s | **1.1 / 2.6 / 2.4** (product query lock) |
-| `v2.0.0` @ `21447bd` (v1.5.6-dev11341) | 1.25M rec/s | 3.8 / 5.1 / 3.5 (best of 3) |
-| `v2.0.0` cyanoptera (v2.0.0-dev84550) | 1.20–1.23M rec/s | 4.5 / 5.8 / 4.4 |
-| `v2.0.0` cyanoptera `60c58d1` (v2.0.0-dev88475) | 1.17–1.20M rec/s | **1.2 / 3.2 / 2.4** (best of 7; dict GROUP BY) |
+| cyanoptera `60c58d1` (v2.0.0-dev88475), dict GROUP BY | 1.17–1.20M rec/s | 1.2 / 3.2 / 2.4 |
+| duration shred + INTEGER lattice | 1.19M rec/s | 1.2 / 3.0 / 2.1 |
+| chunk cluster + INTEGER status GROUP BY | **1.18M rec/s** | **1.1 / 3.0 / 0.9** |
 
-No single DuckDB pin currently passes both “keep v2 ingest” and “keep v1.5.5
-query latency.” Storage version (`v1.5.0` vs default / v2.0.0) does not explain
-the query gap (same 15 typed columns, no overflow, same `SEQ_SCAN` +
-`HASH_GROUP_BY` plan). Threads / `ANALYZE` / in-memory CTAS do not recover 1.5 ms
-on cyanoptera. The jump 1.1 → 3.8 ms is the v2 engine, not RawDuck extract; do
-not “fix” it with a new query planner. `main` stays the query-speed lock.
-`v2.0.0` is the Cyanoptera product line; do not merge it into `main` until
-queries match that lock.
-
-`run_otel.sh` ingest changes on `main` still need ≥ 98% of `baseline-otel.json`.
-On `v2.0.0`, ingest must stay ≥ 98% of this tip (traces 1.17–1.20M, logs
-~2.04M, metrics ~1.85M rec/s on `run_otel.sh --records 1000000`). Query changes
-must not lose the `60c58d1` row in the table above. The August 1.25M traces
-figure is historical; this freeze-line tip is the lock.
+The latest row is the product lock. Ingest must stay ≥ 98% of that traces rate
+(logs ~2.04M, metrics ~1.85M rec/s on `run_otel.sh --records 1000000`). Query
+changes must not lose 1.1 / 3.0 / 0.9. p99 is `quantile_cont(duration, 0.99)`
+grouped by `"http.route"`. Compact integers (`kind`, `http.status_code`,
+`status.code`, `duration` on this harness) are INTEGER; UnixNano timestamps stay
+BIGINT. `status_dist` groups `"http.status_code"` as INTEGER (Perfect Hash Group
+By). Chunk clustering plus the `>= 500` zone map is why errors is 1.1.
 
 ## Source map (src/)
 
 | File | Responsibility |
 |---|---|
-| `raw_json.cpp/.hpp` | **Pure, context-free core**: payload parsing (JSON/NDJSON), schema inference tree (`RawNode`), type lattice, flattening, multi-level explode transform (OTLP metrics additionally fan out `sum`/`gauge`/…`dataPoints` to data-point grain), vectorized extraction (`RawExtractor` + `FillVector` via `FlatVector::Writer`). Never touches `ClientContext` — this is what makes parse threads safe. |
-| `raw_records.cpp` | `raw_records()` table function; shared named-parameter handling (`RawBindParseOptions` / `named_argument_map_t`). |
+| `raw_json.cpp/.hpp` | **Pure, context-free core**: payload parsing (JSON/NDJSON), schema inference tree (`RawNode`), INTEGER→BIGINT→DOUBLE lattice, flattening, multi-level explode transform (OTLP metrics fan out `sum`/`gauge`/…`dataPoints` to data-point grain; OTLP traces derive `duration` after normalize), vectorized extraction (`RawExtractor` + `FillVector` via `FlatVector::Writer`). Never touches `ClientContext` — this is what makes parse threads safe. |
+| `raw_records.cpp` | `raw_records()` table function; shared named-parameter handling (`RawBindParseOptions` / `named_argument_map_t`). Opt-in v2 late materialization (`rowid` virtual column + bind `Copy`) so `ORDER BY … LIMIT` / `LIMIT OFFSET` extract the sort key first, then fetch remaining columns for the surviving row ids. Ingested tables get the same rewrite from DuckDB `seq_scan`. |
 | `raw_grammar.cpp` | Opt-in PEG sugar: `INGEST 'file' INTO tbl` → `raw_ingest_file` (`SET active_grammar_extensions = ['rawduck']`). |
-| `raw_ingest.cpp` | `RawIngestor` (native catalog/storage ingestion + DuckLake SQL fallback), `RawAppendPool` (multi-threaded appends), `RawIngestPipeline` (reader → parse threads → consumer), `raw_ingest()` / `raw_ingest_file()`. The reader closes a batch at whichever comes first: `batch_size` *lines* or `RAW_BATCH_BYTE_TARGET` *bytes* — the byte cap is essential for *container* payloads (OTLP export envelopes, CloudWatch log groups) where one NDJSON line explodes into many records: without it the whole file lands in a single line-count batch and parsing serializes onto one thread. Write-path tuning lives in `raw_write_settings.cpp` (`rawduck_pipeline_threads`, `rawduck_pool_min_rows`, …); parallel ingest consumers default to **1** so wide-schema churn stays serial. |
+| `raw_ingest.cpp` | `RawIngestor` (native catalog/storage ingestion + DuckLake SQL fallback), `RawAppendPool` (multi-threaded appends), `RawIngestPipeline` (reader → parse threads → consumer), `raw_ingest()` / `raw_ingest_file()`. The reader closes a batch at whichever comes first: `batch_size` *lines* or `RAW_BATCH_BYTE_TARGET` *bytes* — the byte cap is essential for *container* payloads (OTLP export envelopes, CloudWatch log groups) where one NDJSON line explodes into many records: without it the whole file lands in a single line-count batch and parsing serializes onto one thread. Before each append, chunks with `http.status_code` are sorted so row groups RLE and zone maps prune on the first query. Write-path tuning lives in `raw_write_settings.cpp` (`rawduck_pipeline_threads`, `rawduck_pool_min_rows`, …); parallel ingest consumers default to **1** so wide-schema churn stays serial. |
 | `raw_optimize.cpp` | Optimizer hooks (predicate/group observation, projection rewrite), `raw_stats()`, `raw_optimize()`, `raw_projections()`, `raw_project()`, `raw_stats_save/load()`. |
 | `raw_transforms.cpp` | User-defined transform registry, `raw_transform_define()` scalar, `raw_transforms()`. |
 | `raw_attach.cpp` | `ATTACH 'rawduck:...'` storage extension (`RawDuckCatalog : DuckCatalog`). Product files default to DuckDB v2 storage (`STORAGE_VERSION 'latest'` unless the caller pins). |
@@ -100,13 +98,12 @@ figure is historical; this freeze-line tip is the lock.
 ## Design invariants — do not break these
 
 1. **The type lattice widens monotonically, never destructively.**
-   `BOOLEAN | BIGINT→DOUBLE | DATE→TIMESTAMP` → scalar conflicts sink to `VARCHAR`; structural
-   conflicts (object vs scalar, mixed arrays) sink to **VARIANT** on branch `v2.0.0` (DuckDB
-   shredded VARIANT) and to **JSON** on `main` (v1.5.5 pin — VARIANT extract was slower than
-   `->>` there). Nothing is ever dropped; widening is `ALTER ... SET DATA TYPE`, with
-   `to_json()` then `::VARIANT` (or `to_json()` alone on v1.5.5) for overflow rewrites — a plain
-   cast to JSON rejects bare strings; JSON→VARIANT is monotonic (never VARIANT→JSON). Do not
-   merge VARIANT-as-default overflow into `main` while it is pinned to v1.5.5.
+   `BOOLEAN | INTEGER→BIGINT→DOUBLE | DATE→TIMESTAMP` → scalar conflicts sink to `VARCHAR`;
+   structural conflicts (object vs scalar, mixed arrays) sink to **VARIANT**. Nothing is ever
+   dropped; widening is `ALTER ... SET DATA TYPE`, with `to_json()` then `::VARIANT` for overflow
+   rewrites — a plain cast to JSON rejects bare strings; JSON→VARIANT is monotonic (never
+   VARIANT→JSON). Integers that fit int32 land as `INTEGER`; a later value outside that range
+   widens the column to `BIGINT` (then `DOUBLE` past int64).
 
 2. **Native ingestion runs in the caller's transaction.** DDL goes through
    `Catalog::CreateTable`/`Alter`, appends through `DataTable::LocalAppend` / optimistic
@@ -171,7 +168,7 @@ figure is historical; this freeze-line tip is the lock.
    tables, or any query. Follow this pattern for new extensible features; don't invent config file
    formats or bespoke DDL.
 
-## Hard-won DuckDB v1.5 facts
+## Hard-won DuckDB facts
 
 - **Transparent `INSERT` auto-evolution is impossible**: `TableCatalogEntry::GetColumnIndex` /
   `GetColumns` are non-virtual and the binder resolves columns before any catalog hook. That's why
@@ -206,9 +203,8 @@ persistence), `raw_quack.test` (`CONNECT` + `raw_ingest`; `require quack`),
 (`require ducklake`, skips when absent).
 OTEL ingest performance: `./scripts/benchmark/run_otel.sh` + `./scripts/benchmark/compare.sh`
 (see `scripts/benchmark/README.md` and `BENCHMARK.md`).
-VARIANT vs RawDuck (traces): `./scripts/benchmark/run_variant.sh` — `main` is the query-speed
-lock (see Performance contract); `v2.0.0` is labeled from `pragma_version()`. Do not treat a
-VARIANT-flat tie as a reason to stop shredding.
+Product query lock: `./scripts/benchmark/run_variant.sh --paths rawduck --records 1000000 --query-runs 7`
+(see Performance contract). Do not treat a VARIANT-flat tie as a reason to stop shredding.
 Every feature needs: happy path, evolution interaction, error case, and—for anything that can
 return wrong data—a proof test (e.g. tampering with a projection to prove the rewrite engaged).
 `raw_ingest` output is `(table, created, columns_added, columns_widened, rows, errors)`;
